@@ -63,7 +63,34 @@ an instance is enforced by the avibe.bot backend** (`isEmailAuthorizedForInstanc
 the local instance only trusts backend-issued tokens (audience/issuer/nonce
 checked at exchange). The `state` remains HMAC-signed and single-use, so it cannot
 be forged or replayed. The cookie's state-equality was a defense-in-depth layer
-that is simply unavailable (and counter-productive) in standalone PWAs.
+that is unavailable (and counter-productive) in standalone PWAs.
+
+Codex review (gpt-5.5, xhigh) hardening applied:
+
+- **Store-fallback requires a valid same-origin handshake cookie to be present**
+  (its state may differ — that's the PWA desync — but it must parse/verify). This
+  proves the browser actually started a login on this instance, so a bare
+  `code+state` callback URL can't be replayed in a browser that never did. The PWA
+  always carries such a cookie, so the fix still works.
+- **`pop_oauth_handshake` is atomic single-use** via `os.replace` to a unique
+  private name before reading, so concurrent callbacks for one `rid` can't both
+  consume the same record.
+
+### Known limitation / follow-up
+
+The fallback still binds finalization to *a* same-origin login attempt, not to the
+*specific* browser tab that approved consent (the cookie/jar that would provide
+that binding is exactly what desyncs on iOS). On an instance that authorizes
+**multiple** identities, an attacker who holds a valid `code+state` for their own
+authorized identity could induce a victim's browser (which has visited the
+instance) to hit that callback and be logged in as the attacker — a login-CSRF.
+
+Bounded today: Avibe instances are single-identity (one authorized email), so no
+second identity exists to mount this. The complete fix, for when multi-identity
+matters, is a same-origin binding the desync can't break: the login-start page
+writes a random nonce to `localStorage`, the store keeps its hash, and a JS
+finalizer on the callback page POSTs `{code, state, nonce}` — tracked as a
+follow-up rather than blocking this PWA fix.
 
 ## Testing
 

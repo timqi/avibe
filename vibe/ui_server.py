@@ -2532,7 +2532,13 @@ def remote_access_auth_callback():
         code_verifier = cookie_state["code_verifier"]
         handshake_nonce = cookie_state.get("nonce")
         next_target = cookie_state.get("next")
-    elif store_record is not None:
+    elif cookie_state is not None and store_record is not None:
+        # Store-fallback for the iOS standalone PWA case. Require a *valid* same-origin
+        # handshake cookie to be present (even though its state differs): that proves
+        # this browser actually started a login on this instance, so the callback URL
+        # alone can't be replayed in a browser that never did (closes the cookie-absent
+        # bearer-login vector). The PWA always carries such a cookie — only its state
+        # desyncs because authorize ran in a separate in-app-browser context.
         logger.info("oauth callback recovered via server-side handshake (cookie-less or desynced context)")
         code_verifier = store_record["code_verifier"]
         handshake_nonce = store_record.get("nonce")

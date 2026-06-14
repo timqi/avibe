@@ -1189,6 +1189,71 @@ def test_oauth_handshake_store_is_single_use_and_expires(monkeypatch, tmp_path):
     assert remote_access.pop_oauth_handshake(None) is None
 
 
+def test_remote_callback_refuses_store_fallback_without_cookie(monkeypatch, tmp_path):
+    # Defense-in-depth: a callback URL (code+state) must not become a cross-browser
+    # bearer login. With NO same-origin handshake cookie present, the server-side
+    # store must not be used to complete login, even though a record exists for the
+    # signed state. The PWA fix only relaxes the *state-equality* of a present cookie.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    secret = config.remote_access.vibe_cloud.session_secret
+    client = app.test_client()
+
+    rid = "victimrid0001"
+    state_url = ui_server._make_oauth_state(secret, next_target="/dashboard", rid=rid)
+    remote_access.store_oauth_handshake(rid, nonce="n", code_verifier="v", next_target="/dashboard")
+
+    exchanged = []
+    monkeypatch.setattr(
+        remote_access, "exchange_oauth_code", lambda *a, **k: exchanged.append(a) or {"claims": {}}
+    )
+
+    # No oauth handshake cookie on the client.
+    response = client.get(
+        f"/auth/callback?code=test-code&state={state_url}",
+        base_url="https://alex.avibe.bot",
+        follow_redirects=False,
+    )
+
+    # Never exchanged the code, and never redirected the browser to the target.
+    assert exchanged == []
+    assert response.headers.get("Location") != "/dashboard"
+
+
+def test_oauth_handshake_pop_is_atomic_single_use_under_concurrency(monkeypatch, tmp_path):
+    import threading
+    from unittest import mock
+
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    remote_access.store_oauth_handshake("race-rid000", nonce="n", code_verifier="v", next_target="/")
+
+    barrier = threading.Barrier(2)
+    orig_replace = remote_access.os.replace
+
+    def delayed_replace(src, dst):
+        try:
+            barrier.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+        return orig_replace(src, dst)
+
+    results = []
+
+    def worker():
+        results.append(remote_access.pop_oauth_handshake("race-rid000"))
+
+    with mock.patch.object(remote_access.os, "replace", delayed_replace):
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    # The atomic claim guarantees exactly one racer gets the record.
+    assert sum(1 for r in results if r is not None) == 1
+
+
 def test_remote_callback_accepts_html_escaped_state_separator(monkeypatch, tmp_path):
     monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
     config = _save_config(tmp_path)

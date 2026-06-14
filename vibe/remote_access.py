@@ -930,17 +930,28 @@ def store_oauth_handshake(rid: str, *, nonce: str, code_verifier: str, next_targ
 
 
 def pop_oauth_handshake(rid: str | None) -> dict[str, Any] | None:
-    """Return and delete (single-use) the handshake for ``rid``; None if absent/expired."""
+    """Return and delete (single-use) the handshake for ``rid``; None if absent/expired.
+
+    The claim is atomic: the record file is ``os.replace``d to a unique private name
+    before it is read, so under concurrent callbacks for the same ``rid`` exactly one
+    racer wins and the others get ``None``.
+    """
     if not rid or not _OAUTH_HANDSHAKE_RID_RE.match(rid):
         return None
-    path = _oauth_handshake_dir() / f"{rid}.json"
+    directory = _oauth_handshake_dir()
+    path = directory / f"{rid}.json"
+    claim = directory / f".{rid}.{os.getpid()}.{secrets.token_hex(8)}.claim"
     try:
-        raw = path.read_text(encoding="utf-8")
+        os.replace(path, claim)  # atomic single-use claim — only one racer can win
+    except OSError:
+        return None
+    try:
+        raw = claim.read_text(encoding="utf-8")
     except OSError:
         return None
     finally:
         try:
-            path.unlink()
+            claim.unlink()
         except OSError:
             pass
     try:
