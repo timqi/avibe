@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 import socket
 import asyncio
 from collections import namedtuple
 
 import httpx
+import pytest
 
-from config import paths
 from config.v2_config import AgentsConfig, PlatformsConfig, RemoteAccessConfig, RuntimeConfig, SlackConfig, UiConfig, V2Config
 from config.v2_config import CONFIG_LOCK
 from tests.ui_server_test_helpers import csrf_headers
@@ -1204,12 +1203,9 @@ def test_oauth_handshake_store_is_single_use_and_expires(monkeypatch, tmp_path):
     # Single-use: a second pop finds nothing.
     assert remote_access.pop_oauth_handshake("rid-abc") is None
 
-    # An expired record is treated as absent (and removed).
+    # An expired record is treated as absent.
     remote_access.store_oauth_handshake("rid-exp", nonce="n", code_verifier="v", next_target="/x")
-    record_path = paths.get_runtime_dir() / "oauth_handshakes" / "rid-exp.json"
-    data = json.loads(record_path.read_text())
-    data["exp"] = 0
-    record_path.write_text(json.dumps(data))
+    remote_access._oauth_handshakes["rid-exp"]["exp"] = 0
     assert remote_access.pop_oauth_handshake("rid-exp") is None
 
     # Invalid ids are rejected, never touching the filesystem.
@@ -1257,8 +1253,28 @@ def test_oauth_handshake_cap_holds_under_concurrency(monkeypatch, tmp_path):
     for t in threads:
         t.join()
 
-    live = list((paths.get_runtime_dir() / "oauth_handshakes").glob("*.json"))
-    assert len(live) <= 5
+    assert len(remote_access._oauth_handshakes) <= 5
+
+
+def test_unauthenticated_auth_requests_are_rate_limited(monkeypatch, tmp_path):
+    # Root-level bound: a flood of unauthenticated login-start requests from one
+    # client is 429'd, instead of each one doing handshake/cookie/log work.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    monkeypatch.setattr(ui_server, "_AUTH_RATELIMIT_MAX_PER_WINDOW", 3)
+    client = app.test_client()
+
+    statuses = [
+        client.get(
+            "/dashboard",
+            base_url="https://alex.avibe.bot",
+            environ_base={"REMOTE_ADDR": "203.0.113.77"},
+            follow_redirects=False,
+        ).status_code
+        for _ in range(5)
+    ]
+    assert statuses[:3] == [302, 302, 302]  # within budget -> redirect to login
+    assert statuses[3:] == [429, 429]  # over budget -> throttled
 
 
 def test_oauth_diag_log_is_rate_limited(monkeypatch):

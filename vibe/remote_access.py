@@ -864,53 +864,39 @@ def exchange_oauth_code(config: V2Config, code: str, code_verifier: str) -> dict
 
 # --- OAuth handshake store -------------------------------------------------
 #
-# The login handshake (PKCE ``code_verifier`` + ``nonce``) is normally carried in
-# a short-lived cookie. iOS standalone PWAs run the cross-origin authorize step in
-# a separate in-app-browser context, so the cookie the callback reads belongs to a
-# *different* ``GET /`` generation than the consent the user approved, and
-# ``cookie.state == url.state`` never holds. We therefore also persist the
-# handshake server-side, keyed by the signed state's random id, so the callback
-# can recover it by the (signature-verified) state in the callback URL. The id is
-# unguessable and single-use; the verifier never leaves the machine.
+# The login handshake (PKCE ``code_verifier`` + ``nonce`` + device binding) lives
+# only between the login-start redirect and the ``/auth/callback`` of one flow
+# (~5 min). iOS standalone PWAs run the cross-origin authorize step in a separate
+# in-app-browser context, so the handshake *cookie* the callback reads can belong
+# to a different ``GET /`` generation than the consent the user approved; we
+# therefore also keep the handshake here, keyed by the signed state's random id, so
+# the callback can recover it by the (signature-verified) state in the callback URL.
+#
+# Kept in process memory, not on disk: the UI server is a single process that
+# handles both the redirect and the callback, the data is short-lived, and a
+# mid-flow restart just means the user logs in again. This avoids a disk/inode DoS
+# surface entirely and makes single-use + the cap trivially atomic under one lock.
 
 OAUTH_HANDSHAKE_TTL_SECONDS = 300
-# Hard cap on live handshake files. The store is written on every unauthenticated
-# redirect, so without a bound a burst of unauthenticated requests could exhaust
-# inodes within the TTL. The cap sheds *new* writes when full (preserving in-flight
-# logins) and is far above any realistic concurrent-login count.
+# Cap on live handshakes — bounds memory under a burst of unauthenticated login
+# starts; sheds new entries when full (preserving in-flight logins). Far above any
+# realistic concurrent-login count. (The unauthenticated /auth rate limiter is the
+# primary bound; this is a backstop.)
 OAUTH_HANDSHAKE_MAX_ENTRIES = 2048
 _OAUTH_HANDSHAKE_RID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
-# Serializes prune+capacity-check+write so the cap is enforced atomically under a
-# concurrent burst (count-then-write without a lock could blow past the cap).
+# Guards prune + capacity-check + insert/pop so admission and single-use are atomic.
 _OAUTH_STORE_LOCK = threading.Lock()
-# Throttle the "at capacity" warning: under a sustained flood it would otherwise be
-# emitted on every shed write and grow the log unbounded — the very thing the cap
-# is meant to prevent.
+_oauth_handshakes: dict[str, dict[str, Any]] = {}
+# Throttle the "at capacity" warning so it can't itself grow the log under the flood
+# it reports.
 _OAUTH_STORE_CAPACITY_WARN_INTERVAL_SECONDS = 60.0
 _oauth_store_capacity_warned_at = 0.0
 
 
-def _oauth_handshake_dir() -> Path:
-    return paths.get_runtime_dir() / "oauth_handshakes"
-
-
-def _prune_oauth_handshakes(directory: Path) -> int:
-    """Delete expired records; return the number of surviving (live) entries."""
-    cutoff = time.time() - OAUTH_HANDSHAKE_TTL_SECONDS
-    survivors = 0
-    try:
-        entries = list(directory.glob("*.json"))
-    except OSError:
-        return 0
-    for entry in entries:
-        try:
-            if entry.stat().st_mtime < cutoff:
-                entry.unlink()
-            else:
-                survivors += 1
-        except OSError:
-            pass
-    return survivors
+def _prune_oauth_handshakes(now: int) -> None:
+    """Drop expired handshakes. Caller must hold ``_OAUTH_STORE_LOCK``."""
+    for rid in [rid for rid, record in _oauth_handshakes.items() if record.get("exp", 0) <= now]:
+        _oauth_handshakes.pop(rid, None)
 
 
 def _warn_oauth_store_at_capacity() -> None:
@@ -925,80 +911,42 @@ def _warn_oauth_store_at_capacity() -> None:
 def store_oauth_handshake(
     rid: str, *, nonce: str, code_verifier: str, next_target: str, device_hash: str | None = None
 ) -> None:
-    """Persist a login handshake keyed by the signed state's random id ``rid``.
+    """Persist a login handshake in memory, keyed by the signed state's random id.
 
-    Single-use, ``OAUTH_HANDSHAKE_TTL_SECONDS`` TTL. Written atomically with
-    owner-only permissions under the runtime dir. Invalid ids are ignored.
+    Single-use, ``OAUTH_HANDSHAKE_TTL_SECONDS`` TTL. Invalid ids are ignored.
     ``device_hash`` binds a later store-fallback recovery to the originating browser.
     """
     if not _OAUTH_HANDSHAKE_RID_RE.match(rid or ""):
         return
-    directory = _oauth_handshake_dir()
-    payload = {
+    now = int(time.time())
+    record = {
         "nonce": nonce,
         "code_verifier": code_verifier,
         "next": next_target,
         "device_hash": device_hash,
-        "exp": int(time.time()) + OAUTH_HANDSHAKE_TTL_SECONDS,
+        "exp": now + OAUTH_HANDSHAKE_TTL_SECONDS,
     }
-    final = directory / f"{rid}.json"
-    tmp = directory / f".{rid}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
-    # Hold the lock across prune + capacity-check + write so admission is atomic:
-    # otherwise a concurrent burst could all pass the check and blow past the cap.
     with _OAUTH_STORE_LOCK:
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-            directory.chmod(0o700)
-        except OSError:
-            pass
-        # Prune expired records first; if the store is still at capacity (i.e. a
-        # flood of fresh entries), shed this write rather than grow unbounded.
-        if _prune_oauth_handshakes(directory) >= OAUTH_HANDSHAKE_MAX_ENTRIES:
+        _prune_oauth_handshakes(now)
+        # At capacity (a flood of fresh entries): shed this one rather than grow
+        # unbounded, but keep in-flight logins. Re-storing an existing id is allowed
+        # (it doesn't grow the store).
+        if len(_oauth_handshakes) >= OAUTH_HANDSHAKE_MAX_ENTRIES and rid not in _oauth_handshakes:
             _warn_oauth_store_at_capacity()
             return
-        try:
-            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-            try:
-                tmp.chmod(0o600)
-            except OSError:
-                pass
-            os.replace(tmp, final)
-        except OSError:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+        _oauth_handshakes[rid] = record
 
 
 def pop_oauth_handshake(rid: str | None) -> dict[str, Any] | None:
-    """Return and delete (single-use) the handshake for ``rid``; None if absent/expired.
+    """Return and remove (single-use) the handshake for ``rid``; None if absent/expired.
 
-    The claim is atomic: the record file is ``os.replace``d to a unique private name
-    before it is read, so under concurrent callbacks for the same ``rid`` exactly one
-    racer wins and the others get ``None``.
+    ``dict.pop`` under the lock is atomic, so concurrent callbacks for the same
+    ``rid`` get exactly one winner.
     """
     if not rid or not _OAUTH_HANDSHAKE_RID_RE.match(rid):
         return None
-    directory = _oauth_handshake_dir()
-    path = directory / f"{rid}.json"
-    claim = directory / f".{rid}.{os.getpid()}.{secrets.token_hex(8)}.claim"
-    try:
-        os.replace(path, claim)  # atomic single-use claim — only one racer can win
-    except OSError:
+    with _OAUTH_STORE_LOCK:
+        record = _oauth_handshakes.pop(rid, None)
+    if record is None or record.get("exp", 0) <= int(time.time()):
         return None
-    try:
-        raw = claim.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    finally:
-        try:
-            claim.unlink()
-        except OSError:
-            pass
-    try:
-        payload = json.loads(raw)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict) or int(payload.get("exp", 0)) <= int(time.time()):
-        return None
-    return payload
+    return record

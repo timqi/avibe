@@ -51,10 +51,13 @@ Stop requiring `cookie.state == url.state`. Recover the PKCE secrets by the
   - if neither yields a record → existing one-shot retry, then the friendly
     re-login page.
 
-Server-side store: per-file under `~/.avibe/runtime/oauth_handshakes/<r>.json`,
-`0600`, single-use (deleted on read), pruned by TTL. Single UI process, so no
-cross-process coordination needed; on-disk so an in-flight login survives a UI
-restart.
+Server-side store: an **in-memory** dict keyed by the state id (`vibe/remote_access.py`),
+single-use (`pop` under a lock), TTL-pruned, with a size cap. The UI server is a
+single process that handles both the redirect and the callback, so memory is shared
+and admission/single-use are trivially atomic under one lock. It is deliberately
+*not* on disk — the handshake is short-lived and a mid-flow restart just means the
+user logs in again; keeping it in memory removes the disk/inode DoS surface and the
+file-cleanup/atomic-rename machinery entirely.
 
 ## Security
 
@@ -98,12 +101,21 @@ while giving the same binding. Its one assumption (iOS keeps the persistent devi
 cookie stable across the excursion) is verified on the regression PWA; if that ever
 fails, the `localStorage`-nonce variant is the fallback.
 
-### Review round 2 (Codex P2s)
+### Hardening the unauthenticated path (Codex review)
 
-- **Bounded store** — the handshake store is written on every unauthenticated
-  redirect, so it now caps live entries (`OAUTH_HANDSHAKE_MAX_ENTRIES`) and sheds
-  *new* writes when full (preserving in-flight logins), preventing inode exhaustion
-  from a burst of unauthenticated requests.
+The login-start redirect and `/auth/callback` are reachable without a session, so
+unauthenticated floods are the root of the resource-growth concerns. Addressed at
+the highest layer plus backstops:
+
+- **Root: per-client rate limit** on the unauthenticated `/auth` path (`ui_server.py`,
+  fixed window keyed by the Cloudflare-forwarded IP). A flood is `429`'d at the door,
+  so the downstream store and diagnostics stay bounded; a real login spends only a
+  couple of requests, far under the budget.
+- **In-memory store with a size cap** — no disk/inode surface; the cap sheds new
+  entries when full (preserving in-flight logins) as a backstop.
+- **Rate-limited diagnostics** — every unauthenticated-reachable failure log goes
+  through a per-key throttle; the capacity warning is throttled; the success-recovery
+  line is `debug`.
 - **i18n** — the re-login page copy lives in `vibe/i18n` (`remote_access.oauth_error.*`,
   en + zh) and renders in the browser's `Accept-Language` (the only server-readable
   locale signal pre-auth; the SPA keeps its language only in localStorage).

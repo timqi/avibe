@@ -1487,6 +1487,52 @@ def _oauth_callback_error_response(error: str, *, next_target: Any, status: int 
     return response
 
 
+# --- Unauthenticated /auth rate limiting -----------------------------------
+#
+# The login-start redirect and /auth/callback are reachable without a session, so
+# a flood of unauthenticated requests is the *root* of the resource-growth concerns
+# on this path. A per-client fixed-window limiter bounds that flood at the door, so
+# the downstream handshake store and diagnostics stay bounded without each needing
+# its own guard. (The per-store cap and per-log throttles remain as cheap backstops.)
+_AUTH_RATELIMIT_WINDOW_SECONDS = 60.0
+_AUTH_RATELIMIT_MAX_PER_WINDOW = 60  # a real login spends a handful; this only stops floods
+_AUTH_RATELIMIT_MAX_TRACKED_CLIENTS = 4096
+_auth_ratelimit_lock = threading.Lock()
+_auth_ratelimit: dict[str, list[float]] = {}  # client -> [window_start_monotonic, count]
+
+
+def _auth_client_id() -> str:
+    """Client identity for rate limiting: the Cloudflare-forwarded IP when present
+    (remote traffic always arrives via the tunnel), else the connecting peer."""
+    return (request.headers.get("CF-Connecting-IP") or request.remote_addr or "unknown").strip()
+
+
+def _auth_rate_limited() -> bool:
+    """True when the caller has exceeded the unauthenticated /auth request budget."""
+    client = _auth_client_id()
+    now = time.monotonic()
+    with _auth_ratelimit_lock:
+        if len(_auth_ratelimit) > _AUTH_RATELIMIT_MAX_TRACKED_CLIENTS:
+            for stale in [c for c, (ws, _c) in _auth_ratelimit.items() if now - ws >= _AUTH_RATELIMIT_WINDOW_SECONDS]:
+                _auth_ratelimit.pop(stale, None)
+        window_start, count = _auth_ratelimit.get(client, (0.0, 0))
+        if now - window_start >= _AUTH_RATELIMIT_WINDOW_SECONDS:
+            _auth_ratelimit[client] = [now, 1]
+            return False
+        if count >= _AUTH_RATELIMIT_MAX_PER_WINDOW:
+            return True
+        _auth_ratelimit[client] = [window_start, count + 1]
+        return False
+
+
+def _auth_rate_limit_response():
+    """Minimal 429 for an abusive unauthenticated /auth client (no per-request work)."""
+    response = Response("Too Many Requests", status=429, mimetype="text/plain; charset=utf-8")
+    response.headers["Retry-After"] = str(int(_AUTH_RATELIMIT_WINDOW_SECONDS))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.before_request
 def start_api_request_timer():
     if request.path.startswith("/api/"):
@@ -1528,6 +1574,10 @@ def enforce_remote_access_cookie():
             g.remote_session_renew = (str(payload.get("email", "")), str(payload.get("sub", "")))
         return None
     if request.method == "GET":
+        # Bound unauthenticated login-start floods at the door (this writes a
+        # handshake + sets cookies); a real user spends only a couple per login.
+        if _auth_rate_limited():
+            return _auth_rate_limit_response()
         return _redirect_to_vibe_cloud_login(config)
     return jsonify({"ok": False, "error": "remote_access_login_required"}), 401
 
@@ -2596,6 +2646,9 @@ def remote_access_auth_callback():
     cloud = config.remote_access.vibe_cloud
     if not cloud.enabled:
         return jsonify({"error": "remote_access_disabled"}), 400
+    # Unauthenticated endpoint: bound floods before any store lookup / logging.
+    if _auth_rate_limited():
+        return _auth_rate_limit_response()
     url_state_token = _oauth_callback_arg("state")
     cookie_state = _read_oauth_cookie(cloud.session_secret, request.cookies.get(REMOTE_OAUTH_COOKIE_NAME))
     url_state = _read_oauth_state(cloud.session_secret, url_state_token)
@@ -2619,7 +2672,7 @@ def remote_access_auth_callback():
         # the same browser that started the flow — so a bare code+state callback URL
         # can't be replayed in another browser (closes login-CSRF). The PWA carries the
         # device cookie unchanged across the excursion, so recovery still succeeds.
-        logger.info("oauth callback recovered via server-side handshake (device-bound, desynced cookie context)")
+        logger.debug("oauth callback recovered via server-side handshake (device-bound, desynced cookie context)")
         code_verifier = store_record["code_verifier"]
         handshake_nonce = store_record.get("nonce")
         next_target = store_record.get("next")

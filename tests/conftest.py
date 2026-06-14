@@ -39,3 +39,25 @@ def _isolate_vibe_remote_home(request, tmp_path, monkeypatch):
         return
     monkeypatch.delenv("AVIBE_HOME", raising=False)
     monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path / ".vibe_remote"))
+
+
+@pytest.fixture(autouse=True)
+def _reset_oauth_runtime_state():
+    """Reset module-level in-memory OAuth caches between tests.
+
+    The handshake store, diagnostic-log throttles, and the unauthenticated /auth
+    rate limiter live in process memory (not under the isolated VIBE_REMOTE_HOME),
+    so without this they would leak across tests sharing a pytest process — e.g. the
+    rate limiter accumulating across files and spuriously 429-ing an unrelated test.
+    """
+    try:
+        from vibe import remote_access, ui_server
+    except Exception:
+        yield
+        return
+    caches = (remote_access._oauth_handshakes, ui_server._oauth_diag_log_state, ui_server._auth_ratelimit)
+    for cache in caches:
+        cache.clear()
+    yield
+    for cache in caches:
+        cache.clear()
