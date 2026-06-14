@@ -6,6 +6,7 @@ import asyncio
 from collections import namedtuple
 
 import httpx
+import pytest
 
 from config.v2_config import AgentsConfig, PlatformsConfig, RemoteAccessConfig, RuntimeConfig, SlackConfig, UiConfig, V2Config
 from config.v2_config import CONFIG_LOCK
@@ -114,6 +115,42 @@ def test_remote_host_redirects_to_vibe_cloud_login(monkeypatch, tmp_path):
     assert state_payload is not None
     assert state_payload["next"] == "/dashboard"
     assert state_payload["retry"] is False
+
+
+def test_login_redirect_sets_persistent_handshake_cookie(monkeypatch, tmp_path):
+    # iOS standalone PWAs drop session-scoped cookies (no Max-Age) across the
+    # cross-origin authorize excursion, so the callback can't read the handshake
+    # back and deterministically fails with invalid_oauth_state. The handshake
+    # cookie must be persistent. Regression guard for the PWA login dead-end.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+
+    with app.test_request_context("/dashboard", base_url="https://alex.avibe.bot"):
+        response = ui_server._redirect_to_vibe_cloud_login(config)
+
+    set_cookie = response.headers["Set-Cookie"]
+    assert set_cookie.startswith(f"{ui_server.REMOTE_OAUTH_COOKIE_NAME}=")
+    assert f"Max-Age={ui_server.REMOTE_OAUTH_HANDSHAKE_TTL_SECONDS}" in set_cookie
+
+
+def test_login_redirect_sets_stable_device_binding_cookie(monkeypatch, tmp_path):
+    # The store-fallback recovery is bound to this persistent per-browser device
+    # cookie, which (unlike the per-flow handshake state) survives the iOS authorize
+    # excursion. The login redirect must seed it, long-lived.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+
+    with app.test_request_context("/dashboard", base_url="https://alex.avibe.bot"):
+        response = ui_server._redirect_to_vibe_cloud_login(config)
+
+    device_cookies = [
+        c for c in response.headers.getlist("Set-Cookie")
+        if c.startswith(f"{ui_server.REMOTE_OAUTH_DEVICE_COOKIE_NAME}=")
+    ]
+    assert len(device_cookies) == 1
+    assert f"Max-Age={ui_server.REMOTE_OAUTH_DEVICE_TTL_SECONDS}" in device_cookies[0]
+    assert "HttpOnly" in device_cookies[0]
+    assert "Secure" in device_cookies[0]
 
 
 def test_remote_setup_route_requires_vibe_cloud_login(monkeypatch, tmp_path):
@@ -994,7 +1031,11 @@ def test_remote_callback_rejects_nonce_mismatch(monkeypatch, tmp_path):
     response = client.get(f"/auth/callback?code=test-code&state={state}", base_url="https://alex.avibe.bot")
 
     assert response.status_code == 400
-    assert response.get_json()["error"] == "invalid_oauth_nonce"
+    assert "text/html" in response.headers["Content-Type"]
+    assert "invalid_oauth_nonce" in response.text
+    assert "Sign in again" in response.text
+    # Re-login button points back at the original destination from the handshake.
+    assert 'href="/dashboard"' in response.text
 
 
 def test_remote_callback_rejects_when_remote_access_is_disabled(monkeypatch, tmp_path):
@@ -1064,19 +1105,342 @@ def test_remote_callback_does_not_restart_oauth_twice(monkeypatch, tmp_path):
 
     response = client.get(f"/auth/callback?code=test-code&state={state}", base_url="https://alex.avibe.bot")
 
+    # Auto-retry already spent: render the friendly re-login page, not raw JSON.
     assert response.status_code == 400
-    assert response.get_json()["error"] == "invalid_oauth_state"
+    assert "text/html" in response.headers["Content-Type"]
+    assert "invalid_oauth_state" in response.text
+    assert "Sign in again" in response.text
+    # Retry recovers the original destination from the signed state param.
+    assert 'href="/show/ses123/"' in response.text
 
 
-def test_remote_callback_preserves_invalid_state_response_for_legacy_state(monkeypatch, tmp_path):
+def test_remote_callback_renders_relogin_page_for_legacy_state(monkeypatch, tmp_path):
     monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
     _save_config(tmp_path)
     client = app.test_client()
 
     response = client.get("/auth/callback?code=test-code&state=state-1", base_url="https://alex.avibe.bot")
 
+    # Undecodable state has no recoverable destination, so the retry button
+    # falls back to the home page.
     assert response.status_code == 400
-    assert response.get_json()["error"] == "invalid_oauth_state"
+    assert "text/html" in response.headers["Content-Type"]
+    assert "invalid_oauth_state" in response.text
+    assert "Sign in again" in response.text
+    assert 'href="/"' in response.text
+
+
+def test_remote_callback_recovers_via_store_when_cookie_state_desyncs(monkeypatch, tmp_path):
+    # iOS standalone PWA: the handshake cookie carries a *different* (but valid)
+    # state than the one the user approved, because the cross-origin authorize step
+    # runs in a separate in-app-browser context. The callback must still complete by
+    # recovering the PKCE secrets from the server-side store, keyed by the signed URL
+    # state. Regression guard for the deterministic PWA invalid_oauth_state dead-end.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    secret = config.remote_access.vibe_cloud.session_secret
+    client = app.test_client()
+
+    # The flow the user actually approved: a signed state plus its server-side record,
+    # bound to this browser's stable device id.
+    rid = "approvedrid000"
+    device_id = "device-abc-123"
+    state_url = ui_server._make_oauth_state(secret, next_target="/dashboard", rid=rid)
+    remote_access.store_oauth_handshake(
+        rid,
+        nonce="nonce-approved",
+        code_verifier="verifier-approved",
+        next_target="/dashboard",
+        device_hash=ui_server._oauth_device_hash(secret, device_id),
+    )
+
+    # A stale-but-valid cookie from a *different* GET / generation (different state).
+    stale_cookie = ui_server._make_oauth_cookie(
+        secret,
+        {
+            "state": ui_server._make_oauth_state(secret, next_target="/", rid="stalerid0000"),
+            "nonce": "nonce-stale",
+            "code_verifier": "verifier-stale",
+            "next": "/",
+            "exp": int(ui_server.datetime.now().timestamp()) + 300,
+        },
+    )
+    client.set_cookie(ui_server.REMOTE_OAUTH_COOKIE_NAME, stale_cookie, domain="alex.avibe.bot")
+    # The device cookie is stable across the excursion and matches the record's bind.
+    client.set_cookie(ui_server.REMOTE_OAUTH_DEVICE_COOKIE_NAME, device_id, domain="alex.avibe.bot")
+
+    captured = {}
+
+    def exchange(cfg, code, verifier):
+        captured["verifier"] = verifier
+        return {"claims": {"email": "alex@example.com", "sub": "user-1", "nonce": "nonce-approved"}}
+
+    monkeypatch.setattr(remote_access, "exchange_oauth_code", exchange)
+
+    response = client.get(
+        f"/auth/callback?code=test-code&state={state_url}",
+        base_url="https://alex.avibe.bot",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/dashboard"
+    # Used the server-side record's verifier, not the stale cookie's.
+    assert captured["verifier"] == "verifier-approved"
+    # Handshake is single-use: consumed by the callback.
+    assert remote_access.pop_oauth_handshake(rid) is None
+
+
+def test_oauth_handshake_store_is_single_use_and_expires(monkeypatch, tmp_path):
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+
+    remote_access.store_oauth_handshake("rid-abc", nonce="n", code_verifier="v", next_target="/x")
+    first = remote_access.pop_oauth_handshake("rid-abc")
+    assert first is not None
+    assert first["code_verifier"] == "v"
+    assert first["next"] == "/x"
+    # Single-use: a second pop finds nothing.
+    assert remote_access.pop_oauth_handshake("rid-abc") is None
+
+    # An expired record is treated as absent.
+    remote_access.store_oauth_handshake("rid-exp", nonce="n", code_verifier="v", next_target="/x")
+    remote_access._oauth_handshakes["rid-exp"]["exp"] = 0
+    assert remote_access.pop_oauth_handshake("rid-exp") is None
+
+    # Invalid ids are rejected, never touching the filesystem.
+    assert remote_access.pop_oauth_handshake("bad/rid") is None
+    assert remote_access.pop_oauth_handshake(None) is None
+
+
+def test_oauth_handshake_store_caps_entries(monkeypatch, tmp_path):
+    # The store is written on every unauthenticated redirect; a hard cap prevents
+    # unbounded inode growth under a burst. At capacity, new writes are shed and
+    # existing in-flight entries are preserved.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    monkeypatch.setattr(remote_access, "OAUTH_HANDSHAKE_MAX_ENTRIES", 3)
+
+    for i in range(3):
+        remote_access.store_oauth_handshake(f"rid-{i}", nonce="n", code_verifier="v", next_target="/")
+    remote_access.store_oauth_handshake("rid-overflow", nonce="n", code_verifier="v", next_target="/")
+
+    assert remote_access.pop_oauth_handshake("rid-overflow") is None
+    assert remote_access.pop_oauth_handshake("rid-0") is not None
+
+
+def test_oauth_handshake_cap_holds_under_concurrency(monkeypatch, tmp_path):
+    # Atomic admission: a concurrent burst must not blow past the cap. Without the
+    # lock, many threads could pass the count check before any writes.
+    import threading
+
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    monkeypatch.setattr(remote_access, "OAUTH_HANDSHAKE_MAX_ENTRIES", 5)
+
+    barrier = threading.Barrier(20)
+
+    def worker(i):
+        try:
+            barrier.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+        remote_access.store_oauth_handshake(f"rid-{i:03d}", nonce="n", code_verifier="v", next_target="/")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(remote_access._oauth_handshakes) <= 5
+
+
+def test_unauthenticated_auth_requests_are_rate_limited(monkeypatch, tmp_path):
+    # Root-level bound: a flood of unauthenticated login-start requests from one
+    # client is 429'd, instead of each one doing handshake/cookie/log work.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    monkeypatch.setattr(ui_server, "_AUTH_RATELIMIT_MAX_PER_WINDOW", 3)
+    client = app.test_client()
+
+    statuses = [
+        client.get(
+            "/dashboard",
+            base_url="https://alex.avibe.bot",
+            environ_base={"REMOTE_ADDR": "203.0.113.77"},
+            follow_redirects=False,
+        ).status_code
+        for _ in range(5)
+    ]
+    assert statuses[:3] == [302, 302, 302]  # within budget -> redirect to login
+    assert statuses[3:] == [429, 429]  # over budget -> throttled
+
+
+def test_auth_rate_limit_ignores_untrusted_forwarded_ip(monkeypatch, tmp_path):
+    # A direct (non-loopback) peer can't dodge the limit by rotating CF-Connecting-IP:
+    # the forwarded IP is trusted only from the loopback tunnel peer, so such a peer
+    # is keyed by its real address and the rotating header is ignored.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    monkeypatch.setattr(ui_server, "_AUTH_RATELIMIT_MAX_PER_WINDOW", 3)
+    client = app.test_client()
+
+    statuses = [
+        client.get(
+            "/dashboard",
+            base_url="https://alex.avibe.bot",
+            environ_base={"REMOTE_ADDR": "203.0.113.90"},
+            headers={"CF-Connecting-IP": f"9.9.9.{i}"},  # rotated each request
+            follow_redirects=False,
+        ).status_code
+        for i in range(5)
+    ]
+    assert statuses[:3] == [302, 302, 302]
+    assert statuses[3:] == [429, 429]  # still limited despite the rotating header
+
+
+def test_auth_rate_limit_table_is_bounded(monkeypatch, tmp_path):
+    # The limiter's own table is hard-capped (LRU eviction), so a burst of distinct
+    # clients can't drive unbounded in-process memory growth.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    monkeypatch.setattr(ui_server, "_AUTH_RATELIMIT_MAX_TRACKED_CLIENTS", 3)
+    client = app.test_client()
+
+    for i in range(10):  # 10 distinct peers
+        client.get(
+            "/dashboard",
+            base_url="https://alex.avibe.bot",
+            environ_base={"REMOTE_ADDR": f"198.51.100.{i}"},
+            follow_redirects=False,
+        )
+    assert len(ui_server._auth_ratelimit) <= 3
+
+
+def test_oauth_diag_log_is_rate_limited(monkeypatch):
+    # The unauthenticated callback failure path must not grow the log without bound:
+    # repeated hits within the window emit once, with the suppressed count folded in.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ui_server.time, "monotonic", lambda: clock["t"])
+    ui_server._oauth_diag_log_state.pop("test_key", None)
+
+    emitted = []
+    monkeypatch.setattr(ui_server.logger, "warning", lambda msg, *a: emitted.append(msg % a if a else msg))
+
+    for _ in range(5):
+        ui_server._log_oauth_diag("test_key", "boom x=%s", 1)
+    assert len(emitted) == 1  # only the first hit in the window is logged
+
+    clock["t"] += ui_server._OAUTH_DIAG_LOG_INTERVAL_SECONDS + 1
+    ui_server._log_oauth_diag("test_key", "boom x=%s", 1)
+    assert len(emitted) == 2
+    assert "suppressed" in emitted[1]  # the 4 suppressed hits are reported
+
+
+def test_oauth_error_page_localizes_from_accept_language(monkeypatch, tmp_path):
+    # The re-login page copy must come from vibe/i18n and honor the browser's
+    # Accept-Language (the only server-readable locale signal pre-auth).
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    client = app.test_client()
+
+    response = client.get(
+        "/auth/callback?code=test-code&state=state-1",
+        base_url="https://alex.avibe.bot",
+        headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+    )
+
+    assert response.status_code == 400
+    body = response.text
+    assert '<html lang="zh"' in body
+    assert "登录会话已过期" in body  # invalid_oauth_state_title (zh)
+    assert "重新登录" in body  # sign_in_again (zh)
+    assert "Your sign-in session expired" not in body  # not the English copy
+
+
+def test_remote_callback_refuses_store_fallback_without_device_binding(monkeypatch, tmp_path):
+    # Login-CSRF block: a code+state callback URL must not complete in a browser that
+    # isn't the one that started the flow. The store record is bound to the attacker's
+    # device id; the victim's browser presents its own (different) device cookie plus a
+    # stale handshake cookie, so the store-fallback must refuse — no token exchange.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    secret = config.remote_access.vibe_cloud.session_secret
+    client = app.test_client()
+
+    rid = "victimrid0001"
+    state_url = ui_server._make_oauth_state(secret, next_target="/dashboard", rid=rid)
+    remote_access.store_oauth_handshake(
+        rid,
+        nonce="n",
+        code_verifier="v",
+        next_target="/dashboard",
+        device_hash=ui_server._oauth_device_hash(secret, "attacker-device"),
+    )
+
+    # Victim browser: a valid-but-stale handshake cookie and its OWN device cookie.
+    stale_cookie = ui_server._make_oauth_cookie(
+        secret,
+        {
+            "state": ui_server._make_oauth_state(secret, next_target="/", rid="victimst0000"),
+            "nonce": "x",
+            "code_verifier": "x",
+            "next": "/",
+            "exp": int(ui_server.datetime.now().timestamp()) + 300,
+        },
+    )
+    client.set_cookie(ui_server.REMOTE_OAUTH_COOKIE_NAME, stale_cookie, domain="alex.avibe.bot")
+    client.set_cookie(ui_server.REMOTE_OAUTH_DEVICE_COOKIE_NAME, "victim-device", domain="alex.avibe.bot")
+
+    exchanged = []
+    monkeypatch.setattr(
+        remote_access, "exchange_oauth_code", lambda *a, **k: exchanged.append(a) or {"claims": {}}
+    )
+
+    response = client.get(
+        f"/auth/callback?code=test-code&state={state_url}",
+        base_url="https://alex.avibe.bot",
+        follow_redirects=False,
+    )
+
+    # Never exchanged the code, and never redirected the browser to the target.
+    assert exchanged == []
+    assert response.headers.get("Location") != "/dashboard"
+
+
+def test_oauth_handshake_pop_is_atomic_single_use_under_concurrency(monkeypatch, tmp_path):
+    import threading
+    from unittest import mock
+
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    remote_access.store_oauth_handshake("race-rid000", nonce="n", code_verifier="v", next_target="/")
+
+    barrier = threading.Barrier(2)
+    orig_replace = remote_access.os.replace
+
+    def delayed_replace(src, dst):
+        try:
+            barrier.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+        return orig_replace(src, dst)
+
+    results = []
+
+    def worker():
+        results.append(remote_access.pop_oauth_handshake("race-rid000"))
+
+    with mock.patch.object(remote_access.os, "replace", delayed_replace):
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    # The atomic claim guarantees exactly one racer gets the record.
+    assert sum(1 for r in results if r is not None) == 1
 
 
 def test_remote_callback_accepts_html_escaped_state_separator(monkeypatch, tmp_path):

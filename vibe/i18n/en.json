@@ -397,5 +397,19 @@
     "routingChoosePrefix": "Choose a value for",
     "routingSaving": "Saving routing settings...",
     "routingCanceled": "Routing update canceled."
+  },
+  "remote_access": {
+    "oauth_error": {
+      "sign_in_again": "Sign in again",
+      "cookie_hint": "Still stuck after trying again? Make sure your browser allows cookies for this site.",
+      "default_title": "Let's sign you in again",
+      "default_body": "Your sign-in didn't finish. Please try again.",
+      "invalid_oauth_state_title": "Your sign-in session expired",
+      "invalid_oauth_state_body": "The secure login link expired or couldn't be matched to this browser. This usually happens when a sign-in link sits unused for a few minutes, or is opened in a different tab or window. Start over and you'll be right back in.",
+      "oauth_exchange_failed_title": "We couldn't finish signing you in",
+      "oauth_exchange_failed_body": "Avibe Cloud didn't complete the sign-in just now. This is usually temporary — please try again.",
+      "invalid_oauth_nonce_title": "We couldn't verify this sign-in",
+      "invalid_oauth_nonce_body": "This sign-in attempt couldn't be verified, so we stopped to keep your account secure. Start over to continue."
+    }
   }
 }
