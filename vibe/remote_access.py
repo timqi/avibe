@@ -880,6 +880,14 @@ OAUTH_HANDSHAKE_TTL_SECONDS = 300
 # logins) and is far above any realistic concurrent-login count.
 OAUTH_HANDSHAKE_MAX_ENTRIES = 2048
 _OAUTH_HANDSHAKE_RID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+# Serializes prune+capacity-check+write so the cap is enforced atomically under a
+# concurrent burst (count-then-write without a lock could blow past the cap).
+_OAUTH_STORE_LOCK = threading.Lock()
+# Throttle the "at capacity" warning: under a sustained flood it would otherwise be
+# emitted on every shed write and grow the log unbounded — the very thing the cap
+# is meant to prevent.
+_OAUTH_STORE_CAPACITY_WARN_INTERVAL_SECONDS = 60.0
+_oauth_store_capacity_warned_at = 0.0
 
 
 def _oauth_handshake_dir() -> Path:
@@ -905,6 +913,15 @@ def _prune_oauth_handshakes(directory: Path) -> int:
     return survivors
 
 
+def _warn_oauth_store_at_capacity() -> None:
+    """Log the capacity-shed warning at most once per interval (call under the lock)."""
+    global _oauth_store_capacity_warned_at
+    now = time.monotonic()
+    if now - _oauth_store_capacity_warned_at >= _OAUTH_STORE_CAPACITY_WARN_INTERVAL_SECONDS:
+        _oauth_store_capacity_warned_at = now
+        logger.warning("oauth handshake store at capacity (>= %d); shedding writes", OAUTH_HANDSHAKE_MAX_ENTRIES)
+
+
 def store_oauth_handshake(
     rid: str, *, nonce: str, code_verifier: str, next_target: str, device_hash: str | None = None
 ) -> None:
@@ -917,16 +934,6 @@ def store_oauth_handshake(
     if not _OAUTH_HANDSHAKE_RID_RE.match(rid or ""):
         return
     directory = _oauth_handshake_dir()
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        directory.chmod(0o700)
-    except OSError:
-        pass
-    # Prune expired records first; if the store is still at capacity (i.e. flooded
-    # with fresh entries), shed this write rather than grow unbounded on disk.
-    if _prune_oauth_handshakes(directory) >= OAUTH_HANDSHAKE_MAX_ENTRIES:
-        logger.warning("oauth handshake store at capacity (>= %d); skipping write", OAUTH_HANDSHAKE_MAX_ENTRIES)
-        return
     payload = {
         "nonce": nonce,
         "code_verifier": code_verifier,
@@ -935,19 +942,32 @@ def store_oauth_handshake(
         "exp": int(time.time()) + OAUTH_HANDSHAKE_TTL_SECONDS,
     }
     final = directory / f"{rid}.json"
-    tmp = directory / f".{rid}.{os.getpid()}.tmp"
-    try:
-        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    tmp = directory / f".{rid}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    # Hold the lock across prune + capacity-check + write so admission is atomic:
+    # otherwise a concurrent burst could all pass the check and blow past the cap.
+    with _OAUTH_STORE_LOCK:
         try:
-            tmp.chmod(0o600)
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o700)
         except OSError:
             pass
-        os.replace(tmp, final)
-    except OSError:
+        # Prune expired records first; if the store is still at capacity (i.e. a
+        # flood of fresh entries), shed this write rather than grow unbounded.
+        if _prune_oauth_handshakes(directory) >= OAUTH_HANDSHAKE_MAX_ENTRIES:
+            _warn_oauth_store_at_capacity()
+            return
         try:
-            tmp.unlink()
+            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            try:
+                tmp.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(tmp, final)
         except OSError:
-            pass
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def pop_oauth_handshake(rid: str | None) -> dict[str, Any] | None:

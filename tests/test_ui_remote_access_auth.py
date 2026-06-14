@@ -1233,6 +1233,34 @@ def test_oauth_handshake_store_caps_entries(monkeypatch, tmp_path):
     assert remote_access.pop_oauth_handshake("rid-0") is not None
 
 
+def test_oauth_handshake_cap_holds_under_concurrency(monkeypatch, tmp_path):
+    # Atomic admission: a concurrent burst must not blow past the cap. Without the
+    # lock, many threads could pass the count check before any writes.
+    import threading
+
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    monkeypatch.setattr(remote_access, "OAUTH_HANDSHAKE_MAX_ENTRIES", 5)
+
+    barrier = threading.Barrier(20)
+
+    def worker(i):
+        try:
+            barrier.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+        remote_access.store_oauth_handshake(f"rid-{i:03d}", nonce="n", code_verifier="v", next_target="/")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    live = list((paths.get_runtime_dir() / "oauth_handshakes").glob("*.json"))
+    assert len(live) <= 5
+
+
 def test_oauth_diag_log_is_rate_limited(monkeypatch):
     # The unauthenticated callback failure path must not grow the log without bound:
     # repeated hits within the window emit once, with the suppressed count folded in.

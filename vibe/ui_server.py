@@ -2645,7 +2645,8 @@ def remote_access_auth_callback():
         result = remote_access.exchange_oauth_code(config, _oauth_callback_arg("code") or "", code_verifier)
         claims = result["claims"]
     except Exception as exc:
-        logger.warning("vibe cloud oauth code exchange failed: %s", exc)
+        # Unauthenticated-reachable (valid handshake + bad code), so rate-limited.
+        _log_oauth_diag("exchange_failed", "vibe cloud oauth code exchange failed: %s", exc)
         return _oauth_callback_error_response("oauth_exchange_failed", next_target=next_target)
     if claims.get("nonce") != handshake_nonce:
         return _oauth_callback_error_response("invalid_oauth_nonce", next_target=next_target)
