@@ -475,15 +475,17 @@ jobs:
           fi
 
           # Source 2: an already-created release body. A silent release is often
-          # set up by pre-creating the release with the marker in its body
-          # (e.g. via 'gh release create --notes-file'). This job overwrites the
-          # body with AI-generated notes, which would otherwise STRIP that marker
-          # and silently re-enable update notifications for a release meant to be
-          # silent. Honor a marker that is already on the release we are editing.
-          if [ "$has_marker" != "true" ] && [[ "$TAG" != gh-v* ]]; then
+          # set up by pre-creating the release with the marker comment in its body
+          # (e.g. via 'gh release create --notes-file'). Both this job (official
+          # tags) and the later softprops step (gh-v* tags) replace the body with
+          # release.md, which would otherwise STRIP that marker — so this applies
+          # to ALL tags, not just official ones. Require the STRICT HTML-comment
+          # form here: a body that merely DOCUMENTS the marker text as prose
+          # (e.g. notes about this workflow) is not an intent to go silent.
+          if [ "$has_marker" != "true" ]; then
             EXISTING_BODY=$(gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" --json body --jq '.body' 2>/dev/null || true)
-            if echo "$EXISTING_BODY" | grep -qE "$MARKER_RE"; then
-              echo "Silent update marker found in the existing release body."
+            if echo "$EXISTING_BODY" | grep -qE "$MARKER_COMMENT_RE"; then
+              echo "Silent update marker (HTML comment) found in the existing release body."
               has_marker="true"
             fi
           fi
