@@ -629,7 +629,17 @@
     },
     "search": {
       "roleYou": "You",
-      "roleAgent": "Agent"
+      "roleAgent": "Agent",
+      "title": "Search messages",
+      "entry": "Search messages",
+      "placeholder": "Search messages",
+      "hint": "Search your messages",
+      "empty": "No messages found",
+      "kbdEsc": "Esc",
+      "kbdNavigate": "Navigate",
+      "kbdOpen": "Open",
+      "kbdClose": "Close",
+      "footerNote": "Searching message content · all sessions"
     },
     "inbox": {
       "eyebrow": "Inbox",

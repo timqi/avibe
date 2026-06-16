@@ -19,6 +19,7 @@ import {
   Loader2,
   Pencil,
   Plus,
+  Search,
   Settings2,
   WandSparkles,
 } from 'lucide-react';
@@ -612,7 +613,7 @@ const ProjectRow: React.FC<{
   );
 };
 
-export const WorkbenchSidebar: React.FC = () => {
+export const WorkbenchSidebar: React.FC<{ onOpenSearch?: () => void }> = ({ onOpenSearch }) => {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { totalUnread, unreadSessions, inboxSessions, markRead, unreadBySession } = useWorkbenchInbox();
@@ -688,6 +689,21 @@ export const WorkbenchSidebar: React.FC = () => {
   // popover stays OUT of any overflow box below, so it is never clipped.
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
+      {/* Search field — the sidebar's first item (Brand lives in AppShell).
+          Field-style button per design.pen XErMu: search glyph + muted
+          placeholder + ⌘K pill; opens the ⌘K command palette. */}
+      <button
+        type="button"
+        onClick={onOpenSearch}
+        className="flex items-center gap-2 rounded-lg border border-border-strong bg-foreground/[0.03] px-[11px] py-[9px] text-left transition hover:bg-foreground/[0.05]"
+      >
+        <Search className="size-3.5 shrink-0 text-muted" />
+        <span className="flex-1 truncate text-[13px] text-muted">{t('workbench.search.entry')}</span>
+        <kbd className="shrink-0 rounded-[5px] border border-border bg-foreground/[0.06] px-1.5 py-0.5 font-mono text-[11px] font-medium text-muted">
+          ⌘K
+        </kbd>
+      </button>
+
       {/* Inbox entry — hover opens the floating popover. */}
       <div
         className="relative"

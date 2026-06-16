@@ -13,6 +13,7 @@ import { ThemeToggle } from './ThemeToggle';
 import { VersionBadge } from './VersionBadge';
 import { WorkbenchSidebar } from './workbench/WorkbenchSidebar';
 import { NewSessionSheet } from './workbench/NewSessionSheet';
+import { SearchPalette } from './workbench/search/SearchPalette';
 import { Button } from './ui/button';
 import { InstallHint } from './InstallHint';
 import logoImg from '../assets/logo.png';
@@ -141,6 +142,7 @@ export const AppShell: React.FC = () => {
   const [enabledPlatforms, setEnabledPlatforms] = useState<string[]>([]);
   const [config, setConfig] = useState<any>(null);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   // Mirror the iOS visual-viewport height into --app-vvh. The MOBILE shell is a
   // static locked column that does NOT read it (resizing the shell mid-focus
   // fought iOS's scroll-into-view and flung the input off-screen); only the md+
@@ -154,6 +156,20 @@ export const AppShell: React.FC = () => {
       setEnabledPlatforms(getEnabledPlatforms(c));
     }).catch(() => {});
   }, [api]);
+
+  // Global ⌘K / Ctrl+K toggles the message-search palette. Intercept the chord
+  // everywhere (it's a deliberate command, so it wins even from the composer);
+  // the palette's own input/Esc/arrow handling takes over once it is open.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault();
+        setSearchOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   const hasChannelPlatforms = enabledPlatforms.some((platform) => platformSupportsChannels(config, platform));
   const isRunning = status.state === 'running';
@@ -242,7 +258,7 @@ export const AppShell: React.FC = () => {
                 </nav>
               </div>
             )}
-            {shellMode === 'workbench' && <WorkbenchSidebar />}
+            {shellMode === 'workbench' && <WorkbenchSidebar onOpenSearch={() => setSearchOpen(true)} />}
           </div>
 
           {/* Bottom: Status (with embedded version badge) + toggles + hostname */}
@@ -365,6 +381,11 @@ export const AppShell: React.FC = () => {
         onClose={() => setNewSessionOpen(false)}
         onOpen={() => setNewSessionOpen(true)}
       />
+
+      {/* ⌘K message-search palette. Mounted shell-wide so the shortcut works from
+          both Workbench and Control Panel; the sidebar field is the workbench
+          entry point. */}
+      <SearchPalette open={searchOpen} onClose={() => setSearchOpen(false)} />
     </div>
   );
 };
