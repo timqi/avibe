@@ -811,8 +811,24 @@ export const ChatPage: React.FC = () => {
           void refreshQueue();
           return;
         }
-        // A turn started — optimistically show the user row (echo dedupes by id).
-        if (body && body.id) appendMessage(body as WorkbenchMessage);
+        // A turn started — show the user row. If we're in an around-jump window
+        // (a search jump landed away from the live tail, newerCursor set), the
+        // transcript is a centered historical window with a deliberate gap to the
+        // tail — appendMessage would graft the just-sent prompt disjointly below
+        // that window (same hole the SSE/reconcile guards avoid). Instead exit
+        // around-mode and catch up to the live tail (which already contains the
+        // persisted prompt) via the shared tail-reload, then scroll the sent row
+        // into view. Outside around-mode, append optimistically (echo dedupes).
+        if (body && body.id) {
+          if (newerCursorRef.current) {
+            await jumpToLatest();
+            if (sessionId === sessionIdRef.current) {
+              setJumpTarget((body as WorkbenchMessage).id);
+            }
+          } else {
+            appendMessage(body as WorkbenchMessage);
+          }
+        }
       } catch (err: any) {
         if (sessionId === sessionIdRef.current) {
           setWorking(false);
@@ -823,7 +839,7 @@ export const ChatPage: React.FC = () => {
         }
       }
     },
-    [sessionId, appendMessage, refreshQueue, markWorking],
+    [sessionId, appendMessage, refreshQueue, markWorking, jumpToLatest],
   );
 
   // @ mention source: all enabled Agents, filtered client-side (the set is small
@@ -1093,7 +1109,14 @@ export const ChatPage: React.FC = () => {
       // reconcile update can't cancel the in-flight around-fetch (Codex P2).
       cancelled = true;
     };
-  }, [deepLinkMessageId, sessionId, loading, session, api, startHighlight, setSearchParams]);
+    // Depend on ``session?.id`` (stable), NOT the whole ``session`` object: a
+    // title / native-bind / agent_status update landing while the around-fetch
+    // is in flight would otherwise re-run this effect — running the cleanup
+    // (cancelling the fetch), then exiting via handledJumpRef so the fetched
+    // window is dropped and ``?msg`` stays unhandled (Codex P2). The closure
+    // still reads ``session`` for the ``!session`` / ``session.id !== sessionId``
+    // readiness checks; it only needs to re-run when the id changes.
+  }, [deepLinkMessageId, sessionId, loading, session?.id, api, startHighlight, setSearchParams]);
 
   // Re-arm the jump guard once ``?msg=`` is gone. ``clearParam`` (above) nulls
   // the param after handling, so without this re-selecting the SAME search hit
@@ -1121,11 +1144,20 @@ export const ChatPage: React.FC = () => {
   // inbox.session.updated lands after a reply — so the Inbox/sidebar never badge
   // the chat you're looking at. Reactive to the unread map, so it's race-free
   // against the cross-process event ordering.
+  //
+  // EXCEPT while in an around-jump window (newerCursor set): the SSE feed DROPS
+  // live tail rows there (see the message.new guard) so a fresh agent reply is
+  // neither rendered nor at the bottom of the loaded window — marking it read
+  // here would silently swallow it (no badge, no row), and the user would never
+  // know it arrived. Suppress the mark-read until the user catches up to the
+  // live tail (newerCursor clears) — listing ``newerCursor`` in the deps re-runs
+  // this then, so any still-unread reply gets marked read once it's visible.
   useEffect(() => {
+    if (newerCursor) return;
     if (sessionId && (unreadBySession[sessionId] ?? 0) > 0) {
       void markInboxRead(sessionId);
     }
-  }, [sessionId, unreadBySession, markInboxRead]);
+  }, [sessionId, unreadBySession, markInboxRead, newerCursor]);
 
   // The Workbench canvas creates the session and hands its first message over
   // as router state. Replay it once through the compose path so the agent turn

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ChevronLeft, Loader2, Search, X } from 'lucide-react';
 
 import { useMessageSearch } from '../../lib/useMessageSearch';
+import { Button } from '../ui/button';
 import { SearchResultGroup } from './search/SearchResultGroup';
 
 // Mobile full-screen message-content search (design.pen K7Bytg "M · Search
@@ -18,9 +19,31 @@ export const SearchPage: React.FC = () => {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
-  const [query, setQuery] = useState('');
+  // The query lives in the URL (?q=…), not just component state, so navigating
+  // INTO a result (push /chat/…?msg=…) and back (navigate(-1) → /search?q=…)
+  // restores it — otherwise Back would land on a blank search page. Seed the
+  // input from the param on mount and mirror every keystroke back into it.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [query, setQuery] = useState(() => searchParams.get('q') ?? '');
   const { results, loading } = useMessageSearch(query);
   const inputRef = useRef<HTMLInputElement | null>(null);
+
+  // Drive the query (state + URL together). ``replace: true`` so each keystroke
+  // updates ?q= in place instead of pushing a history entry per character (Back
+  // would otherwise step through every intermediate query). Preserve any other
+  // params already on the URL.
+  const updateQuery = (next: string) => {
+    setQuery(next);
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        if (next) params.set('q', next);
+        else params.delete('q');
+        return params;
+      },
+      { replace: true },
+    );
+  };
 
   // Autofocus the field on mount so typing flows straight in (the search page
   // exists only to search). iOS sometimes needs the focus deferred a tick past
@@ -42,7 +65,7 @@ export const SearchPage: React.FC = () => {
   // already-empty field it doubles as a back affordance.
   const onClear = () => {
     if (query) {
-      setQuery('');
+      updateQuery('');
       inputRef.current?.focus();
     } else {
       goBack();
@@ -62,20 +85,22 @@ export const SearchPage: React.FC = () => {
     <div className="fixed inset-0 z-40 flex flex-col bg-background pt-[env(safe-area-inset-top)] md:absolute">
       {/* Header — back chevron + active search field (design.pen P6Nsz/KmsNV). */}
       <header className="flex shrink-0 items-center gap-2.5 border-b border-border bg-background/92 px-4 py-3 backdrop-blur">
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="icon"
           onClick={goBack}
           aria-label={t('common.back')}
-          className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border-strong bg-foreground/[0.04] text-foreground transition hover:bg-foreground/[0.08]"
+          className="size-9 shrink-0 rounded-lg border border-border-strong bg-foreground/[0.04] hover:bg-foreground/[0.08]"
         >
           <ChevronLeft className="size-5" />
-        </button>
+        </Button>
         <div className="flex min-w-0 flex-1 items-center gap-2.5 rounded-xl border border-border-strong bg-foreground/[0.04] px-3 py-2.5">
           <Search className="size-4 shrink-0 text-mint" />
           <input
             ref={inputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => updateQuery(e.target.value)}
             placeholder={t('workbench.search.placeholder')}
             aria-label={t('workbench.search.placeholder')}
             className="min-w-0 flex-1 bg-transparent text-[15px] text-foreground outline-none placeholder:text-muted"
@@ -85,14 +110,16 @@ export const SearchPage: React.FC = () => {
             enterKeyHint="search"
           />
           {loading && <Loader2 className="size-4 shrink-0 animate-spin text-muted" />}
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="icon"
             onClick={onClear}
             aria-label={t('common.clear')}
-            className="flex size-5 shrink-0 items-center justify-center rounded-md text-muted transition hover:text-foreground"
+            className="size-5 shrink-0 rounded-md text-muted hover:bg-transparent hover:text-foreground [&_svg]:size-4"
           >
             <X className="size-4" />
-          </button>
+          </Button>
         </div>
       </header>
 

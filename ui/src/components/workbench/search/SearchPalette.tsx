@@ -99,6 +99,11 @@ export const SearchPalette: React.FC<SearchPaletteProps> = ({ open, onClose }) =
       e.preventDefault();
       moveSelection(-1);
     } else if (e.key === 'Enter') {
+      // Result rows are real <Button>s now (focusable via Tab). Only treat Enter
+      // as "open the arrow-selected hit" while the SEARCH INPUT holds focus; when
+      // a row Button is focused, let its native Enter→click fire so the FOCUSED
+      // row activates instead of the (possibly different) arrow-selected one.
+      if (document.activeElement !== inputRef.current) return;
       e.preventDefault();
       const target = flatMatches.find((m) => m.messageId === selectedId);
       if (target) handleSelect(target.sessionId, target.messageId);
