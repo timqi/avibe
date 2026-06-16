@@ -79,6 +79,7 @@ class SQLiteSettingsService:
                         {
                             "show_message_types": item.show_message_types,
                             "routing": routing,
+                            "require_bind": item.require_bind,
                         }
                     ),
                     created_at=now,
@@ -237,6 +238,7 @@ class SQLiteSettingsService:
                 custom_cwd=row["workdir"],
                 routing=_routing_from_row(row, payload),
                 require_mention=_nullable_bool(row["require_mention"]),
+                require_bind=payload.get("require_bind"),
             )
         return result
 

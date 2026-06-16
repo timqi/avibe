@@ -70,6 +70,7 @@ interface ChannelConfig {
     codex_reasoning_effort?: string | null;
   };
   require_mention?: boolean | null;  // null=use global default, true=require, false=don't require
+  require_bind?: boolean | null;  // null/false=off, true=only bound users may use this channel
 }
 
 interface TelegramDiscoverySummary {
@@ -731,6 +732,7 @@ export const ChannelList: React.FC<ChannelListProps> = ({ data = {}, onNext, onB
         codex_reasoning_effort: null,
       },
     require_mention: null,
+    require_bind: null,
   });
 
   const selectedCount = channels.filter((channel) => isChannelEnabled(channel.id)).length;
@@ -1314,6 +1316,7 @@ export const ChannelList: React.FC<ChannelListProps> = ({ data = {}, onNext, onB
                 custom_cwd: rawConfig.custom_cwd ?? def.custom_cwd,
                 routing: { ...def.routing, ...(rawConfig.routing || {}) },
                 require_mention: rawConfig.require_mention !== undefined ? rawConfig.require_mention : def.require_mention,
+                require_bind: rawConfig.require_bind !== undefined ? rawConfig.require_bind : def.require_bind,
               };
               const rowKey = `${channelPlatform}::${channel.id}`;
               const expanded = expandedChannelId === rowKey;
@@ -1723,6 +1726,7 @@ export const ChannelList: React.FC<ChannelListProps> = ({ data = {}, onNext, onB
             },
             // Preserve require_mention from rawConfig (can be null, true, or false)
             require_mention: rawConfig.require_mention !== undefined ? rawConfig.require_mention : def.require_mention,
+            require_bind: rawConfig.require_bind !== undefined ? rawConfig.require_bind : def.require_bind,
           };
           const effectiveCwd = channelConfig.custom_cwd || config.runtime?.default_cwd || '~/work';
           const opencodeOptions = opencodeOptionsByCwd[effectiveCwd];

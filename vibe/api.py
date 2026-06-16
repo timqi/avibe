@@ -1268,6 +1268,7 @@ def save_settings(payload: dict) -> dict:
                 custom_cwd=channel_payload.get("custom_cwd"),
                 routing=_parse_routing(_normalize_backend_routing_payload(channel_payload.get("routing") or {})),
                 require_mention=channel_payload.get("require_mention"),
+                require_bind=channel_payload.get("require_bind"),
             )
         store.set_channels_for_platform(platform, channels)
     if "guilds" in payload or "guild_allowlist" in payload:
@@ -1901,6 +1902,7 @@ def _settings_to_payload(store: SettingsStore, platform: str) -> dict:
             "show_message_types": normalize_show_message_types(settings.show_message_types),
             "custom_cwd": settings.custom_cwd,
             "require_mention": settings.require_mention,
+            "require_bind": settings.require_bind,
             "routing": routing_to_compat_dict(settings.routing),
         }
     payload["guild_scope_configured"] = store.has_guild_scope_for_platform(platform)

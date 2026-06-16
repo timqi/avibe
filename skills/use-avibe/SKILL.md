@@ -386,6 +386,7 @@ Channel entry shape:
   "show_message_types": ["assistant"],
   "custom_cwd": "/path/to/repo",
   "require_mention": null,
+  "require_bind": null,
   "routing": {
     "agent_backend": "codex",
     "model": "gpt-5.4",
@@ -409,6 +410,7 @@ Field meanings:
 - `show_message_types`: visible intermediate messages; allowed values are `system`, `assistant`, `toolcall`
 - `custom_cwd`: scope-level working directory override; empty string or `null` means use global default
 - `require_mention`: `null` inherits the platform default, `true` requires mention, `false` disables mention gating for that channel
+- `require_bind`: `null`/`false` lets any channel member use the bot (current default); `true` gates the channel to bound users only — messages from unbound senders are silently ignored (no denial reply), while the bot's own replies stay visible to everyone. Enforced in the shared auth pipeline, so it applies on every platform. Bind is platform-wide, so `require_bind` means "is this sender a bound user", not a per-channel allowlist.
 - `routing.agent_backend`: `opencode`, `claude`, `codex`, or `null` to inherit default
 - `routing.model`: canonical scope-level model override for the selected backend
 - `routing.reasoning_effort`: canonical scope-level reasoning override for the selected backend

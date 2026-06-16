@@ -43,6 +43,21 @@ def test_settings_store_uses_sqlite_without_rewriting_legacy_json(tmp_path: Path
         reloaded.close()
 
 
+def test_channel_require_bind_persists(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    store.update_channel("C-bind", ChannelSettings(enabled=True, require_bind=True), platform="slack")
+    store.update_channel("C-open", ChannelSettings(enabled=True), platform="slack")
+    store.close()
+
+    reloaded = SettingsStore(settings_path)
+    try:
+        assert reloaded.find_channel("C-bind", platform="slack").require_bind is True
+        assert reloaded.find_channel("C-open", platform="slack").require_bind in (None, False)
+    finally:
+        reloaded.close()
+
+
 def test_settings_store_reloads_external_sqlite_writes(tmp_path: Path) -> None:
     settings_path = tmp_path / "settings.json"
     store = SettingsStore(settings_path)
