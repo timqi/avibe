@@ -584,6 +584,7 @@
     "sessionRenamePlaceholder": "Session name",
     "sessionReference": "Reference this session",
     "sessionFork": "Fork session",
+    "sessionForkUnavailable": "This session has no native agent session to fork yet.",
     "sessionArchive": "Archive session",
     "archiveSession": {
       "title": "Archive this session permanently?",

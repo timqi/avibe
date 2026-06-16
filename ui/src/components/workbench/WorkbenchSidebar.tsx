@@ -267,7 +267,7 @@ const SessionRow: React.FC<{
   }
 
   const displayName = session.title?.trim() || t('workbench.untitledSession');
-  const canFork = !forking;
+  const canFork = !!session.native_session_id && !forking;
   return (
     <>
     <Popover open={menuOpen} onOpenChange={setMenuOpen}>
@@ -328,6 +328,7 @@ const SessionRow: React.FC<{
         <button
           type="button"
           disabled={!canFork}
+          title={!session.native_session_id ? t('workbench.sessionForkUnavailable') : undefined}
           onClick={async () => {
             if (!canFork) return;
             setMenuOpen(false);
