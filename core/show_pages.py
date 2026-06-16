@@ -268,6 +268,14 @@ class ShowPageStore:
             status = conn.execute(
                 select(agent_sessions.c.status).where(agent_sessions.c.id == session_id)
             ).scalar_one_or_none()
+            if status is None:
+                # Unknown session — don't create an orphan page row not tied to any
+                # session lifecycle/archive cleanup (other session-scoped APIs also
+                # treat a missing session as absent).
+                raise ShowPageError(
+                    "Cannot create a Show Page for an unknown session.",
+                    code="session_not_found",
+                )
             if status == "archived":
                 raise ShowPageError(
                     "Cannot create a Show Page for an archived session.",

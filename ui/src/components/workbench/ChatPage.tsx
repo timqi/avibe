@@ -108,11 +108,18 @@ export const ChatPage: React.FC = () => {
     { disabled: !sessionId },
   );
 
+  // Loaded session (null while bootstrapping — ChatPage renders a loader until
+  // it's set). Lifted above the composer bridge + show-page logic that gate on it.
+  const [session, setSession] = useState<WorkbenchSession | null>(null);
+
   // Show Page toggle: swap the chat surface (transcript + composer, NOT the
   // header bar) for this session's Show Page in an iframe, and back. Declared
   // before the composer bridge target, which depends on showPageMode.
   const [showPageMode, setShowPageMode] = useState(false);
   const [showPageBusy, setShowPageBusy] = useState(false);
+  // Sessions whose first-open visualize prompt failed to send — retry it on the
+  // next toggle (the page row already exists, so `existed` alone won't re-prompt).
+  const showPagePromptRetryRef = useRef<Set<string>>(new Set());
   const [showPageUrl, setShowPageUrl] = useState<string | null>(null);
   useEffect(() => {
     // ChatPage is reused across :sessionId — clear all show-page state so the
@@ -130,12 +137,14 @@ export const ChatPage: React.FC = () => {
       composerRef.current?.insertSessionReference(refSessionId, title),
     [],
   );
-  // Null target hides that sidebar action — when no chat is open (no sessionId)
-  // OR while the Show Page iframe has replaced the composer (it's unmounted, so
-  // an insert would silently no-op).
+  // Null target hides that sidebar action unless the composer is actually
+  // mounted + insertable: a chat is open (sessionId), its session has loaded
+  // (before that ChatPage shows a loader — the composer isn't rendered yet), and
+  // the Show Page iframe hasn't replaced the composer. Otherwise an insert would
+  // silently no-op against a null composerRef.
   const composerTarget = useMemo<ComposerInsertTarget | null>(
-    () => (sessionId && !showPageMode ? { sessionId, insertSessionReference } : null),
-    [sessionId, showPageMode, insertSessionReference],
+    () => (sessionId && session != null && !showPageMode ? { sessionId, insertSessionReference } : null),
+    [sessionId, session, showPageMode, insertSessionReference],
   );
   useRegisterComposerTarget(composerTarget);
 
@@ -147,7 +156,6 @@ export const ChatPage: React.FC = () => {
     else navigate('/inbox');
   }, [location.key, navigate]);
 
-  const [session, setSession] = useState<WorkbenchSession | null>(null);
   const [agents, setAgents] = useState<VibeAgentBrief[]>([]);
   const [defaultAgentName, setDefaultAgentName] = useState<string | null>(null);
   const [messages, setMessages] = useState<WorkbenchMessage[]>([]);
@@ -760,11 +768,17 @@ export const ChatPage: React.FC = () => {
             ? `/p/${encodeURIComponent(res.share_id)}/`
             : `/show/${encodeURIComponent(sid)}/`,
         );
-        // Only a freshly-created page needs the agent to build the visualization.
-        if (res.existed === false) {
-          void sendMessage(t('chat.showPage.prompt'));
-        }
         setShowPageMode(true);
+        // First open (or a prior prompt that failed to send) asks the agent to
+        // build the visualization. sendMessage returns false on a failed send;
+        // track it so the NEXT toggle retries — the page row exists after this,
+        // so `existed` alone would never re-prompt a created-but-unprompted page.
+        if (res.existed === false || showPagePromptRetryRef.current.has(sid)) {
+          void sendMessage(t('chat.showPage.prompt')).then((sent) => {
+            if (sent === false) showPagePromptRetryRef.current.add(sid);
+            else showPagePromptRetryRef.current.delete(sid);
+          });
+        }
       }
     } catch {
       // apiFetch already surfaced a toast; stay in chat view.
@@ -1032,10 +1046,10 @@ export const ChatPage: React.FC = () => {
           onToggleShowPage={toggleShowPage}
         />
 
-      {showPageMode && showPageUrl ? (
-        // The session's Show Page replaces the transcript + composer (the header
-        // bar stays). Same-origin (/show/<id>/ private or /p/<share>/ public) so
-        // it inherits the workbench's auth; URL is resolved from ensureShowPage.
+      {showPageMode && showPageUrl && (
+        // The session's Show Page (same-origin /show/<id>/ private or /p/<share>/
+        // public; URL resolved from ensureShowPage) fills the chat area while the
+        // header bar stays. The chat surface below is kept mounted but hidden.
         //
         // Sandbox is deliberately LIGHT: `allow-same-origin` is required (the page
         // authenticates with the workbench cookie + runs its own same-origin
@@ -1052,41 +1066,44 @@ export const ChatPage: React.FC = () => {
           sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads"
           className="min-h-0 w-full flex-1 border-0 bg-background"
         />
-      ) : (
-        <>
-          {error && (
-            <div className="mx-auto mt-3 w-full max-w-[1080px] rounded-md border border-destructive/40 bg-destructive/[0.06] px-3 py-2 text-[12px] text-destructive">
-              {error}
-            </div>
-          )}
-
-          <Transcript
-            messages={messages}
-            session={session}
-            working={working}
-            hasOlder={!!olderCursor}
-            loadingOlder={loadingOlder}
-            onLoadOlder={loadOlderMessages}
-            messageFontSize={messageFontSize}
-            onQuickReply={handleQuickReply}
-          />
-          <QueueStrip queue={queue} onRemove={removeQueued} onSendNow={sendQueueNow} />
-          {/* key by session so the composer remounts per session — its draft-seeding
-              + local value reset, instead of carrying across sessions (Codex P2). */}
-          <Compose
-            key={sessionId}
-            composerRef={composerRef}
-            onSend={(text, attachments, references) => sendMessage(text, attachments, undefined, references)}
-            onStop={stopMessage}
-            busy={working}
-            sessionId={sessionId ?? ''}
-            initialDraft={initialDraft}
-            onDraftChange={onDraftChange}
-            onSearchAgents={searchAgents}
-            onSearchSessions={searchSessions}
-          />
-        </>
       )}
+
+      {/* Chat surface stays MOUNTED while the Show Page is shown — just hidden —
+          so unsent composer text + staged attachments survive the toggle instead
+          of being discarded on unmount. */}
+      <div className={clsx('flex min-h-0 flex-1 flex-col', showPageMode && 'hidden')}>
+        {error && (
+          <div className="mx-auto mt-3 w-full max-w-[1080px] rounded-md border border-destructive/40 bg-destructive/[0.06] px-3 py-2 text-[12px] text-destructive">
+            {error}
+          </div>
+        )}
+
+        <Transcript
+          messages={messages}
+          session={session}
+          working={working}
+          hasOlder={!!olderCursor}
+          loadingOlder={loadingOlder}
+          onLoadOlder={loadOlderMessages}
+          messageFontSize={messageFontSize}
+          onQuickReply={handleQuickReply}
+        />
+        <QueueStrip queue={queue} onRemove={removeQueued} onSendNow={sendQueueNow} />
+        {/* key by session so the composer remounts per session — its draft-seeding
+            + local value reset, instead of carrying across sessions (Codex P2). */}
+        <Compose
+          key={sessionId}
+          composerRef={composerRef}
+          onSend={(text, attachments, references) => sendMessage(text, attachments, undefined, references)}
+          onStop={stopMessage}
+          busy={working}
+          sessionId={sessionId ?? ''}
+          initialDraft={initialDraft}
+          onDraftChange={onDraftChange}
+          onSearchAgents={searchAgents}
+          onSearchSessions={searchSessions}
+        />
+      </div>
       </div>
       </FileViewerProvider>
     </ImageViewerProvider>
