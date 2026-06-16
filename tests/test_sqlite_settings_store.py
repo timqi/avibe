@@ -76,6 +76,56 @@ def test_is_bound_user_requires_enabled_user(tmp_path: Path) -> None:
     store.close()
 
 
+def test_admin_helpers_require_enabled_user(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    try:
+        store.set_users_for_platform(
+            "slack",
+            {
+                "U-enabled-admin": UserSettings(display_name="Enabled Admin", is_admin=True, enabled=True),
+                "U-disabled-admin": UserSettings(display_name="Disabled Admin", is_admin=True, enabled=False),
+            },
+        )
+
+        assert store.is_admin("U-enabled-admin", platform="slack") is True
+        assert store.is_admin("U-disabled-admin", platform="slack") is False
+        assert store.has_any_admin(platform="slack") is True
+        assert set(store.get_admins(platform="slack")) == {"slack::U-enabled-admin"}
+
+        store.update_user(
+            "U-enabled-admin",
+            UserSettings(display_name="Enabled Admin", is_admin=True, enabled=False),
+            platform="slack",
+        )
+
+        assert store.has_any_admin(platform="slack") is False
+        assert store.get_admins(platform="slack") == {}
+    finally:
+        store.close()
+
+
+def test_bind_user_promotes_when_only_admin_is_disabled(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    try:
+        store.set_users_for_platform(
+            "slack",
+            {
+                "U-disabled-admin": UserSettings(display_name="Disabled Admin", is_admin=True, enabled=False),
+            },
+        )
+        code = store.create_bind_code()
+
+        success, is_admin = store.bind_user_with_code("U-new", "New Admin", code.code, platform="slack")
+
+        assert success is True
+        assert is_admin is True
+        assert store.get_user("U-new", platform="slack").is_admin is True
+    finally:
+        store.close()
+
+
 def test_settings_manager_runtime_save_preserves_require_bind(tmp_path: Path, monkeypatch) -> None:
     settings_path = tmp_path / "settings.json"
     monkeypatch.setattr(paths, "ensure_data_dirs", lambda: None)
