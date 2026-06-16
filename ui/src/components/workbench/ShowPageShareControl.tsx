@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Check, Copy, Loader2, Share2 } from 'lucide-react';
 
@@ -32,6 +32,9 @@ export const ShowPageShareControl: React.FC<{
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Monotonic guard: a slow ensure() must not overwrite a newer visibility
+  // result (or a link rotated elsewhere). Only the latest request applies.
+  const reqSeq = useRef(0);
 
   useEffect(() => {
     if (payload) onPayloadChange?.(payload);
@@ -48,12 +51,17 @@ export const ShowPageShareControl: React.FC<{
   // admin Show Pages page) is reflected; keep the last payload visible while
   // refreshing so reopening doesn't flash a spinner.
   const refresh = () => {
+    const seq = ++reqSeq.current;
     setLoading(!payload);
     api
       .ensureShowPage(sessionId)
-      .then((res: ShowPagePayload) => setPayload(res))
+      .then((res: ShowPagePayload) => {
+        if (seq === reqSeq.current) setPayload(res);
+      })
       .catch(() => undefined)
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (seq === reqSeq.current) setLoading(false);
+      });
   };
 
   const handleOpenChange = (next: boolean) => {
@@ -62,12 +70,17 @@ export const ShowPageShareControl: React.FC<{
   };
 
   const toggleVisibility = (nextPublic: boolean) => {
+    const seq = ++reqSeq.current;
     setBusy(true);
     api
       .setShowPageVisibility(sessionId, nextPublic ? 'public' : 'private')
-      .then((res: ShowPagePayload) => setPayload(res))
+      .then((res: ShowPagePayload) => {
+        if (seq === reqSeq.current) setPayload(res);
+      })
       .catch(() => undefined)
-      .finally(() => setBusy(false));
+      .finally(() => {
+        if (seq === reqSeq.current) setBusy(false);
+      });
   };
 
   const copyLink = async () => {
