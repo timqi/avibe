@@ -1759,10 +1759,18 @@
     "back": "Back",
     "untitled": "Untitled session",
     "showPage": {
-      "open": "View Show Page",
+      "open": "Visualize",
       "backToChat": "Back to chat",
       "title": "Show Page",
-      "prompt": "Please visualize this session as a Show Page."
+      "prompt": "Please visualize this session as a Show Page.",
+      "share": "Share",
+      "shareTitle": "Share this Show Page",
+      "copyLink": "Copy link",
+      "nativeShare": "Share…",
+      "visibilityPublic": "Public",
+      "visibilityPrivate": "Private",
+      "publicDesc": "Anyone with the link can view",
+      "privateDesc": "Only you can view"
     },
     "titlePlaceholder": "Session title",
     "pickAgent": "Pick an agent",

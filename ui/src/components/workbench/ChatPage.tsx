@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { AppWindow, ArrowLeft, Bell, Bot, ChevronDown, Clock, Info, Loader2, MessageSquare, Pencil, UploadCloud, X } from 'lucide-react';
+import { ArrowLeft, Bell, Bot, ChevronDown, Clock, Info, Loader2, MessageSquare, Pencil, Presentation, UploadCloud, X } from 'lucide-react';
 import clsx from 'clsx';
 
 import { useApi } from '../../context/ApiContext';
@@ -15,6 +15,7 @@ import { isProxyMediaUrl } from '../../lib/mediaProxy';
 import { formatLocalDateTime } from '../../lib/relativeTime';
 import { useFileDrop } from '../../lib/useFileDrop';
 import { AgentRoutePicker } from './AgentRoutePicker';
+import { ShowPageShareControl } from './ShowPageShareControl';
 import { InstallHint } from '../InstallHint';
 import { Button } from '../ui/button';
 import { ChatImage } from '../ui/chat-image';
@@ -1274,48 +1275,58 @@ const ChatHeaderBar: React.FC<ChatHeaderBarProps> = ({ session, agents, defaultA
           <ArrowLeft className="size-3.5" />
         </Button>
         <TitleField key={session.id} title={session.title} onCommit={(title) => onPatch({ title })} />
-        <AgentRoutePicker
-          value={session}
-          agents={agents}
-          onChange={onPatch}
-          disabled={pickerDisabled}
-          allowedBackends={pinnedBackend ? [pinnedBackend] : undefined}
-          defaultLabel={
-            canClearToDefault
-              ? defaultAgent
-                ? t('newSession.defaultAgentNamed', { name: defaultAgent.name })
-                : t('newSession.defaultAgent')
-              : undefined
-          }
-          defaultRoute={defaultRoute}
-          isDefaultRoute={inheritsDefault}
-          compactMobile
-        />
+        {/* Hidden while the Show Page is open so the view gets the full width. */}
+        {!showPageMode && (
+          <AgentRoutePicker
+            value={session}
+            agents={agents}
+            onChange={onPatch}
+            disabled={pickerDisabled}
+            allowedBackends={pinnedBackend ? [pinnedBackend] : undefined}
+            defaultLabel={
+              canClearToDefault
+                ? defaultAgent
+                  ? t('newSession.defaultAgentNamed', { name: defaultAgent.name })
+                  : t('newSession.defaultAgent')
+                : undefined
+            }
+            defaultRoute={defaultRoute}
+            isDefaultRoute={inheritsDefault}
+            compactMobile
+          />
+        )}
         {/* Chat hides the brand header, so mount the install nudge here too —
             IM-launched users often land straight in a chat. Renders only on iOS
             Safari + not-installed; null otherwise. */}
         <InstallHint />
-        {/* Show Page toggle: swaps the chat surface for the session's Show Page
-            (the header bar stays). First open initializes the page + prompts the
-            agent. Pushed to the far right of the header row. */}
-        <Button
-          type="button"
-          variant={showPageMode ? 'secondary' : 'ghost'}
-          size="icon"
-          onClick={onToggleShowPage}
-          disabled={showPageBusy}
-          aria-label={showPageMode ? t('chat.showPage.backToChat') : t('chat.showPage.open')}
-          title={showPageMode ? t('chat.showPage.backToChat') : t('chat.showPage.open')}
-          className="ml-auto size-7 shrink-0"
-        >
-          {showPageBusy ? (
-            <Loader2 className="size-3.5 animate-spin" />
-          ) : showPageMode ? (
-            <MessageSquare className="size-3.5" />
-          ) : (
-            <AppWindow className="size-3.5" />
-          )}
-        </Button>
+        {/* Right-aligned actions. The Show Page toggle swaps the chat surface for
+            this session's Show Page (the header bar stays); first open initializes
+            the page + prompts the agent. It shows its label on desktop and stays
+            icon-only on mobile. In Show Page mode a Share control sits beside the
+            back-to-chat button. */}
+        <div className="ml-auto flex items-center gap-1.5">
+          {showPageMode && <ShowPageShareControl sessionId={session.id} />}
+          <Button
+            type="button"
+            variant={showPageMode ? 'secondary' : 'ghost'}
+            onClick={onToggleShowPage}
+            disabled={showPageBusy}
+            aria-label={showPageMode ? t('chat.showPage.backToChat') : t('chat.showPage.open')}
+            title={showPageMode ? t('chat.showPage.backToChat') : t('chat.showPage.open')}
+            className="h-7 shrink-0 gap-1.5 px-2"
+          >
+            {showPageBusy ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : showPageMode ? (
+              <MessageSquare className="size-3.5" />
+            ) : (
+              <Presentation className="size-3.5" />
+            )}
+            <span className="hidden text-xs font-medium md:inline">
+              {showPageMode ? t('chat.showPage.backToChat') : t('chat.showPage.open')}
+            </span>
+          </Button>
+        </div>
       </div>
     </div>
   );
