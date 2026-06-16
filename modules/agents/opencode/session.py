@@ -74,6 +74,16 @@ class OpenCodeSessionManager:
                 matches[base_id] = info
         return matches
 
+    def list_for_session_key(self, session_key: str) -> Dict[str, RequestSessionTuple]:
+        return {
+            base_id: info
+            for base_id, info in self._request_sessions.items()
+            if len(info) >= 3 and info[2] == session_key
+        }
+
+    def list_all(self) -> Dict[str, RequestSessionTuple]:
+        return dict(self._request_sessions)
+
     def _set_request_agent_session_id(self, request: AgentRequest, agent_session_id: Optional[str]) -> None:
         if not agent_session_id:
             return

@@ -271,6 +271,22 @@ class CodexAgent(BaseAgent):
 
         return count
 
+    def runtime_turn_keys(self) -> set[str]:
+        return {
+            self._runtime_turn_key_for_base_session(base_session_id)
+            for base_session_id in self._session_mgr.all_base_sessions()
+        }
+
+    def runtime_turn_keys_for_session_key(self, session_key: str) -> set[str]:
+        return {
+            self._runtime_turn_key_for_base_session(base_session_id)
+            for base_session_id in self._session_mgr.get_sessions_by_session_key(session_key)
+        }
+
+    def _runtime_turn_key_for_base_session(self, base_session_id: str) -> str:
+        cwd = self._session_mgr.get_cwd(base_session_id)
+        return f"{base_session_id}:{cwd}" if cwd else base_session_id
+
     async def refresh_auth_state(self) -> None:
         """Drop app-server runtime state so future turns pick up fresh auth."""
         if not hasattr(self, "_transport_last_activity"):
@@ -954,6 +970,7 @@ class CodexAgent(BaseAgent):
             raise RuntimeError("Codex turn/start returned no turn id")
 
         turn_state = self._turn_registry.finalize_turn_start_response(turn_id, request)
+        self._mark_runtime_turn_started(getattr(request, "context", None))
         bind_generated_image_snapshot = getattr(event_handler, "bind_generated_image_snapshot", None)
         if callable(bind_generated_image_snapshot):
             bind_generated_image_snapshot(thread_id, turn_id, request.base_session_id)
@@ -965,6 +982,12 @@ class CodexAgent(BaseAgent):
             "registered" if turn_state else "already-finished",
         )
         return thread_id
+
+    def _mark_runtime_turn_started(self, context: Any) -> None:
+        service = getattr(getattr(self, "controller", None), "agent_service", None)
+        mark_started = getattr(service, "mark_runtime_turn_started", None)
+        if callable(mark_started):
+            mark_started(context)
 
     # ------------------------------------------------------------------
     # Input building
