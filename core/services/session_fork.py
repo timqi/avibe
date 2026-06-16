@@ -8,6 +8,7 @@ adapters to call their native fork API on the first turn.
 from __future__ import annotations
 
 import json
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -102,7 +103,9 @@ def reserve_forked_session(
             target_agent_id = override_agent.id if override_agent else row["agent_id"]
             target_agent_name = override_agent.name if override_agent else row["agent_name"]
             target_backend = override_agent.backend if override_agent else source_backend
-            target_variant = str(row["agent_variant"] or target_backend)
+            target_variant = target_backend if override_agent else str(row["agent_variant"] or target_backend)
+            now = utc_now_iso()
+            target_anchor = _fork_session_anchor(row["session_anchor"], source_session_id=str(row["id"]), now=now)
             target_model = _clean_optional(model) if model is not None else row["model"]
             target_effort = (
                 _clean_optional(reasoning_effort)
@@ -110,7 +113,6 @@ def reserve_forked_session(
                 else row["reasoning_effort"]
             )
 
-            now = utc_now_iso()
             metadata = _load_metadata(row["metadata_json"])
             metadata.update(
                 {
@@ -124,9 +126,10 @@ def reserve_forked_session(
             session_id = create_agent_session_row(
                 conn,
                 scope_id=row["scope_id"],
-                # A fork is an independent Avibe Session, so it needs a fresh
-                # anchor even when it stays under the same scope.
-                session_anchor=None,
+                # Keep IM delivery stable while satisfying the per-scope anchor
+                # uniqueness invariant. resolve_session_id_target strips the
+                # suffix after ":" when deriving the IM thread id.
+                session_anchor=target_anchor,
                 agent_id=target_agent_id,
                 agent_name=target_agent_name,
                 agent_backend=target_backend,
@@ -180,6 +183,23 @@ def fork_metadata_from_request(metadata: dict[str, Any] | None) -> dict[str, Any
     }
 
 
+def fork_metadata_from_session_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return pending fork metadata persisted on a fork target Session row."""
+
+    if not isinstance(metadata, dict):
+        return None
+    source_backend = _clean_optional(metadata.get("fork_source_backend"))
+    source_native = _clean_optional(metadata.get("fork_source_native_session_id"))
+    source_session = _clean_optional(metadata.get("fork_source_session_id"))
+    if not (source_backend and source_native and source_session):
+        return None
+    return {
+        "source_session_id": source_session,
+        "source_native_session_id": source_native,
+        "source_backend": source_backend,
+    }
+
+
 def pending_native_fork_source(context: Any, backend: str) -> Optional[str]:
     """Native source id if this turn should fork instead of start fresh."""
 
@@ -193,6 +213,8 @@ def pending_native_fork_source(context: Any, backend: str) -> Optional[str]:
     if str(target.get("native_session_id") or "").strip():
         return None
     fork = target.get("native_session_fork")
+    if not isinstance(fork, dict):
+        fork = fork_metadata_from_session_metadata(target.get("metadata"))
     if not isinstance(fork, dict):
         return None
     if str(fork.get("source_backend") or "").strip() != backend:
@@ -214,3 +236,11 @@ def _clean_optional(value: Any) -> Optional[str]:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _fork_session_anchor(value: Any, *, source_session_id: str, now: str) -> Optional[str]:
+    anchor = _clean_optional(value)
+    if not anchor or anchor == source_session_id:
+        return None
+    suffix = "".join(ch for ch in f"{source_session_id}_{now}" if ch.isalnum())
+    return f"{anchor}:fork_{suffix}_{secrets.token_hex(3)}"

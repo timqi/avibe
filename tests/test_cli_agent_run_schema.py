@@ -308,9 +308,11 @@ def test_agent_run_fork_session_reserves_new_session_and_persists_metadata(tmp_p
     finally:
         engine.dispose()
     assert row["agent_name"] == "reviewer"
+    assert row["agent_variant"] == "codex"
     assert row["native_session_id"] == ""
     assert row["model"] == "gpt-5.2"
     assert row["reasoning_effort"] == "low"
+    assert row["session_anchor"] == payload["session_id"]
 
 
 def test_agent_run_fork_rejects_cross_backend_agent(tmp_path: Path, capsys) -> None:

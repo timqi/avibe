@@ -167,6 +167,7 @@ class ResolvedSessionIdTarget:
     reasoning_effort: Optional[str] = None
     workdir: Optional[str] = None
     session_anchor: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
     suppress_delivery: bool = False
 
 
@@ -265,6 +266,7 @@ def resolve_session_id_target(session_id: str, *, db_path: Optional[Path] = None
         native_session_id=str(row["native_session_id"] or ""),
         workdir=row["workdir"],
         session_anchor=str(row["session_anchor"] or ""),
+        metadata=session_metadata if isinstance(session_metadata, dict) else {},
         suppress_delivery=suppress_delivery,
     )
 
@@ -1823,9 +1825,11 @@ class ScheduledTaskService:
         channel_id = session_target_context["channel_id"]
         if platform == "avibe" and session_id:
             channel_id = session_id
-        from core.services.session_fork import fork_metadata_from_request
+        from core.services.session_fork import fork_metadata_from_request, fork_metadata_from_session_metadata
 
         native_session_fork = fork_metadata_from_request(metadata)
+        if native_session_fork is None and target_info and not str(target_info.native_session_id or "").strip():
+            native_session_fork = fork_metadata_from_session_metadata(getattr(target_info, "metadata", None))
 
         return MessageContext(
             user_id=session_target_context["user_id"],
@@ -1874,6 +1878,7 @@ class ScheduledTaskService:
                         "native_session_fork": native_session_fork,
                         "workdir": target_info.workdir,
                         "session_anchor": target_info.session_anchor,
+                        "metadata": getattr(target_info, "metadata", None) or {},
                         "suppress_delivery": target_info.suppress_delivery,
                     }
                     if target_info

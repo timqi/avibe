@@ -699,6 +699,59 @@ def test_build_context_carries_pending_native_fork_metadata() -> None:
 
     session_target = context.platform_specific["agent_session_target"]
     assert session_target["native_session_id"] == ""
+    assert session_target["metadata"] == {}
+    assert session_target["native_session_fork"] == {
+        "source_session_id": "ses-source",
+        "source_native_session_id": "thread-source",
+        "source_backend": "codex",
+    }
+
+
+def test_build_context_restores_pending_fork_from_session_metadata_when_run_metadata_missing() -> None:
+    controller = SimpleNamespace(
+        platform_settings_managers={},
+        im_clients={"avibe": SimpleNamespace()},
+        get_im_client_for_context=lambda _context: SimpleNamespace(
+            should_use_thread_for_reply=lambda: True,
+            should_use_thread_for_dm_session=lambda: False,
+        ),
+    )
+    service = ScheduledTaskService(controller=controller, store=ScheduledTaskStore(Path("/tmp/nonexistent-scheduled.json")))
+    target = ParsedSessionKey(platform="avibe", scope_type="project", scope_id="proj_890721e64fc8")
+    target_info = SimpleNamespace(
+        session_id="ses-target",
+        agent_id="agent-1",
+        agent_name="worker",
+        agent_backend="codex",
+        agent_variant="codex",
+        model="gpt-5",
+        reasoning_effort="high",
+        native_session_id="",
+        workdir="/tmp/work",
+        session_anchor="ses-target",
+        metadata={
+            "created_via": "session_fork",
+            "fork_source_session_id": "ses-source",
+            "fork_source_native_session_id": "thread-source",
+            "fork_source_backend": "codex",
+        },
+        suppress_delivery=False,
+    )
+
+    context = asyncio.run(
+        service._build_context(
+            target,
+            execution_id="exec-1",
+            trigger_kind="agent_run",
+            session_id="ses-target",
+            agent_name="worker",
+            target_info=target_info,
+            metadata={},
+        )
+    )
+
+    session_target = context.platform_specific["agent_session_target"]
+    assert session_target["metadata"]["fork_source_native_session_id"] == "thread-source"
     assert session_target["native_session_fork"] == {
         "source_session_id": "ses-source",
         "source_native_session_id": "thread-source",
