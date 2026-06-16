@@ -99,6 +99,207 @@ class _StubController:
 
 
 class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_handle_message_serializes_queries_for_same_runtime_session(self):
+        controller = _StubController()
+        runtime_key = "wechat_o9:/tmp/work"
+        first_query_started = asyncio.Event()
+        release_result = asyncio.Event()
+        queries: list[tuple[str, str]] = []
+
+        class ResultMessage:
+            subtype = "success"
+            result = "done"
+            duration_ms = 1
+
+        class _Client:
+            _vibe_runtime_base_session_id = "wechat_o9"
+            _vibe_runtime_session_key = runtime_key
+
+            async def query(self, message, *, session_id):
+                queries.append((message, session_id))
+                if len(queries) == 1:
+                    first_query_started.set()
+
+            def receive_messages(self):
+                async def _iterate():
+                    await release_result.wait()
+                    yield ResultMessage()
+
+                return _iterate()
+
+        client = _Client()
+        controller._get_session_key = lambda _context: "wechat-user"
+        controller.emit_agent_message = AsyncMock()
+        controller.session_handler = SimpleNamespace(
+            get_or_create_claude_session=AsyncMock(return_value=client),
+            mark_session_active=lambda _key: None,
+            mark_session_idle=lambda _key: None,
+            handle_session_error=AsyncMock(),
+            capture_session_id=lambda *_args, **_kwargs: None,
+        )
+
+        agent = ClaudeAgent(controller)
+        agent._prepare_message_with_files = lambda request: request.message
+        agent._delete_ack = AsyncMock()
+        agent.emit_result_message = AsyncMock()
+
+        def _request(message: str):
+            return SimpleNamespace(
+                context=SimpleNamespace(
+                    user_id="U1",
+                    channel_id="C1",
+                    platform_specific={"turn_token": message},
+                ),
+                message=message,
+                working_path="/tmp/work",
+                base_session_id="wechat_o9",
+                composite_session_id=runtime_key,
+                session_key="wechat-user",
+                subagent_name=None,
+                subagent_model=None,
+                subagent_reasoning_effort=None,
+                ack_message_id=None,
+                ack_reaction_message_id=None,
+                ack_reaction_emoji=None,
+                files=None,
+            )
+
+        first = asyncio.create_task(agent.handle_message(_request("first")))
+        await asyncio.wait_for(first_query_started.wait(), timeout=3)
+        await asyncio.sleep(0)
+        second = asyncio.create_task(agent.handle_message(_request("second")))
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(
+            queries,
+            [("first", runtime_key)],
+            "the second prompt must not be written into the same Claude runtime before the first result",
+        )
+
+        release_result.set()
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+
+        self.assertEqual(queries, [("first", runtime_key), ("second", runtime_key)])
+
+    async def test_cancelled_waiter_does_not_leak_runtime_session_lock(self):
+        controller = _StubController()
+        runtime_key = "wechat_o9:/tmp/work"
+        first_query_started = asyncio.Event()
+        release_result = asyncio.Event()
+        queries: list[tuple[str, str]] = []
+
+        class ResultMessage:
+            subtype = "success"
+            result = "done"
+            duration_ms = 1
+
+        class _Client:
+            _vibe_runtime_base_session_id = "wechat_o9"
+            _vibe_runtime_session_key = runtime_key
+
+            async def query(self, message, *, session_id):
+                queries.append((message, session_id))
+                if len(queries) == 1:
+                    first_query_started.set()
+
+            def receive_messages(self):
+                async def _iterate():
+                    await release_result.wait()
+                    yield ResultMessage()
+
+                return _iterate()
+
+        client = _Client()
+        controller._get_session_key = lambda _context: "wechat-user"
+        controller.emit_agent_message = AsyncMock()
+        controller.session_handler = SimpleNamespace(
+            get_or_create_claude_session=AsyncMock(return_value=client),
+            mark_session_active=lambda _key: None,
+            mark_session_idle=lambda _key: None,
+            handle_session_error=AsyncMock(),
+            capture_session_id=lambda *_args, **_kwargs: None,
+        )
+
+        agent = ClaudeAgent(controller)
+        agent._prepare_message_with_files = lambda request: request.message
+        agent._delete_ack = AsyncMock()
+        agent.emit_result_message = AsyncMock()
+
+        def _request(message: str):
+            return SimpleNamespace(
+                context=SimpleNamespace(user_id="U1", channel_id="C1", platform_specific={}),
+                message=message,
+                working_path="/tmp/work",
+                base_session_id="wechat_o9",
+                composite_session_id=runtime_key,
+                session_key="wechat-user",
+                subagent_name=None,
+                subagent_model=None,
+                subagent_reasoning_effort=None,
+                ack_message_id=None,
+                ack_reaction_message_id=None,
+                ack_reaction_emoji=None,
+                files=None,
+            )
+
+        first = asyncio.create_task(agent.handle_message(_request("first")))
+        await asyncio.wait_for(first_query_started.wait(), timeout=3)
+        blocked = asyncio.create_task(agent.handle_message(_request("cancelled")))
+        await asyncio.sleep(0.05)
+        blocked.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await blocked
+
+        release_result.set()
+        await asyncio.wait_for(first, timeout=3)
+
+        third = asyncio.create_task(agent.handle_message(_request("third")))
+        await asyncio.wait_for(third, timeout=3)
+
+        self.assertEqual(queries, [("first", runtime_key), ("third", runtime_key)])
+        self.assertNotIn(runtime_key, agent._pending_requests)
+
+    async def test_handle_stop_releases_runtime_turn_gate(self):
+        controller = _StubController()
+        controller.emit_agent_message = AsyncMock()
+        runtime_key = "wechat_o9:/tmp/work"
+        interrupted = False
+
+        class _Client:
+            async def interrupt(self):
+                nonlocal interrupted
+                interrupted = True
+
+            async def disconnect(self):
+                return None
+
+        agent = ClaudeAgent(controller)
+        pending_request = SimpleNamespace(context=SimpleNamespace(platform_specific={"turn_token": "T1"}))
+        agent._pending_requests[runtime_key] = [pending_request]
+        await agent._acquire_runtime_turn_lock(runtime_key)
+        agent._runtime_turn_lock_keys[runtime_key] = (runtime_key,)
+        controller.claude_sessions[runtime_key] = _Client()
+
+        request = SimpleNamespace(
+            context=SimpleNamespace(platform_specific={}),
+            composite_session_id=runtime_key,
+            stop_failure_reason=None,
+        )
+
+        handled = await agent.handle_stop(request)
+
+        self.assertTrue(handled)
+        self.assertTrue(interrupted)
+        self.assertNotIn(runtime_key, agent._pending_requests)
+        self.assertNotIn(runtime_key, controller.claude_sessions)
+        controller.session_handler.cleanup_session.assert_awaited_once_with(
+            runtime_key,
+            current_receiver_task=None,
+        )
+        self.assertFalse(agent._runtime_turn_locks[runtime_key].locked())
+        self.assertEqual(request.context.platform_specific["turn_token"], "T1")
+
     async def test_result_keeps_claude_session_active_when_requests_are_queued(self):
         controller = _StubController()
         mark_idle_calls = []
