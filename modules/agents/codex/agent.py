@@ -270,6 +270,13 @@ class CodexAgent(BaseAgent):
 
         return count
 
+    def runtime_turn_keys_for_session_key(self, session_key: str) -> set[str]:
+        runtime_keys = set()
+        for base_session_id in self._session_mgr.get_sessions_by_session_key(session_key):
+            cwd = self._session_mgr.get_cwd(base_session_id)
+            runtime_keys.add(f"{base_session_id}:{cwd}" if cwd else base_session_id)
+        return runtime_keys
+
     async def refresh_auth_state(self) -> None:
         """Drop app-server runtime state so future turns pick up fresh auth."""
         if not hasattr(self, "_transport_last_activity"):

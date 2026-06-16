@@ -43,6 +43,7 @@ class ClaudeAgent(BaseAgent):
         self._pending_assistant_message: dict[str, str] = {}
         self._native_session_ids: dict[str, str] = {}
         self._suppressed_synthetic_results: set[str] = set()
+        self._suppress_receiver_runtime_release: set[str] = set()
         # Store reaction info per runtime session for cleanup after terminal
         # result. Under the runtime turn gate there is normally one active entry;
         # the list shape remains for defensive cleanup of older queued state.
@@ -140,8 +141,6 @@ class ClaudeAgent(BaseAgent):
             raise
         except Exception as e:
             logger.error(f"Error processing Claude message: {e}", exc_info=True)
-            if not turn_registered:
-                self._release_service_runtime_turn(context)
             # Clean up the specific reaction for this request (not FIFO)
             await self._remove_specific_pending_reaction(runtime_session_key, context, request)
             self._remove_pending_request(runtime_session_key, request)
@@ -172,7 +171,10 @@ class ClaudeAgent(BaseAgent):
             # empty terminal error result turns the dot red AND releases the
             # web-Chat stream waiter (the visible error was sent + persisted
             # above), instead of waiting out the safety timeout. No-op off-workbench.
-            await self.controller.emit_agent_message(context, "result", "", is_error=True)
+            try:
+                await self.controller.emit_agent_message(context, "result", "", is_error=True)
+            finally:
+                self._release_service_runtime_turn(context)
         finally:
             await self._delete_ack(context, request)
 
@@ -216,6 +218,17 @@ class ClaudeAgent(BaseAgent):
         await self.session_manager.clear_session(session_key)
 
         return len(sessions_to_clear) or len(session_bases_to_clear)
+
+    def runtime_turn_keys_for_session_key(self, session_key: str) -> set[str]:
+        agent_map = self.sessions.list_agent_sessions(session_key, self.name)
+        session_bases_to_clear = set(agent_map.keys())
+        runtime_keys = set()
+        session_ids = set(self.claude_sessions.keys()) | set(self.receiver_tasks.keys())
+        for composite_id in session_ids:
+            base_part = composite_id.split(":", 1)[0] if ":" in composite_id else composite_id
+            if base_part in session_bases_to_clear:
+                runtime_keys.add(composite_id)
+        return runtime_keys
 
     async def refresh_auth_state(self) -> None:
         """Reconnect Claude runtime so future requests load fresh auth."""
@@ -390,20 +403,28 @@ class ClaudeAgent(BaseAgent):
             except Exception:
                 logger.debug("Failed to clear Claude stop processing indicator", exc_info=True)
 
+        self._suppress_receiver_runtime_release.add(composite_key)
+        try:
+            self._mark_session_idle_if_no_pending_requests(composite_key)
+            await self._cleanup_runtime_session(composite_key)
+        except Exception as err:
+            logger.error("Failed to clean up stopped Claude session %s: %s", composite_key, err, exc_info=True)
+            self._release_service_runtime_turn(request.context)
+            raise
+        finally:
+            self._suppress_receiver_runtime_release.discard(composite_key)
+
         try:
             # A user-initiated stop is terminal but intentional, so it carries
             # NO user-facing message: a single SILENT result settles the dot to
             # idle + releases the SSE waiter through the outbound chokepoint
-            # WITHOUT a bubble. Done HERE, before /internal/cancel cancels the
-            # _run_turn task (the cancelled branch can't safely emit during
-            # cancellation).
+            # WITHOUT a bubble. Emit only after cleanup so the next turn cannot
+            # acquire the gate and reuse a client that this stop is still
+            # disconnecting.
             await self.controller.emit_agent_message(request.context, "result", "", level="silent")
         except Exception as err:
             logger.error("Failed to emit Claude stop result for session %s: %s", composite_key, err, exc_info=True)
             self._release_service_runtime_turn(request.context)
-        finally:
-            self._mark_session_idle_if_no_pending_requests(composite_key)
-            await self._cleanup_runtime_session(composite_key)
 
         return True
 
@@ -668,7 +689,8 @@ class ClaudeAgent(BaseAgent):
                 mark_session_idle(composite_key)
             logger.info("Claude receiver cancelled for session %s", composite_key)
             await self._clear_pending_reactions(composite_key, context)
-            self._release_service_runtime_turn(context)
+            if composite_key not in self._suppress_receiver_runtime_release:
+                self._release_service_runtime_turn(context)
             raise
         except Exception as e:
             composite_key = composite_key or f"{base_session_id}:{working_path}"

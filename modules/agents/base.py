@@ -496,6 +496,10 @@ class BaseAgent(ABC):
         """Clear session state for a given session scope key. Returns cleared count."""
         return 0
 
+    def runtime_turn_keys_for_session_key(self, session_key: str) -> set[str]:
+        """Return runtime turn gate keys owned by the session scope."""
+        return set()
+
     async def prepare_resume_binding(
         self,
         *,

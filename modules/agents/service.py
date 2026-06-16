@@ -65,9 +65,14 @@ class AgentService:
     async def clear_sessions(self, session_key: str) -> Dict[str, int]:
         cleared: Dict[str, int] = {}
         for name, agent in self.agents.items():
+            runtime_key_getter = getattr(agent, "runtime_turn_keys_for_session_key", None)
+            runtime_keys = runtime_key_getter(session_key) if callable(runtime_key_getter) else set()
+            runtime_tokens = self._runtime_turn_tokens(runtime_keys)
             count = await agent.clear_sessions(session_key)
             if count:
                 cleared[name] = count
+            for runtime_key, runtime_token in runtime_tokens.items():
+                self.release_runtime_turn_key(runtime_key, runtime_token)
         return cleared
 
     async def handle_stop(self, agent_name: str, request: AgentRequest) -> bool:
@@ -87,6 +92,17 @@ class AgentService:
         gate = self._turn_gates.get(runtime_key)
         if gate is None or gate.token != runtime_token:
             return
+        self.release_runtime_turn_key(runtime_key, runtime_token)
+
+    def release_runtime_turn_key(self, runtime_key: str, runtime_token: str | None = None) -> None:
+        runtime_key = str(runtime_key or "").strip()
+        if not runtime_key:
+            return
+        gate = self._turn_gates.get(runtime_key)
+        if gate is None:
+            return
+        if runtime_token is not None and gate.token != runtime_token:
+            return
         gate.token = ""
         if gate.lock.locked():
             gate.lock.release()
@@ -104,6 +120,14 @@ class AgentService:
         if runtime_key not in self._turn_gates:
             self._turn_gates[runtime_key] = _RuntimeTurnGate()
         return self._turn_gates[runtime_key]
+
+    def _runtime_turn_tokens(self, runtime_keys: set[str]) -> dict[str, str]:
+        tokens = {}
+        for runtime_key in runtime_keys:
+            gate = self._turn_gates.get(runtime_key)
+            if gate is not None and gate.token:
+                tokens[runtime_key] = gate.token
+        return tokens
 
     @staticmethod
     def _stamp_runtime_turn(request: AgentRequest, runtime_key: str, runtime_token: str) -> None:

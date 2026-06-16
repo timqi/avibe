@@ -29,6 +29,24 @@ class _RuntimeAgent:
         return False
 
 
+class _ClearingRuntimeAgent:
+    name = "codex"
+
+    def __init__(self, runtime_keys: set[str], on_clear=None):
+        self.runtime_keys = runtime_keys
+        self.clear_calls: list[str] = []
+        self.on_clear = on_clear
+
+    async def clear_sessions(self, session_key):
+        self.clear_calls.append(session_key)
+        if self.on_clear is not None:
+            await self.on_clear()
+        return 1
+
+    def runtime_turn_keys_for_session_key(self, _session_key):
+        return self.runtime_keys
+
+
 class _Controller:
     def __init__(self):
         self.session_turns = None
@@ -123,5 +141,56 @@ def test_agent_service_runtime_guard_drops_stale_emits_after_next_turn_starts() 
 
         assert service.emit_matches_runtime_turn(second.context)
         assert not service.emit_matches_runtime_turn(first.context)
+
+    asyncio.run(_run())
+
+
+def test_agent_service_clear_sessions_releases_cleared_runtime_gates() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        agent = _ClearingRuntimeAgent({"session:/repo", "session:/other"})
+        service.register(agent)
+
+        for runtime_key in ("session:/repo", "session:/other", "unrelated:/repo"):
+            gate = service._get_turn_gate(runtime_key)
+            await gate.lock.acquire()
+            gate.token = f"{runtime_key}-token"
+
+        cleared = await service.clear_sessions("scope-1")
+
+        assert cleared == {"codex": 1}
+        assert agent.clear_calls == ["scope-1"]
+        assert not service._turn_gates["session:/repo"].lock.locked()
+        assert not service._turn_gates["session:/other"].lock.locked()
+        assert service._turn_gates["unrelated:/repo"].lock.locked()
+
+        service.release_runtime_turn_key("unrelated:/repo")
+
+    asyncio.run(_run())
+
+
+def test_agent_service_clear_sessions_does_not_release_new_turn_token() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        runtime_key = "session:/repo"
+        gate = service._get_turn_gate(runtime_key)
+        await gate.lock.acquire()
+        gate.token = "old-token"
+
+        async def _on_clear():
+            service.release_runtime_turn_key(runtime_key, "old-token")
+            await gate.lock.acquire()
+            gate.token = "new-token"
+
+        agent = _ClearingRuntimeAgent({runtime_key}, on_clear=_on_clear)
+        service.register(agent)
+
+        cleared = await service.clear_sessions("scope-1")
+
+        assert cleared == {"codex": 1}
+        assert service._turn_gates[runtime_key].lock.locked()
+        assert service._turn_gates[runtime_key].token == "new-token"
+
+        service.release_runtime_turn_key(runtime_key, "new-token")
 
     asyncio.run(_run())

@@ -480,6 +480,12 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
                 self.sessions.remove_active_poll(opencode_session_id)
         return terminated
 
+    def runtime_turn_keys_for_session_key(self, session_key: str) -> set[str]:
+        return {
+            f"{base_id}:{req_info[1]}"
+            for base_id, req_info in self._session_manager.list_for_session_key(session_key).items()
+        }
+
     async def _delete_ack(self, request: AgentRequest) -> None:
         service = getattr(self.controller, "processing_indicator", None)
         if service is not None:
