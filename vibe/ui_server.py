@@ -4489,6 +4489,9 @@ def sessions_messages_list(session_id: str):
     except (TypeError, ValueError):
         limit = 50
     before_id = request.args.get("before_id") or None
+    # ``around_id`` centers the window on a specific message (search deep-link
+    # jump); it takes precedence over after/before/tail in the service.
+    around_id = request.args.get("around_id") or None
     # ``tail=1`` returns the most-recent window (for the Chat page's gap recovery)
     # instead of the oldest page.
     tail = request.args.get("tail") == "1"
@@ -4511,11 +4514,36 @@ def sessions_messages_list(session_id: str):
             session_id=session_id,
             after_id=after_id,
             before_id=before_id,
+            around_id=around_id,
             limit=limit,
             types=messages_service.TRANSCRIPT_TYPES,
             include_metadata_sources=("show_page",),
             tail=tail,
         )
+    return jsonify(result)
+
+
+@app.route("/api/search/messages", methods=["GET"])
+def search_messages_list():
+    """Global message-content search across Workbench sessions, grouped by session.
+
+    Substring (case-insensitive) search over ``content_text`` for ``platform
+    ='avibe'`` user prompts + agent ``result`` replies, excluding archived
+    sessions. ``q`` is the query, ``limit`` caps the matched-message scan. The
+    remote-access host guard + auth run in the global ``before_request`` hooks
+    (same as the messages list), so this handler just delegates to the service.
+    """
+    from storage import messages_service
+
+    query = request.args.get("q") or ""
+    try:
+        limit = int(request.args.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+
+    engine = _projects_engine()
+    with engine.connect() as conn:
+        result = messages_service.search_messages(conn, query=query, limit=limit)
     return jsonify(result)
 
 

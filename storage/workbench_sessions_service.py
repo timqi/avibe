@@ -23,6 +23,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.engine import Connection
 
 from storage.agent_session_rows import create_agent_session_row
+from storage.db import escape_sql_like
 from storage.pagination import PageRequest, PageResult, page_result_from_limit_plus_one
 from storage.models import (
     agent_runs,
@@ -131,7 +132,7 @@ def list_sessions(
     if title_query:
         # `#`-mention global search: case-insensitive title LIKE. Escape the LIKE
         # metacharacters so a literal ``%`` / ``_`` in the query can't widen it.
-        like = title_query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = escape_sql_like(title_query.strip())
         if like:
             query = query.where(agent_sessions.c.title.ilike(f"%{like}%", escape="\\"))
     if before_id is not None:
