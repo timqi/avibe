@@ -406,20 +406,28 @@ export const ChatPage: React.FC = () => {
   // chat is caught up to live again (pinning + auto-follow resume). Resolves so
   // the Transcript can scroll to the bottom once the tail is in the DOM. When
   // there is no newer cursor we're already at the tail — the caller just scrolls.
-  const jumpToLatest = useCallback(async () => {
-    if (!sessionId || !newerCursor) return;
+  // Returns true ONLY once the fresh tail window is installed — callers must
+  // scroll / ack only on true. On failure (network error, empty tail, or a
+  // stale-session race) it returns false and leaves the around-window intact, so
+  // the retry button stays and live rows keep being skipped: scrolling/acking on
+  // a failed reload would pin the OLD historical window and hide the retry while
+  // newerCursor is still set (Codex P2).
+  const jumpToLatest = useCallback(async (): Promise<boolean> => {
+    if (!sessionId || !newerCursor) return false;
     try {
       const res = await api.listSessionMessages(sessionId, { limit: 50, tail: true, cache: false });
-      if (sessionId !== sessionIdRef.current) return; // switched chats mid-fetch
+      if (sessionId !== sessionIdRef.current) return false; // switched chats mid-fetch
       const tailMessages = res.messages.filter(isTranscriptMessage);
-      if (tailMessages.length === 0) return;
+      if (tailMessages.length === 0) return false;
       setMessages(tailMessages);
       setOlderCursor(res.next_before_id ?? null);
       // Caught up to the live tail — drop the newer cursor so the load-newer path
       // goes inert and the transcript follows new rows again.
       setNewerCursor(null);
+      return true;
     } catch {
       /* keep the around window; the user can retry */
+      return false;
     }
   }, [api, sessionId, newerCursor]);
 
@@ -823,9 +831,14 @@ export const ChatPage: React.FC = () => {
         // into view. Outside around-mode, append optimistically (echo dedupes).
         if (body && body.id) {
           if (newerCursorRef.current) {
-            await jumpToLatest();
+            const caughtUp = await jumpToLatest();
             if (sessionId === sessionIdRef.current) {
-              setJumpTarget((body as WorkbenchMessage).id);
+              // Only scroll to the sent row once the tail actually installed (it
+              // lives in the reloaded tail). If the tail reload FAILED, fall back
+              // to appending the sent row so the user still sees their message
+              // rather than it silently vanishing into the around-window (Codex P2).
+              if (caughtUp) setJumpTarget((body as WorkbenchMessage).id);
+              else appendMessage(body as WorkbenchMessage);
             }
           } else {
             appendMessage(body as WorkbenchMessage);
@@ -1695,7 +1708,7 @@ interface TranscriptProps {
   // Jump-to-latest while in an around-jump window: fetches a fresh tail window
   // and clears the newer cursor (resolves once the tail is loaded), so the jump
   // button can then scroll to the true bottom. Inert when not in around-mode.
-  onJumpToLatest: () => Promise<void>;
+  onJumpToLatest: () => Promise<boolean>;
   // Deep-link jump (P5): the message id to scroll to once it's in the DOM, a
   // callback to ack the jump (so it runs once per target), and the id currently
   // highlighted (~3s mint fade on the matching row).
@@ -1819,8 +1832,11 @@ const Transcript: React.FC<TranscriptProps> = ({
       scrollToBottom();
       return;
     }
-    void jumpToLatestRef.current().then(() => {
-      requestAnimationFrame(() => scrollToBottom());
+    void jumpToLatestRef.current().then((installed) => {
+      // Only scroll/pin once the fresh tail actually installed. On a failed
+      // reload the around-window + retry button stay so the user can try again
+      // (scrolling would pin the OLD window and hide the retry) (Codex P2).
+      if (installed) requestAnimationFrame(() => scrollToBottom());
     });
   }, [hasNewer, scrollToBottom]);
 
