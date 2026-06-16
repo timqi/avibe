@@ -536,7 +536,7 @@
   },
   "appShell": {
     "title": "Avibe OS",
-    "subtitle": "Agent OS",
+    "subtitle": "Agent OS · Workbench",
     "workspaceLabel": "Workspace",
     "openControlPanel": "Control Panel",
     "backToWorkbench": "Back to Workbench",

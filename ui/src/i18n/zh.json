@@ -536,7 +536,7 @@
   },
   "appShell": {
     "title": "Avibe OS",
-    "subtitle": "Agent 操作系统",
+    "subtitle": "Agent操作系统 · 工作台",
     "workspaceLabel": "工作区",
     "openControlPanel": "控制面板",
     "backToWorkbench": "返回工作台",
