@@ -1096,6 +1096,39 @@ export const ChatPage: React.FC = () => {
 // Pending send-while-busy messages, shown between the transcript and the
 // composer (Codex-GUI style). Each can be dropped; "立即发送" interrupts the
 // running turn and flushes the whole queue now (the queue flushes merged).
+// One queued message. Its text is a single truncated line by default; clicking
+// it expands to the full wrapped text (and clicking again collapses it) so a
+// long queued prompt can be read without sending it.
+const QueueRow: React.FC<{ item: WorkbenchMessage; onRemove: (id: string) => void }> = ({ item, onRemove }) => {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="flex items-start gap-2 rounded-lg bg-surface-2 px-2.5 py-1.5">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+        className={clsx(
+          'min-w-0 flex-1 text-left text-[12px] text-foreground',
+          expanded ? 'whitespace-pre-wrap break-words' : 'truncate',
+        )}
+      >
+        {item.text}
+      </button>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        onClick={() => onRemove(item.id)}
+        aria-label={t('chat.queue.remove')}
+        className="size-6 shrink-0 text-muted hover:text-destructive"
+      >
+        <X className="size-3.5" />
+      </Button>
+    </div>
+  );
+};
+
 const QueueStrip: React.FC<{
   queue: WorkbenchMessage[];
   onRemove: (id: string) => void;
@@ -1117,19 +1150,7 @@ const QueueStrip: React.FC<{
         </div>
         <div className="flex max-h-32 flex-col gap-1 overflow-y-auto">
           {queue.map((item) => (
-            <div key={item.id} className="flex items-center gap-2 rounded-lg bg-surface-2 px-2.5 py-1.5">
-              <span className="flex-1 truncate text-[12px] text-foreground">{item.text}</span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                onClick={() => onRemove(item.id)}
-                aria-label={t('chat.queue.remove')}
-                className="size-6 shrink-0 text-muted hover:text-destructive"
-              >
-                <X className="size-3.5" />
-              </Button>
-            </div>
+            <QueueRow key={item.id} item={item} onRemove={onRemove} />
           ))}
         </div>
       </div>
