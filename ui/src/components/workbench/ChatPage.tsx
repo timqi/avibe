@@ -978,7 +978,14 @@ export const ChatPage: React.FC = () => {
     handledJumpRef.current = targetMsg;
     const requestSessionId = sessionId;
 
-    const clearParam = () => setSearchParams({}, { replace: true });
+    // Clear only ``msg`` (preserve any other query params) so a re-render /
+    // visibility gap-recovery can't re-fire the jump. Read the live URL so we
+    // don't need the reactive ``searchParams`` in this effect's deps.
+    const clearParam = () => {
+      const next = new URLSearchParams(window.location.search);
+      next.delete('msg');
+      setSearchParams(next, { replace: true });
+    };
 
     // Already loaded → jump directly, no fetch.
     if (messages.some((m) => m.id === targetMsg)) {
@@ -1657,7 +1664,12 @@ const Transcript: React.FC<TranscriptProps> = ({
     const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
     // Small tolerance keeps us "following" through sub-pixel rounding; the jump
     // button only appears once the user has scrolled up a clear distance.
-    const pinned = distance < 80;
+    // Don't follow-pin while a newer cursor exists — we're in an around-jump
+    // window, NOT caught up to the live tail. Otherwise reaching the loaded
+    // window's bottom would pin, and the next loadNewer append would snap to the
+    // bottom and chain-load every newer page, losing the read position. Pinning
+    // resumes once hasNewer clears (the transcript has caught up to the tail).
+    const pinned = distance < 80 && !hasNewer;
     pinnedRef.current = pinned;
     setShowJump(distance > 240);
     // Only track an anchor while reading history; following needs none (the bottom
@@ -1669,11 +1681,10 @@ const Transcript: React.FC<TranscriptProps> = ({
     }
     // Symmetric downward paging from an around-jump: when a newer cursor exists
     // (only after a jump that landed away from the tail) and the user scrolls
-    // near the BOTTOM, load the next newer page. captureAnchor above already ran
-    // (not pinned here, since ``distance`` is small only at the true bottom where
-    // pinned is true — but the cursor is null in tail mode so this can't fire
-    // there). The append merges below the anchor, so the row the user is reading
-    // stays put under the existing ResizeObserver restore.
+    // near the BOTTOM, load the next newer page. ``pinned`` is forced false above
+    // while hasNewer, so captureAnchor() ran and the append merges below that
+    // anchor — the row the user is reading stays put under the ResizeObserver
+    // restore instead of snapping to the bottom.
     if (hasNewer && !loadingNewer && distance < 120) {
       loadNewerRef.current();
     }
