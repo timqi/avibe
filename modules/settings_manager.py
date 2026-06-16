@@ -141,6 +141,10 @@ class SettingsManager:
         """Check whether a user is already bound."""
         return self.store.is_bound_user(str(user_id), platform=self.platform)
 
+    def is_enabled_user(self, user_id: Union[int, str]) -> bool:
+        """Check whether a bound user is enabled for access."""
+        return self.store.is_enabled_user(str(user_id), platform=self.platform)
+
     def bind_user_with_code(
         self,
         user_id: Union[int, str],
@@ -239,6 +243,7 @@ class SettingsManager:
                 if existing is not None:
                     cs.enabled = existing.enabled
                     cs.require_mention = existing.require_mention
+                    cs.require_bind = existing.require_bind
                 channels[cid] = cs
             self.store.set_channels_for_platform(self.platform, channels)
             for uid, s in self.dm_user_settings.items():
@@ -560,6 +565,12 @@ class MultiSettingsManager:
             return self.managers[platform].is_bound_user(user_id)
         manager, raw = self._resolve(user_id)
         return manager.is_bound_user(raw)
+
+    def is_enabled_user(self, user_id: Union[int, str], platform: Optional[str] = None) -> bool:
+        if platform:
+            return self.managers[platform].is_enabled_user(user_id)
+        manager, raw = self._resolve(user_id)
+        return manager.is_enabled_user(raw)
 
     def bind_user_with_code(
         self,
