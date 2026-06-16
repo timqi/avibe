@@ -13,6 +13,7 @@ from storage.migrations import run_migrations
 from storage.models import scope_settings, scopes
 from storage.sessions_service import SQLiteSessionsService
 from storage.settings_service import SQLiteSettingsService, upsert_scope
+from modules.settings_manager import SettingsManager
 
 
 def test_settings_store_uses_sqlite_without_rewriting_legacy_json(tmp_path: Path) -> None:
@@ -41,6 +42,137 @@ def test_settings_store_uses_sqlite_without_rewriting_legacy_json(tmp_path: Path
         assert settings_path.read_text(encoding="utf-8") == original
     finally:
         reloaded.close()
+
+
+def test_channel_require_bind_persists(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    store.update_channel("C-bind", ChannelSettings(enabled=True, require_bind=True), platform="slack")
+    store.update_channel("C-open", ChannelSettings(enabled=True), platform="slack")
+    store.close()
+
+    reloaded = SettingsStore(settings_path)
+    try:
+        assert reloaded.find_channel("C-bind", platform="slack").require_bind is True
+        assert reloaded.find_channel("C-open", platform="slack").require_bind in (None, False)
+    finally:
+        reloaded.close()
+
+
+def test_bound_and_enabled_user_checks_are_separate(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    store.set_users_for_platform(
+        "slack",
+        {
+            "U-enabled": UserSettings(display_name="Enabled", enabled=True),
+            "U-disabled": UserSettings(display_name="Disabled", enabled=False),
+        },
+    )
+
+    assert store.is_bound_user("U-enabled", platform="slack") is True
+    assert store.is_enabled_user("U-enabled", platform="slack") is True
+    assert store.is_bound_user("U-disabled", platform="slack") is True
+    assert store.is_enabled_user("U-disabled", platform="slack") is False
+
+    store.close()
+
+
+def test_admin_helpers_require_enabled_user(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    try:
+        store.set_users_for_platform(
+            "slack",
+            {
+                "U-enabled-admin": UserSettings(display_name="Enabled Admin", is_admin=True, enabled=True),
+                "U-disabled-admin": UserSettings(display_name="Disabled Admin", is_admin=True, enabled=False),
+            },
+        )
+
+        assert store.is_admin("U-enabled-admin", platform="slack") is True
+        assert store.is_admin("U-disabled-admin", platform="slack") is False
+        assert store.has_any_admin(platform="slack") is True
+        assert store.has_enabled_admin(platform="slack") is True
+        assert set(store.get_admins(platform="slack")) == {"slack::U-enabled-admin"}
+
+        store.update_user(
+            "U-enabled-admin",
+            UserSettings(display_name="Enabled Admin", is_admin=True, enabled=False),
+            platform="slack",
+        )
+
+        assert store.has_any_admin(platform="slack") is True
+        assert store.has_enabled_admin(platform="slack") is False
+        assert store.get_admins(platform="slack") == {}
+    finally:
+        store.close()
+
+
+def test_bind_user_promotes_when_only_admin_is_disabled(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    try:
+        store.set_users_for_platform(
+            "slack",
+            {
+                "U-disabled-admin": UserSettings(display_name="Disabled Admin", is_admin=True, enabled=False),
+            },
+        )
+        code = store.create_bind_code()
+
+        success, is_admin = store.bind_user_with_code("U-new", "New Admin", code.code, platform="slack")
+
+        assert success is True
+        assert is_admin is True
+        assert store.get_user("U-new", platform="slack").is_admin is True
+    finally:
+        store.close()
+
+
+def test_disabled_user_cannot_rebind_with_active_code(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    store = SettingsStore(settings_path)
+    try:
+        store.set_users_for_platform(
+            "slack",
+            {
+                "U-disabled": UserSettings(display_name="Disabled", enabled=False),
+            },
+        )
+        code = store.create_bind_code()
+
+        success, is_admin = store.bind_user_with_code("U-disabled", "Rebound", code.code, platform="slack")
+
+        assert success is False
+        assert is_admin is False
+        assert store.get_user("U-disabled", platform="slack").enabled is False
+    finally:
+        store.close()
+
+
+def test_settings_manager_runtime_save_preserves_require_bind(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(paths, "ensure_data_dirs", lambda: None)
+
+    manager = SettingsManager(settings_file=str(settings_path), platform="slack")
+    try:
+        manager.store.update_channel(
+            "C-bind",
+            ChannelSettings(enabled=True, require_mention=True, require_bind=True, custom_cwd="/old"),
+            platform="slack",
+        )
+        settings = manager.get_user_settings("C-bind")
+        settings.custom_cwd = "/new"
+        manager.update_user_settings("C-bind", settings)
+
+        reloaded = manager.store.find_channel("C-bind", platform="slack")
+        assert reloaded is not None
+        assert reloaded.custom_cwd == "/new"
+        assert reloaded.require_mention is True
+        assert reloaded.require_bind is True
+    finally:
+        manager.store.close()
 
 
 def test_settings_store_reloads_external_sqlite_writes(tmp_path: Path) -> None:

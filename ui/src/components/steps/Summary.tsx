@@ -500,6 +500,7 @@ const buildSettingsPayload = (data: any) => {
               show_message_types: cfg.show_message_types || [],
               custom_cwd: cfg.custom_cwd || null,
               require_mention: cfg.require_mention ?? null,
+              require_bind: cfg.require_bind ?? null,
               routing: {
                 agent_name: cfg.routing?.agent_name || null,
                 agent_backend: cfg.routing?.agent_backend || null,
