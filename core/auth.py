@@ -124,6 +124,18 @@ def check_auth(
         if not ch or not ch.enabled:
             return AuthResult(allowed=False, denial="unauthorized_channel", is_dm=False)
 
+        # 2b. Optional per-channel require_bind gate: when enabled, only bound
+        # users may drive the agent in this channel. Unbound senders are denied
+        # with a denial type that maps to no message (silent ignore), so other
+        # members' chatter does not trigger the bot or spam the channel.
+        if getattr(ch, "require_bind", None):
+            try:
+                is_bound = store.is_bound_user(user_id, platform=platform)
+            except TypeError:
+                is_bound = store.is_bound_user(user_id)
+            if not is_bound:
+                return AuthResult(allowed=False, denial="not_bound_channel", is_dm=False)
+
     # 3. Admin check for protected actions
     if _is_admin_protected(action):
         try:

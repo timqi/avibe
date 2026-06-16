@@ -111,6 +111,53 @@ def test_admin_guard_denies_non_admin_for_protected_action():
     assert result.denial == "not_admin"
 
 
+def test_require_bind_channel_denies_unbound_user():
+    store = _Store()
+    store.settings.channels["C1"] = SimpleNamespace(enabled=True, require_bind=True)
+
+    result = check_auth(
+        user_id="U-stranger",
+        channel_id="C1",
+        is_dm=False,
+        action="",
+        store=store,
+    )
+
+    assert result.allowed is False
+    assert result.denial == "not_bound_channel"
+
+
+def test_require_bind_channel_allows_bound_user():
+    store = _Store()
+    store.settings.channels["C1"] = SimpleNamespace(enabled=True, require_bind=True)
+    store._bound_users.add("U-me")
+
+    result = check_auth(
+        user_id="U-me",
+        channel_id="C1",
+        is_dm=False,
+        action="",
+        store=store,
+    )
+
+    assert result.allowed is True
+
+
+def test_require_bind_off_allows_any_channel_member():
+    store = _Store()
+    store.settings.channels["C1"] = SimpleNamespace(enabled=True, require_bind=None)
+
+    result = check_auth(
+        user_id="U-stranger",
+        channel_id="C1",
+        is_dm=False,
+        action="",
+        store=store,
+    )
+
+    assert result.allowed is True
+
+
 def test_admin_guard_denies_non_admin_for_auth_setup_callback():
     store = _Store()
     store.settings.channels["C1"] = SimpleNamespace(enabled=True)

@@ -161,6 +161,9 @@ class ChannelSettings:
     routing: RoutingSettings = field(default_factory=RoutingSettings)
     # Per-channel require_mention override: None=use global default, True=require, False=don't require
     require_mention: Optional[bool] = None
+    # Per-channel require_bind gate: None/False=off (any channel member), True=only
+    # process messages from bound users; unbound senders are silently ignored.
+    require_bind: Optional[bool] = None
 
 
 @dataclass
@@ -288,6 +291,7 @@ def parse_settings_payload(payload: dict) -> tuple[SettingsState, bool]:
                         custom_cwd=cp.get("custom_cwd"),
                         routing=_parse_routing(cp.get("routing") or {}),
                         require_mention=cp.get("require_mention"),
+                        require_bind=cp.get("require_bind"),
                     )
 
         raw_guild_scopes = scopes.get("guild") or {}
@@ -345,6 +349,7 @@ def parse_settings_payload(payload: dict) -> tuple[SettingsState, bool]:
                 custom_cwd=cp.get("custom_cwd"),
                 routing=_parse_routing(cp.get("routing") or {}),
                 require_mention=cp.get("require_mention"),
+                require_bind=cp.get("require_bind"),
             )
             migrated_legacy_channels = True
 
