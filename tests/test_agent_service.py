@@ -79,6 +79,11 @@ class _Controller:
         self.session_turns = None
 
 
+class _FailingTurnManager:
+    def on_running(self, _context):
+        raise RuntimeError("status failed")
+
+
 def _request(message: str, runtime_key: str = "session:/repo"):
     return SimpleNamespace(
         context=SimpleNamespace(platform_specific={}),
@@ -300,12 +305,35 @@ def test_agent_service_releases_runtime_gate_for_stale_stop() -> None:
         await gate.lock.acquire()
         gate.token = "stop-token"
         gate.backend = "claude"
+        gate.running = False
 
         handled = await service.handle_stop("claude", request)
 
         assert handled is False
         assert not gate.lock.locked()
         assert request.context.platform_specific["agent_runtime_turn_token"] == "stop-token"
+
+    asyncio.run(_run())
+
+
+def test_agent_service_keeps_runtime_gate_for_startup_window_stop() -> None:
+    async def _run():
+        service = AgentService(controller=_Controller())
+        agent = _StopRuntimeAgent("not_active")
+        service.register(agent)
+        request = _request("stop")
+        gate = service._get_turn_gate("session:/repo")
+        await gate.lock.acquire()
+        gate.token = "stop-token"
+        gate.backend = "codex"
+        gate.running = True
+
+        handled = await service.handle_stop("claude", request)
+
+        assert handled is False
+        assert gate.lock.locked()
+        assert gate.token == "stop-token"
+        service.release_runtime_turn_key("session:/repo", "stop-token")
 
     asyncio.run(_run())
 
@@ -320,12 +348,38 @@ def test_agent_service_keeps_runtime_gate_for_interrupt_failure_stop() -> None:
         await gate.lock.acquire()
         gate.token = "stop-token"
         gate.backend = "claude"
+        gate.running = True
 
         handled = await service.handle_stop("claude", request)
 
         assert handled is False
         assert gate.lock.locked()
         service.release_runtime_turn_key("session:/repo", "stop-token")
+
+    asyncio.run(_run())
+
+
+def test_agent_service_releases_gate_when_on_running_fails() -> None:
+    async def _run():
+        controller = _Controller()
+        controller.session_turns = _FailingTurnManager()
+        service = AgentService(controller=controller)
+        agent = _RuntimeAgent()
+        service.register(agent)
+        request = _request("hello")
+
+        try:
+            await service.handle_message("claude", request)
+        except RuntimeError as err:
+            assert str(err) == "status failed"
+        else:
+            raise AssertionError("on_running failure should escape")
+
+        gate = service._turn_gates["session:/repo"]
+        assert not gate.lock.locked()
+        assert gate.token == ""
+        assert gate.running is False
+        assert agent.started == []
 
     asyncio.run(_run())
 

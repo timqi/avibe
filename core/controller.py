@@ -678,7 +678,7 @@ class Controller:
 
         # Register callbacks with the IM client
         self.im_client.register_callbacks(
-            on_message=self._dispatch_to_controller_loop_background(_on_im_message),
+            on_message=self._dispatch_im_message_to_controller_loop(_on_im_message),
             on_command=command_handlers,
             on_callback_query=self._dispatch_to_controller_loop(self.message_handler.handle_callback_query),
             on_settings_update=self._dispatch_to_controller_loop(self.settings_handler.handle_settings_update),
@@ -710,11 +710,43 @@ class Controller:
 
         return _wrapped
 
+    def _dispatch_im_message_to_controller_loop(self, callback):
+        tracked_platforms = {"telegram", "wechat"}
+
+        async def _wrapped(context, *args, **kwargs):
+            platform = str(
+                getattr(context, "platform", None)
+                or (getattr(context, "platform_specific", None) or {}).get("platform")
+                or ""
+            )
+            if platform in tracked_platforms:
+                return await self._run_on_controller_loop(callback, context, *args, **kwargs)
+            self._schedule_controller_callback(callback, context, *args, **kwargs)
+            return None
+
+        return _wrapped
+
     def _dispatch_to_controller_loop_background(self, callback):
         async def _wrapped(*args, **kwargs):
             self._schedule_controller_callback(callback, *args, **kwargs)
 
         return _wrapped
+
+    async def _run_on_controller_loop(self, callback, *args, **kwargs):
+        loop = self._loop
+        if loop is None:
+            return await callback(*args, **kwargs)
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is loop:
+            return await callback(*args, **kwargs)
+
+        future = asyncio.run_coroutine_threadsafe(callback(*args, **kwargs), loop)
+        return await asyncio.wrap_future(future)
 
     def _schedule_controller_callback(self, callback, *args, **kwargs) -> None:
         async def _runner():

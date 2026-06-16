@@ -43,17 +43,18 @@ class AgentService:
         await gate.lock.acquire()
         gate.token = uuid.uuid4().hex
         gate.backend = agent.name
+        gate.running = True
         self._stamp_runtime_turn(request, runtime_key, gate.token)
-        # INBOUND status chokepoint (one of exactly two — the other is the outbound
-        # MessageDispatcher.emit_agent_message). Every turn, every source (chat /
-        # scheduled / Show Page), every backend funnels through here, so this is the
-        # single place that marks an avibe session "running". The matching idle /
-        # failed is written by the outbound terminal result. Non-avibe turns carry
-        # no workbench session id and are skipped.
-        manager = getattr(self.controller, "session_turns", None)
-        if manager is not None:
-            manager.on_running(request.context)
         try:
+            # INBOUND status chokepoint (one of exactly two — the other is the outbound
+            # MessageDispatcher.emit_agent_message). Every turn, every source (chat /
+            # scheduled / Show Page), every backend funnels through here, so this is the
+            # single place that marks an avibe session "running". The matching idle /
+            # failed is written by the outbound terminal result. Non-avibe turns carry
+            # no workbench session id and are skipped.
+            manager = getattr(self.controller, "session_turns", None)
+            if manager is not None:
+                manager.on_running(request.context)
             await agent.handle_message(request)
         except asyncio.CancelledError:
             self.release_runtime_turn(request.context)
@@ -116,7 +117,13 @@ class AgentService:
         if gate is not None and gate.token:
             self._stamp_runtime_turn(request, runtime_key, gate.token)
         handled = await agent.handle_stop(request)
-        if not handled and getattr(request, "stop_failure_reason", None) in STALE_STOP_REASONS:
+        if (
+            not handled
+            and getattr(request, "stop_failure_reason", None) in STALE_STOP_REASONS
+            and gate is not None
+            and gate.token
+            and not gate.running
+        ):
             self.release_runtime_turn(request.context)
         return handled
 
@@ -142,6 +149,7 @@ class AgentService:
             return
         gate.token = ""
         gate.backend = ""
+        gate.running = False
         if gate.lock.locked():
             gate.lock.release()
 
@@ -218,3 +226,4 @@ class _RuntimeTurnGate:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     token: str = ""
     backend: str = ""
+    running: bool = False
