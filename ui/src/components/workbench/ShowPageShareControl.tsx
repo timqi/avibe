@@ -5,7 +5,7 @@ import { Check, Copy, Loader2, Share2 } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
-import { Switch } from '../ui/switch';
+import { Select } from '../ui/select';
 import { useApi } from '../../context/ApiContext';
 import { copyTextToClipboard } from '../../lib/utils';
 import { copyHref, type ShowPageLinkInfo } from '../../lib/showPageLinks';
@@ -70,10 +70,10 @@ export const ShowPageShareControl: React.FC<{
     if (next) refresh();
   };
 
-  const toggleVisibility = (nextPublic: boolean) => {
+  const setVisibilityTo = (next: string) => {
     setBusy(true);
     api
-      .setShowPageVisibility(sessionId, nextPublic ? 'public' : 'private')
+      .setShowPageVisibility(sessionId, next)
       .then((res: ShowPagePayload) => {
         // Authoritative server state: always apply it, and invalidate any
         // in-flight refresh read so a stale read can't revert us afterwards.
@@ -165,21 +165,24 @@ export const ShowPageShareControl: React.FC<{
               )}
             </div>
 
-            <div className="flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-sm">
-                  {isPublic ? t('chat.showPage.visibilityPublic') : t('chat.showPage.visibilityPrivate')}
-                </div>
-                <div className="text-xs text-muted">
-                  {isPublic ? t('chat.showPage.publicDesc') : t('chat.showPage.privateDesc')}
-                </div>
+            <div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm">{t('chat.showPage.access')}</span>
+                <Select
+                  value={isPublic ? 'public' : 'private'}
+                  disabled={busy}
+                  onChange={(e) => setVisibilityTo(e.target.value)}
+                  wrapperClassName="w-auto"
+                  className="h-8 text-sm"
+                  aria-label={t('chat.showPage.access')}
+                >
+                  <option value="private">{t('chat.showPage.visibilityPrivate')}</option>
+                  <option value="public">{t('chat.showPage.visibilityPublic')}</option>
+                </Select>
               </div>
-              <Switch
-                checked={isPublic}
-                disabled={busy}
-                onCheckedChange={toggleVisibility}
-                label={t('chat.showPage.visibilityPublic')}
-              />
+              <p className="mt-1.5 text-xs text-muted">
+                {isPublic ? t('chat.showPage.publicDesc') : t('chat.showPage.privateDesc')}
+              </p>
             </div>
 
             {payload && isPublic && !payload.url_available && (
