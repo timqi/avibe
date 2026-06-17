@@ -322,6 +322,19 @@ export const WorkbenchProjectsProvider: React.FC<{ children: ReactNode }> = ({ c
     }
   }, [api, applyBootstrapSessions, queueReconcile, reconcileSessions]);
 
+  const refreshCachedSessionRow = useCallback(async (sessionId: string) => {
+    const needsRefresh = Object.values(sessionsRef.current).some((state) =>
+      state.sessions?.some((session) => session.id === sessionId && !session.native_session_id),
+    );
+    if (!needsRefresh) return;
+    try {
+      const updated = await api.getSession(sessionId, { cache: false });
+      setSessions((prev) => patchSessionRow(prev, sessionId, () => updated));
+    } catch {
+      /* best-effort: reconnect reconcile will refresh the row later */
+    }
+  }, [api]);
+
   // Load the first page (append=false) or the next page (append=true) of a
   // project's sessions, with dedupe + per-project serialisation.
   const fetchSessions = useCallback(
@@ -405,10 +418,18 @@ export const WorkbenchProjectsProvider: React.FC<{ children: ReactNode }> = ({ c
         setSessions((prev) =>
           patchSessionRow(prev, session_id, (s) => (s.agent_status === agent_status ? s : { ...s, agent_status })),
         );
+        if (agent_status !== 'running') void refreshCachedSessionRow(session_id);
+      },
+      onTurnEnd: ({ session_id }) => {
+        // The first turn can bind the native_session_id server-side, but the
+        // status event only carries the dot state. Refresh the cached row so
+        // actions gated on native binding, such as Fork session, unlock without
+        // waiting for a full sidebar reload.
+        void refreshCachedSessionRow(session_id);
       },
     });
     return disconnect;
-  }, [api, reconcileProjectTree, reconcileSessions]);
+  }, [api, reconcileProjectTree, reconcileSessions, refreshCachedSessionRow]);
 
   const toggleExpanded = useCallback(
     (projectId: string) => {

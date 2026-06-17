@@ -1239,10 +1239,16 @@ const ChatHeaderBar: React.FC<ChatHeaderBarProps> = ({ session, agents, defaultA
   // Idle blank-backend rows with a native (legacy, pre-backfill) stay enabled:
   // the server allows their one-time "initial pin".
   const concreteBackend = session.agent_backend?.trim() || null;
-  const backendLocked = Boolean(session.native_session_id) || working;
-  const pinnedBackend = backendLocked ? concreteBackend : null;
+  const pendingForkBackend =
+    !session.native_session_id &&
+    session.metadata?.created_via === 'session_fork' &&
+    typeof session.metadata?.fork_source_backend === 'string'
+      ? session.metadata.fork_source_backend.trim() || null
+      : null;
+  const backendLocked = Boolean(session.native_session_id) || working || Boolean(pendingForkBackend);
+  const pinnedBackend = pendingForkBackend ?? (backendLocked ? concreteBackend : null);
   const canClearToDefault = !backendLocked;
-  const pickerDisabled = working && !concreteBackend;
+  const pickerDisabled = working && !concreteBackend && !pendingForkBackend;
   const defaultRoute = defaultAgent
     ? {
         agent_name: defaultAgent.name,
