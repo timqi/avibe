@@ -1777,6 +1777,11 @@
   "chat": {
     "back": "Back",
     "untitled": "Untitled session",
+    "selection": {
+      "quote": "Quote",
+      "askInNew": "Ask in a new session",
+      "copy": "Copy"
+    },
     "showPage": {
       "open": "Visualize",
       "backToChat": "Back to chat",

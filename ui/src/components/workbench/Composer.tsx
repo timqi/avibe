@@ -130,6 +130,10 @@ export interface ComposerHandle {
    *  session" from the sidebar). No-op when the mention editor isn't active
    *  (the plain-textarea home composer). */
   insertSessionReference: (sessionId: string, title?: string | null) => void;
+  /** Append text to the end of the composer (e.g. a quoted chat selection),
+   *  with a separating space when the composer is non-empty. No-op when the
+   *  mention editor isn't active (the plain-textarea home composer). */
+  appendText: (text: string) => void;
 }
 
 // The chat-style input row: an auto-growing textarea + a Send/Stop icon button,
@@ -343,6 +347,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       // carries the stable sessionId → serializes to `#<id>` + a session ref.
       mentionRef.current?.insertMention('#', title?.trim() || refSessionId, { sessionId: refSessionId });
     },
+    appendText: (text: string) => mentionRef.current?.append(text),
   }));
 
   const startRecording = async () => {

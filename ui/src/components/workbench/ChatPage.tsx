@@ -15,8 +15,10 @@ import { isProxyMediaUrl } from '../../lib/mediaProxy';
 import { localPath, type ShowPageLinkInfo } from '../../lib/showPageLinks';
 import { formatLocalDateTime } from '../../lib/relativeTime';
 import { useFileDrop } from '../../lib/useFileDrop';
+import { quoteText } from '../../lib/quoteText';
 import { AgentRoutePicker } from './AgentRoutePicker';
 import { ShowPageShareControl } from './ShowPageShareControl';
+import { SelectionQuoteToolbar } from './SelectionQuoteToolbar';
 import { InstallHint } from '../InstallHint';
 import { Button } from '../ui/button';
 import { ChatImage } from '../ui/chat-image';
@@ -145,6 +147,28 @@ export const ChatPage: React.FC = () => {
     (refSessionId: string, title?: string | null) =>
       composerRef.current?.insertSessionReference(refSessionId, title),
     [],
+  );
+
+  // Chat-selection toolbar actions. "Quote" appends the quoted selection to the
+  // current composer; "Ask in a new session" forks this session and seeds the
+  // fork's draft with the same quote, then navigates to it.
+  const quoteSelectionToComposer = useCallback(
+    (text: string) => composerRef.current?.appendText(quoteText(text)),
+    [],
+  );
+  const askInNewSession = useCallback(
+    async (text: string) => {
+      if (!sessionId) return;
+      try {
+        const forked = await api.forkSession(sessionId);
+        if (!forked?.id) return;
+        await api.setSessionDraft(forked.id, quoteText(text));
+        navigate(`/chat/${encodeURIComponent(forked.id)}`);
+      } catch {
+        // forkSession / setSessionDraft surface their own errors via the toast layer.
+      }
+    },
+    [sessionId, api, navigate],
   );
   // Null target hides that sidebar action unless the composer is actually
   // mounted + insertable: a chat is open (sessionId), its session has loaded
@@ -1384,6 +1408,8 @@ export const ChatPage: React.FC = () => {
           highlightedId={highlightedId}
           messageFontSize={messageFontSize}
           onQuickReply={handleQuickReply}
+          onQuoteSelection={quoteSelectionToComposer}
+          onAskInNewSession={askInNewSession}
         />
         <QueueStrip queue={queue} onRemove={removeQueued} onSendNow={sendQueueNow} />
         {/* key by session so the composer remounts per session — its draft-seeding
@@ -1723,6 +1749,10 @@ interface TranscriptProps {
   highlightedId: string | null;
   messageFontSize: number;
   onQuickReply: (messageId: string, choice: string) => boolean | void | Promise<boolean | void>;
+  // Chat-selection toolbar: quote the selection into the composer, or fork +
+  // ask in a new session seeded with the quote.
+  onQuoteSelection: (text: string) => void;
+  onAskInNewSession: (text: string) => void;
 }
 
 const Transcript: React.FC<TranscriptProps> = ({
@@ -1741,6 +1771,8 @@ const Transcript: React.FC<TranscriptProps> = ({
   highlightedId,
   messageFontSize,
   onQuickReply,
+  onQuoteSelection,
+  onAskInNewSession,
 }) => {
   const { t } = useTranslation();
   const forkSourceSessionId =
@@ -2030,7 +2062,10 @@ const Transcript: React.FC<TranscriptProps> = ({
   }
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
-      <div ref={scrollRef} onScroll={handleScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-5 [overflow-anchor:none] md:px-8">
+      <SelectionQuoteToolbar containerRef={scrollRef} onQuote={onQuoteSelection} onAskInNew={onAskInNewSession} />
+      {/* [-webkit-touch-callout:none] suppresses the iOS selection callout so our
+          toolbar is the selection UI on mobile (we re-offer Copy there). */}
+      <div ref={scrollRef} onScroll={handleScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-5 [overflow-anchor:none] [-webkit-touch-callout:none] md:px-8">
         <div ref={contentRef} className="mx-auto flex w-full max-w-[1080px] flex-col gap-3">
           {forkSourceBanner}
           {loadingOlder && (
