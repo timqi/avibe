@@ -1,10 +1,9 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { Check, Copy, GitFork, TextQuote } from 'lucide-react';
+import { GitFork, TextQuote } from 'lucide-react';
 
 import { Button } from '../ui/button';
-import { copyTextToClipboard } from '../../lib/utils';
 
 type SelectionState = { text: string; top: number; bottom: number; left: number };
 
@@ -15,8 +14,8 @@ const EDGE = 8;
 // A floating toolbar that appears over a text selection inside the chat
 // transcript. "Quote" appends the (quoted) selection to the current composer;
 // "Ask in a new session" forks + prefills the fork's draft (only offered when
-// the session is forkable); "Copy" is a touch-only convenience — the OS
-// selection menu can't be suppressed, so on touch we stagger below it.
+// the session is forkable). On touch the OS native selection menu also shows
+// (it can't be suppressed), so we stagger this toolbar clear of it.
 export const SelectionQuoteToolbar: React.FC<{
   containerRef: React.RefObject<HTMLDivElement | null>;
   onQuote: (text: string) => void;
@@ -26,12 +25,10 @@ export const SelectionQuoteToolbar: React.FC<{
 }> = ({ containerRef, onQuote, onAskInNew }) => {
   const { t } = useTranslation();
   const [sel, setSel] = useState<SelectionState | null>(null);
-  const [copied, setCopied] = useState(false);
   const toolbarRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
-  // Touch (coarse pointer — covers phones AND tablets/iPads, unlike a width
-  // breakpoint) gets a Copy convenience; the OS selection menu still shows, so
-  // we stagger our toolbar below it rather than try to fight it.
+  // Touch (coarse pointer — phones AND tablets/iPads) is where the OS selection
+  // menu coexists, so it drives the stagger-positioning below.
   const [isTouch] = useState(
     () => typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches,
   );
@@ -80,7 +77,7 @@ export const SelectionQuoteToolbar: React.FC<{
   }, [containerRef]);
 
   // Measure the rendered toolbar so we can clamp it on-screen by its real width
-  // (the label widths vary by locale + how many actions are shown).
+  // (label widths vary by locale + whether Ask is shown).
   useLayoutEffect(() => {
     if (sel && toolbarRef.current) setWidth(toolbarRef.current.offsetWidth);
   }, [sel, onAskInNew, isTouch]);
@@ -90,7 +87,6 @@ export const SelectionQuoteToolbar: React.FC<{
   const dismiss = () => {
     window.getSelection()?.removeAllRanges();
     setSel(null);
-    setCopied(false);
   };
   const runQuote = () => {
     onQuote(sel.text);
@@ -99,15 +95,6 @@ export const SelectionQuoteToolbar: React.FC<{
   const runAsk = () => {
     onAskInNew?.(sel.text);
     dismiss();
-  };
-  const runCopy = () => {
-    const text = sel.text;
-    void copyTextToClipboard(text).then((ok) => {
-      if (ok) {
-        setCopied(true);
-        window.setTimeout(dismiss, 800);
-      }
-    });
   };
 
   // Activate on pointerup (mouse + touch) and Enter/Space (keyboard). The
@@ -125,12 +112,21 @@ export const SelectionQuoteToolbar: React.FC<{
     },
   });
 
-  // The OS selection menu can't be queried or suppressed, but on touch it sits
-  // ABOVE the selection by default — so place ours BELOW to stagger (avoid the
-  // OS menu overlapping + covering ours). Desktop has no OS menu: prefer above.
   const roomAbove = sel.top > TOOLBAR_H + GAP + EDGE;
   const roomBelow = window.innerHeight - sel.bottom > TOOLBAR_H + GAP + EDGE;
-  const below = isTouch ? roomBelow || !roomAbove : !roomAbove;
+  let below: boolean;
+  if (isTouch) {
+    // The OS selection menu can't be queried or suppressed, but it sits toward
+    // screen center: BELOW a selection in the top half, ABOVE one in the bottom
+    // half. Stagger ours toward the nearer edge (the opposite side) so the two
+    // don't overlap. Fall back if that edge is clipped.
+    below = (sel.top + sel.bottom) / 2 >= window.innerHeight / 2;
+    if (below && !roomBelow) below = false;
+    else if (!below && !roomAbove) below = true;
+  } else {
+    // Desktop has no OS selection menu — just prefer above, flip if no room.
+    below = !roomAbove;
+  }
   const top = below ? sel.bottom + GAP : sel.top - TOOLBAR_H - GAP;
   // Clamp by the on-screen (capped) width so a toolbar wider than the viewport
   // centers + scrolls internally instead of pushing an edge off-screen.
@@ -156,15 +152,6 @@ export const SelectionQuoteToolbar: React.FC<{
           <Button variant="ghost" className={itemClass} {...activate(runAsk)}>
             <GitFork className="size-3.5 text-muted" />
             {t('chat.selection.askInNew')}
-          </Button>
-        </>
-      )}
-      {isTouch && (
-        <>
-          <span className="h-5 w-px bg-border" />
-          <Button variant="ghost" className={itemClass} {...activate(runCopy)}>
-            {copied ? <Check className="size-3.5 text-mint" /> : <Copy className="size-3.5 text-muted" />}
-            {t('chat.selection.copy')}
           </Button>
         </>
       )}
