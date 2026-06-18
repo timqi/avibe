@@ -15,8 +15,8 @@ const EDGE = 8;
 // A floating toolbar that appears over a text selection inside the chat
 // transcript. "Quote" appends the (quoted) selection to the current composer;
 // "Ask in a new session" forks + prefills the fork's draft (only offered when
-// the session is forkable); "Copy" replaces the native callout that the
-// transcript suppresses on touch devices.
+// the session is forkable); "Copy" is a touch-only convenience — the OS
+// selection menu can't be suppressed, so on touch we stagger below it.
 export const SelectionQuoteToolbar: React.FC<{
   containerRef: React.RefObject<HTMLDivElement | null>;
   onQuote: (text: string) => void;
@@ -29,9 +29,9 @@ export const SelectionQuoteToolbar: React.FC<{
   const [copied, setCopied] = useState(false);
   const toolbarRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
-  // Touch devices get a Copy action because the transcript suppresses the native
-  // selection callout there (a coarse pointer covers phones AND tablets/iPads,
-  // unlike a width breakpoint).
+  // Touch (coarse pointer — covers phones AND tablets/iPads, unlike a width
+  // breakpoint) gets a Copy convenience; the OS selection menu still shows, so
+  // we stagger our toolbar below it rather than try to fight it.
   const [isTouch] = useState(
     () => typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches,
   );
@@ -125,8 +125,13 @@ export const SelectionQuoteToolbar: React.FC<{
     },
   });
 
-  const above = sel.top > TOOLBAR_H + GAP + EDGE;
-  const top = above ? sel.top - TOOLBAR_H - GAP : sel.bottom + GAP;
+  // The OS selection menu can't be queried or suppressed, but on touch it sits
+  // ABOVE the selection by default — so place ours BELOW to stagger (avoid the
+  // OS menu overlapping + covering ours). Desktop has no OS menu: prefer above.
+  const roomAbove = sel.top > TOOLBAR_H + GAP + EDGE;
+  const roomBelow = window.innerHeight - sel.bottom > TOOLBAR_H + GAP + EDGE;
+  const below = isTouch ? roomBelow || !roomAbove : !roomAbove;
+  const top = below ? sel.bottom + GAP : sel.top - TOOLBAR_H - GAP;
   // Clamp by the on-screen (capped) width so a toolbar wider than the viewport
   // centers + scrolls internally instead of pushing an edge off-screen.
   const half = Math.min(width, window.innerWidth - 2 * EDGE) / 2;

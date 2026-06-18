@@ -160,7 +160,8 @@ export const ChatPage: React.FC = () => {
   // current composer; "Ask in a new session" forks this session and seeds the
   // fork's draft with the same quote, then navigates to it.
   const quoteSelectionToComposer = useCallback(
-    (text: string) => composerRef.current?.appendText(quoteText(text)),
+    // Trailing space so the user's next typed text is separated from the quote.
+    (text: string) => composerRef.current?.appendText(quoteText(text) + ' '),
     [],
   );
   const askInNewSession = useCallback(
@@ -172,7 +173,8 @@ export const ChatPage: React.FC = () => {
         // setSessionDraft returns {ok:false} for a non-OK response (it doesn't
         // throw), so check it before navigating — don't strand the user in a
         // fork with an empty composer and a lost selection.
-        const saved = await api.setSessionDraft(forked.id, quoteText(text));
+        // Trailing space so typing continues separated from the quote.
+        const saved = await api.setSessionDraft(forked.id, quoteText(text) + ' ');
         if (!saved?.ok) {
           showToast(t('chat.selection.askFailed'), 'error');
           return;
@@ -2089,9 +2091,7 @@ const Transcript: React.FC<TranscriptProps> = ({
         // omit the action otherwise so it isn't offered just to 409.
         onAskInNew={session.native_session_id ? onAskInNewSession : undefined}
       />
-      {/* [-webkit-touch-callout:none] suppresses the iOS selection callout so our
-          toolbar is the selection UI on mobile (we re-offer Copy there). */}
-      <div ref={scrollRef} onScroll={handleScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-5 [overflow-anchor:none] [-webkit-touch-callout:none] md:px-8">
+      <div ref={scrollRef} onScroll={handleScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-5 [overflow-anchor:none] md:px-8">
         <div ref={contentRef} className="mx-auto flex w-full max-w-[1080px] flex-col gap-3">
           {forkSourceBanner}
           {loadingOlder && (
