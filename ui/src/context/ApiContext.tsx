@@ -323,6 +323,7 @@ export type WorkbenchSessionUpdate = {
   title: string | null;
   agent_id: string | null;
   agent_name: string | null;
+  // Session execution snapshot, not a scope/default route selector.
   agent_backend: string;
   agent_variant: string;
   model: string | null;
