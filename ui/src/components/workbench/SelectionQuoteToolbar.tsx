@@ -1,9 +1,10 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { GitFork, TextQuote } from 'lucide-react';
+import { Check, Copy, GitFork, TextQuote } from 'lucide-react';
 
 import { Button } from '../ui/button';
+import { copyTextToClipboard } from '../../lib/utils';
 
 type SelectionState = { text: string; top: number; bottom: number; left: number };
 
@@ -14,8 +15,10 @@ const EDGE = 8;
 // A floating toolbar that appears over a text selection inside the chat
 // transcript. "Quote" appends the (quoted) selection to the current composer;
 // "Ask in a new session" forks + prefills the fork's draft (only offered when
-// the session is forkable). On touch the OS native selection menu also shows
-// (it can't be suppressed), so we stagger this toolbar clear of it.
+// the session is forkable); "Copy" (touch only) is a fallback for when the OS
+// selection menu doesn't cooperate. It follows the selection through scrolling
+// (hides while scrolling, re-shows at the new spot) and only disappears when
+// the selection is cleared — so the user can scroll to dodge the OS menu.
 export const SelectionQuoteToolbar: React.FC<{
   containerRef: React.RefObject<HTMLDivElement | null>;
   onQuote: (text: string) => void;
@@ -25,10 +28,11 @@ export const SelectionQuoteToolbar: React.FC<{
 }> = ({ containerRef, onQuote, onAskInNew }) => {
   const { t } = useTranslation();
   const [sel, setSel] = useState<SelectionState | null>(null);
+  const [copied, setCopied] = useState(false);
   const toolbarRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   // Touch (coarse pointer — phones AND tablets/iPads) is where the OS selection
-  // menu coexists, so it drives the stagger-positioning below.
+  // menu coexists; it drives the stagger-positioning + the touch-only Copy.
   const [isTouch] = useState(
     () => typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches,
   );
@@ -62,10 +66,13 @@ export const SelectionQuoteToolbar: React.FC<{
       window.clearTimeout(timer);
       timer = window.setTimeout(recompute, 150);
     };
-    // A scrolled transcript makes the cached rect stale — hide immediately.
+    // Follow the selection through scrolling: hide while scrolling, then re-show
+    // at the new position once it settles. The toolbar persists as long as the
+    // selection exists, so the user can scroll to move it clear of the OS menu.
     const onScroll = () => {
-      window.clearTimeout(timer);
       setSel(null);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(recompute, 150);
     };
     document.addEventListener('selectionchange', onSelectionChange);
     container.addEventListener('scroll', onScroll, { passive: true });
@@ -77,7 +84,7 @@ export const SelectionQuoteToolbar: React.FC<{
   }, [containerRef]);
 
   // Measure the rendered toolbar so we can clamp it on-screen by its real width
-  // (label widths vary by locale + whether Ask is shown).
+  // (label widths vary by locale + which actions are shown).
   useLayoutEffect(() => {
     if (sel && toolbarRef.current) setWidth(toolbarRef.current.offsetWidth);
   }, [sel, onAskInNew, isTouch]);
@@ -87,6 +94,7 @@ export const SelectionQuoteToolbar: React.FC<{
   const dismiss = () => {
     window.getSelection()?.removeAllRanges();
     setSel(null);
+    setCopied(false);
   };
   const runQuote = () => {
     onQuote(sel.text);
@@ -95,6 +103,15 @@ export const SelectionQuoteToolbar: React.FC<{
   const runAsk = () => {
     onAskInNew?.(sel.text);
     dismiss();
+  };
+  const runCopy = () => {
+    const text = sel.text;
+    void copyTextToClipboard(text).then((ok) => {
+      if (ok) {
+        setCopied(true);
+        window.setTimeout(dismiss, 800);
+      }
+    });
   };
 
   // Activate on pointerup (mouse + touch) and Enter/Space (keyboard). The
@@ -127,7 +144,10 @@ export const SelectionQuoteToolbar: React.FC<{
     // Desktop has no OS selection menu — just prefer above, flip if no room.
     below = !roomAbove;
   }
-  const top = below ? sel.bottom + GAP : sel.top - TOOLBAR_H - GAP;
+  const rawTop = below ? sel.bottom + GAP : sel.top - TOOLBAR_H - GAP;
+  // Keep the toolbar on-screen vertically too, so it stays visible (and the
+  // user can still act) when the selection is scrolled near a viewport edge.
+  const top = Math.min(Math.max(rawTop, EDGE), window.innerHeight - TOOLBAR_H - EDGE);
   // Clamp by the on-screen (capped) width so a toolbar wider than the viewport
   // centers + scrolls internally instead of pushing an edge off-screen.
   const half = Math.min(width, window.innerWidth - 2 * EDGE) / 2;
@@ -152,6 +172,15 @@ export const SelectionQuoteToolbar: React.FC<{
           <Button variant="ghost" className={itemClass} {...activate(runAsk)}>
             <GitFork className="size-3.5 text-muted" />
             {t('chat.selection.askInNew')}
+          </Button>
+        </>
+      )}
+      {isTouch && (
+        <>
+          <span className="h-5 w-px bg-border" />
+          <Button variant="ghost" className={itemClass} {...activate(runCopy)}>
+            {copied ? <Check className="size-3.5 text-mint" /> : <Copy className="size-3.5 text-muted" />}
+            {t('chat.selection.copy')}
           </Button>
         </>
       )}
