@@ -254,6 +254,7 @@ const MobileSessionRow: React.FC<{
   const [draft, setDraft] = useState(session.title ?? '');
   const inputRef = useRef<HTMLInputElement | null>(null);
   const handledRef = useRef(false);
+  const forkingRef = useRef(false);
 
   useEffect(() => {
     if (renaming) inputRef.current?.focus();
@@ -349,8 +350,16 @@ const MobileSessionRow: React.FC<{
               icon={GitFork}
               onClick={async () => {
                 setMenuOpen(false);
-                const forked = await forkSession(projectId, session.id);
-                if (forked) navigate(`/chat/${encodeURIComponent(forked.id)}`);
+                // The row stays mounted after the menu closes, so guard against a
+                // second tap (reopened menu) spawning a duplicate fork in flight.
+                if (forkingRef.current) return;
+                forkingRef.current = true;
+                try {
+                  const forked = await forkSession(projectId, session.id);
+                  if (forked) navigate(`/chat/${encodeURIComponent(forked.id)}`);
+                } finally {
+                  forkingRef.current = false;
+                }
               }}
             >
               {t('workbench.sessionFork')}

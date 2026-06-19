@@ -4295,7 +4295,7 @@ def sessions_fork(session_id: str):
     from vibe.sse_broker import broker
 
     try:
-        result = reserve_forked_session(source_session_id=session_id)
+        result = reserve_forked_session(source_session_id=session_id, title_lang=_request_ui_language())
         engine = _projects_engine()
         with engine.connect() as conn:
             session = workbench_sessions_service.get_session(conn, result.session_id)

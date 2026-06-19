@@ -1,4 +1,8 @@
 {
+  "fork": {
+    "title": "Fork {title}",
+    "titleUntitled": "Fork"
+  },
   "common": {
     "save": "Save",
     "cancel": "Cancel",

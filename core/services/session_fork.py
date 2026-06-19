@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from config import paths
+from vibe.i18n import t
 
 
 class SessionForkError(ValueError):
@@ -56,6 +57,7 @@ def reserve_forked_session(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     db_path: Optional[Path] = None,
+    title_lang: str = "en",
 ) -> SessionForkResult:
     """Copy an existing Agent Session row into a new pending fork target.
 
@@ -118,7 +120,7 @@ def reserve_forked_session(
                 else row["reasoning_effort"]
             )
             source_title = str(row["title"] or "").strip()
-            target_title = _forked_session_title(source_title)
+            target_title = _forked_session_title(source_title, title_lang)
 
             metadata = _load_metadata(row["metadata_json"])
             metadata.update(
@@ -248,8 +250,8 @@ def _clean_optional(value: Any) -> Optional[str]:
     return text or None
 
 
-def _forked_session_title(source_title: str) -> str:
-    return f"Fork {source_title}" if source_title else "Fork"
+def _forked_session_title(source_title: str, lang: str = "en") -> str:
+    return t("fork.title", lang, title=source_title) if source_title else t("fork.titleUntitled", lang)
 
 
 def _latest_source_message_id(conn: Any, source_session_id: str) -> Optional[str]:
