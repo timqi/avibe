@@ -630,6 +630,8 @@ class CommandHandlers(BaseHandler):
 
             formatter = self._get_formatter(context)
             response_text = f"✅ {self._t('success.cwdChanged', path=formatter.format_code_inline(absolute_path))}"
+            if self._flat_scope_needs_new_session_hint(context, log_context="cwd update hint"):
+                response_text = f"{response_text}\n\n{self._t('success.routingUpdateNeedsNewSession')}"
             channel_context = self._get_channel_context(context)
             await im_client.send_message(channel_context, response_text)
 
