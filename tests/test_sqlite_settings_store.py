@@ -352,7 +352,6 @@ def test_settings_save_does_not_migrate_legacy_model_fields_without_backend(tmp_
                         enabled=True,
                         routing=RoutingSettings(
                             agent_name=None,
-                            agent_backend=None,
                             codex_model="gpt-stale-codex",
                             claude_model="claude-stale",
                             opencode_model="openai/stale",
@@ -377,7 +376,7 @@ def test_settings_save_does_not_migrate_legacy_model_fields_without_backend(tmp_
     assert routing.opencode_model == "openai/stale"
 
 
-def test_settings_save_does_not_migrate_active_backend_legacy_fields(tmp_path: Path) -> None:
+def test_settings_save_lifts_backend_aliases_for_builtin_agent_name(tmp_path: Path) -> None:
     db_path = tmp_path / "vibe.sqlite"
     run_migrations(db_path)
     service = SQLiteSettingsService(db_path)
@@ -388,7 +387,7 @@ def test_settings_save_does_not_migrate_active_backend_legacy_fields(tmp_path: P
                     "slack::C123": ChannelSettings(
                         enabled=True,
                         routing=RoutingSettings(
-                            agent_backend="claude",
+                            agent_name="claude",
                             claude_model="claude-opus-4-8",
                             claude_reasoning_effort="max",
                         ),
@@ -402,10 +401,135 @@ def test_settings_save_does_not_migrate_active_backend_legacy_fields(tmp_path: P
         service.close()
 
     routing = state.channels["slack::C123"].routing
+    assert routing.model == "claude-opus-4-8"
+    assert routing.reasoning_effort == "max"
+
+
+def test_settings_save_stores_only_active_builtin_agent_variant(tmp_path: Path) -> None:
+    db_path = tmp_path / "vibe.sqlite"
+    run_migrations(db_path)
+    service = SQLiteSettingsService(db_path)
+    try:
+        service.save_state(
+            SettingsState(
+                channels={
+                    "slack::C123": ChannelSettings(
+                        enabled=True,
+                        routing=RoutingSettings(
+                            agent_name="opencode",
+                            codex_agent="stale-codex-profile",
+                            opencode_agent=None,
+                        ),
+                    ),
+                }
+            )
+        )
+        state = service.load_state()
+    finally:
+        service.close()
+
+    engine = create_sqlite_engine(db_path)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                select(scope_settings.c.agent_variant, scope_settings.c.settings_json)
+                .select_from(scope_settings)
+                .join(scopes, scopes.c.id == scope_settings.c.scope_id)
+                .where(scopes.c.platform == "slack", scopes.c.native_id == "C123")
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert row.agent_variant is None
+    assert state.channels["slack::C123"].routing.codex_agent == "stale-codex-profile"
+    assert json.loads(row.settings_json)["routing"]["codex_agent"] == "stale-codex-profile"
+
+
+def test_settings_save_uses_matching_builtin_agent_variant(tmp_path: Path) -> None:
+    db_path = tmp_path / "vibe.sqlite"
+    run_migrations(db_path)
+    service = SQLiteSettingsService(db_path)
+    try:
+        service.save_state(
+            SettingsState(
+                channels={
+                    "slack::C123": ChannelSettings(
+                        enabled=True,
+                        routing=RoutingSettings(
+                            agent_name="codex",
+                            codex_agent="active-codex-profile",
+                            opencode_agent="stale-opencode-profile",
+                        ),
+                    ),
+                }
+            )
+        )
+    finally:
+        service.close()
+
+    engine = create_sqlite_engine(db_path)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                select(scope_settings.c.agent_variant)
+                .select_from(scope_settings)
+                .join(scopes, scopes.c.id == scope_settings.c.scope_id)
+                .where(scopes.c.platform == "slack", scopes.c.native_id == "C123")
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert row.agent_variant == "active-codex-profile"
+
+
+def test_settings_load_ignores_row_model_without_agent_name(tmp_path: Path) -> None:
+    db_path = tmp_path / "vibe.sqlite"
+    run_migrations(db_path)
+    engine = create_sqlite_engine(db_path)
+    service = None
+    try:
+        with engine.begin() as conn:
+            scope_id = upsert_scope(
+                conn,
+                "slack",
+                "channel",
+                "C123",
+                display_name=None,
+                native_type=None,
+                is_private=False,
+                supports_threads=True,
+                metadata={},
+                now="now",
+            )
+            conn.execute(
+                scope_settings.insert().values(
+                    scope_id=scope_id,
+                    enabled=1,
+                    role=None,
+                    workdir=None,
+                    agent_name=None,
+                    agent_backend="codex",
+                    agent_variant=None,
+                    model="gpt-stale-codex",
+                    reasoning_effort="high",
+                    require_mention=None,
+                    settings_version=1,
+                    settings_json=json.dumps({"routing": {"agent_backend": "codex"}, "require_bind": None}),
+                    created_at="now",
+                    updated_at="now",
+                )
+            )
+        service = SQLiteSettingsService(db_path)
+        state = service.load_state()
+    finally:
+        if service is not None:
+            service.close()
+        engine.dispose()
+
+    routing = state.channels["slack::C123"].routing
+    assert routing.agent_name is None
     assert routing.model is None
     assert routing.reasoning_effort is None
-    assert routing.claude_model == "claude-opus-4-8"
-    assert routing.claude_reasoning_effort == "max"
 
 
 def test_settings_store_bootstrap_uses_config_primary_platform(tmp_path: Path, monkeypatch) -> None:

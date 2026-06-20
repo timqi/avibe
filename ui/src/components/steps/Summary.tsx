@@ -432,7 +432,6 @@ const buildConfigPayload = (data: any) => {
       default_cwd: data.default_cwd || data.runtime?.default_cwd || '_tmp',
     },
     agents: {
-      default_backend: data.default_backend || 'opencode',
       opencode: {
         ...agents.opencode,
         enabled: agents.opencode?.enabled ?? true,
@@ -503,7 +502,6 @@ const buildSettingsPayload = (data: any) => {
               require_bind: cfg.require_bind ?? null,
               routing: {
                 agent_name: cfg.routing?.agent_name || null,
-                agent_backend: cfg.routing?.agent_backend || null,
                 model: cfg.routing?.model || null,
                 reasoning_effort: cfg.routing?.reasoning_effort || null,
                 opencode_agent: cfg.routing?.opencode_agent || null,

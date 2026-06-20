@@ -2298,6 +2298,17 @@ def show_page_visibility_post(session_id):
         return _show_page_error_response(exc)
 
 
+@app.route("/api/show-pages/<session_id>/ensure", methods=["POST"])
+def show_page_ensure_post(session_id):
+    from core.show_pages import ShowPageError
+    from vibe import api
+
+    try:
+        return jsonify(api.ensure_show_page(session_id))
+    except ShowPageError as exc:
+        return _show_page_error_response(exc)
+
+
 @app.route("/api/show-pages/<session_id>/rotate-share", methods=["POST"])
 def show_page_rotate_share_post(session_id):
     from core.show_pages import ShowPageError
@@ -3133,6 +3144,20 @@ def _get_wechat_auth():
     return _wechat_auth_manager
 
 
+def _load_wechat_local_tokens() -> list[str]:
+    try:
+        from core.services import settings as settings_service
+
+        config = settings_service.load_config()
+    except Exception:
+        logger.warning("Failed to load WeChat local token list for QR login", exc_info=True)
+        return []
+    token = getattr(getattr(config, "wechat", None), "bot_token", "")
+    if isinstance(token, str) and token.strip():
+        return [token.strip()]
+    return []
+
+
 def _schedule_wechat_qr_login_restart() -> dict:
     """Schedule a managed restart after QR-login credentials are persisted."""
     from vibe.restart_supervisor import schedule_restart
@@ -3140,14 +3165,48 @@ def _schedule_wechat_qr_login_restart() -> dict:
     return schedule_restart(delay_seconds=2.0, trigger="wechat-qr-login")
 
 
+def _persist_wechat_qr_credentials(result: dict) -> None:
+    token = result.get("bot_token")
+    if not isinstance(token, str) or not token.strip():
+        return
+
+    from vibe import api as vibe_api
+    from core.services import settings as settings_service
+
+    config = settings_service.load_config(default_factory=settings_service.default_config)
+    current = vibe_api.config_to_payload(config, include_secrets=True)
+    wechat = dict(current.get("wechat") or {})
+    wechat["bot_token"] = token.strip()
+    if isinstance(result.get("base_url"), str) and result["base_url"].strip():
+        wechat["base_url"] = result["base_url"].strip()
+    elif not wechat.get("base_url"):
+        wechat["base_url"] = "https://ilinkai.weixin.qq.com"
+    current["wechat"] = wechat
+
+    platforms = dict(current.get("platforms") or {})
+    enabled = list(platforms.get("enabled") or [])
+    if "wechat" not in enabled:
+        enabled.append("wechat")
+    platforms["enabled"] = enabled
+    if not platforms.get("primary") or platforms.get("primary") == "avibe":
+        platforms["primary"] = "wechat"
+    current["platforms"] = platforms
+
+    vibe_api.save_config(current)
+
+
+WECHAT_QR_LOGIN_BASE_URL = "https://ilinkai.weixin.qq.com"
+
+
 @app.route("/api/wechat/qr_login/start", methods=["POST"])
 async def wechat_qr_login_start():
     """Start WeChat QR code login flow."""
     auth = _get_wechat_auth()
-    payload = request.json or {}
-    base_url = payload.get("base_url", "https://ilinkai.weixin.qq.com")
 
-    result = await auth.start_login(base_url=base_url)
+    result = await auth.start_login(
+        base_url=WECHAT_QR_LOGIN_BASE_URL,
+        local_token_list=_load_wechat_local_tokens(),
+    )
     if result.get("ok") is False:
         return jsonify(result), 500
     return jsonify(result)
@@ -3160,15 +3219,24 @@ async def wechat_qr_login_poll():
     session_key = payload.get("session_key", "")
     if not session_key:
         return jsonify({"error": "session_key required"}), 400
+    verify_code = payload.get("verify_code")
+    if verify_code is not None and not isinstance(verify_code, str):
+        return jsonify({"error": "invalid_verify_code"}), 400
 
     auth = _get_wechat_auth()
-    result = await auth.poll_status(session_key)
+    result = await auth.poll_status(session_key, verify_code=verify_code)
     if result.get("ok") is False:
         return jsonify(result), 500
 
     # If confirmed, auto-bind the WeChat user
-    if result.get("status") == "confirmed" and result.get("bot_token"):
-        user_id = result.get("user_id", "wechat_user")
+    if result.get("status") == "confirmed" and result.get("bot_token") and result.get("user_id"):
+        user_id = result["user_id"]
+
+        try:
+            _persist_wechat_qr_credentials(result)
+        except Exception as exc:
+            logger.error("Failed to persist WeChat QR credentials: %s", exc)
+            return jsonify({"ok": False, "error": "failed_to_persist_wechat_credentials"}), 500
 
         # Auto-bind user
         try:
@@ -3520,6 +3588,14 @@ async def backend_oauth_web_remove(backend: str):
     return jsonify(await api.remove_backend_auth_async(backend))
 
 
+@app.route("/api/backend/claude/auth/oauth/credentials/remove", methods=["POST"])
+async def claude_oauth_credentials_remove():
+    """Clear Claude OAuth credentials without touching API-key auth."""
+    from vibe import api
+
+    return jsonify(await api.remove_claude_oauth_credentials_async())
+
+
 @app.route("/api/backend/<backend>/auth/api-key/remove", methods=["POST"])
 def backend_auth_api_key_remove(backend: str):
     """Clear the stored API key (V2Config + Codex auth.json) without
@@ -3747,7 +3823,7 @@ def projects_update(project_id: str):
     # (see ``projects_service.update_project`` and its ``_UNSET`` sentinel).
     agent_kwargs = {
         field: payload[field]
-        for field in ("agent_backend", "agent_name", "agent_variant", "model", "reasoning_effort")
+        for field in ("agent_name", "agent_variant", "model", "reasoning_effort")
         if field in payload
     }
     if display_name is None and folder_path is None and not agent_kwargs:
@@ -4197,6 +4273,46 @@ def sessions_create():
     return jsonify(session), 201
 
 
+def _session_fork_error_response(err: Exception):
+    message = str(err)
+    if "id not found" in message:
+        return jsonify({"error": message, "code": "session_not_found"}), 404
+    if "is archived" in message:
+        return jsonify({"error": message, "code": "session_archived"}), 409
+    if "no native session id" in message:
+        return jsonify({"error": message, "code": "session_not_bound"}), 409
+    if "backend cannot be forked" in message:
+        return jsonify({"error": message, "code": "session_backend_unsupported"}), 409
+    if "backend does not match" in message:
+        return jsonify({"error": message, "code": "session_backend_mismatch"}), 409
+    return jsonify({"error": message, "code": "session_fork_failed"}), 400
+
+
+@app.route("/api/sessions/<session_id>/fork", methods=["POST"])
+def sessions_fork(session_id: str):
+    from core.services import sessions as workbench_sessions_service
+    from core.services import settings as settings_service
+    from core.services.session_fork import SessionForkError, reserve_forked_session
+    from vibe.sse_broker import broker
+
+    try:
+        # Use the saved global UI language (the same source other backend-generated
+        # strings use) so the forked title matches the chosen UI, not the browser's
+        # Accept-Language header which can differ from the user's selected language.
+        title_lang = settings_service.load_config_or_default().language
+        result = reserve_forked_session(source_session_id=session_id, title_lang=title_lang)
+        engine = _projects_engine()
+        with engine.connect() as conn:
+            session = workbench_sessions_service.get_session(conn, result.session_id)
+    except SessionForkError as err:
+        return _session_fork_error_response(err)
+    except LookupError as err:
+        return jsonify({"error": str(err), "code": "session_not_found"}), 404
+
+    broker.publish("session.activity", {"session_id": session["id"], "scope_id": session["scope_id"], "event": "created"})
+    return jsonify(session), 201
+
+
 @app.route("/api/sessions/<session_id>", methods=["GET"])
 def sessions_get(session_id: str):
     from core.services import sessions as workbench_sessions_service
@@ -4317,6 +4433,18 @@ async def sessions_update(session_id: str):
         return jsonify({"error": "no updatable fields supplied"}), 400
 
     engine = _projects_engine()
+    should_check_backend_lock = "agent_backend" in updatable
+    requested_backend = updatable.get("agent_backend")
+    if "agent_name" in updatable and "agent_backend" not in updatable:
+        try:
+            with engine.connect() as conn:
+                requested_backend = workbench_sessions_service.derive_backend_for_agent_name(
+                    conn,
+                    str(updatable.get("agent_name") or ""),
+                )
+            should_check_backend_lock = True
+        except LookupError as err:
+            return jsonify({"error": str(err)}), 404
     # The row's ``agent_status`` lags turn acceptance: ``SessionTurnManager.submit``
     # registers the in-flight gate synchronously, but ``running`` is only written
     # once dispatch starts — so a cross-backend switch landing in that startup
@@ -4324,13 +4452,13 @@ async def sessions_update(session_id: str):
     # bind-time backend backfill. Consult the controller's authoritative in-flight
     # registry first; an unreachable/slow controller falls through to the
     # row-status guard inside ``update_session`` (best effort).
-    if "agent_backend" in updatable:
+    if should_check_backend_lock:
         try:
             with engine.connect() as conn:
                 current = workbench_sessions_service.get_session(conn, session_id)
         except LookupError as err:
             return jsonify({"error": str(err)}), 404
-        if str(updatable.get("agent_backend") or "") != str(current.get("agent_backend") or ""):
+        if str(requested_backend or "") != str(current.get("agent_backend") or ""):
             try:
                 turn_result = await internal_client.turn_state(session_id)
                 in_flight = bool((turn_result.get("body") or {}).get("in_flight"))
@@ -4341,7 +4469,7 @@ async def sessions_update(session_id: str):
                     workbench_sessions_service.SessionBackendLockedError(
                         session_id=session_id,
                         current_backend=current.get("agent_backend"),
-                        requested_backend=updatable.get("agent_backend"),
+                        requested_backend=requested_backend,
                     )
                 )
 
@@ -4478,6 +4606,9 @@ def sessions_messages_list(session_id: str):
     except (TypeError, ValueError):
         limit = 50
     before_id = request.args.get("before_id") or None
+    # ``around_id`` centers the window on a specific message (search deep-link
+    # jump); it takes precedence over after/before/tail in the service.
+    around_id = request.args.get("around_id") or None
     # ``tail=1`` returns the most-recent window (for the Chat page's gap recovery)
     # instead of the oldest page.
     tail = request.args.get("tail") == "1"
@@ -4500,11 +4631,36 @@ def sessions_messages_list(session_id: str):
             session_id=session_id,
             after_id=after_id,
             before_id=before_id,
+            around_id=around_id,
             limit=limit,
             types=messages_service.TRANSCRIPT_TYPES,
             include_metadata_sources=("show_page",),
             tail=tail,
         )
+    return jsonify(result)
+
+
+@app.route("/api/search/messages", methods=["GET"])
+def search_messages_list():
+    """Global message-content search across Workbench sessions, grouped by session.
+
+    Substring (case-insensitive) search over ``content_text`` for ``platform
+    ='avibe'`` user prompts + agent ``result`` replies, excluding archived
+    sessions. ``q`` is the query, ``limit`` caps the matched-message scan. The
+    remote-access host guard + auth run in the global ``before_request`` hooks
+    (same as the messages list), so this handler just delegates to the service.
+    """
+    from storage import messages_service
+
+    query = request.args.get("q") or ""
+    try:
+        limit = int(request.args.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+
+    engine = _projects_engine()
+    with engine.connect() as conn:
+        result = messages_service.search_messages(conn, query=query, limit=limit)
     return jsonify(result)
 
 
@@ -5743,7 +5899,7 @@ if os.environ.get("E2E_TEST_MODE", "").lower() in ("true", "1", "yes"):
                     from config.v2_settings import RoutingSettings
 
                     ch.routing = RoutingSettings(
-                        agent_backend=modal_values.get("backend", "opencode"),
+                        agent_name=modal_values.get("backend", "opencode"),
                         model=(
                             modal_values.get("opencode_model")
                             or modal_values.get("claude_model")
@@ -5790,7 +5946,7 @@ if os.environ.get("E2E_TEST_MODE", "").lower() in ("true", "1", "yes"):
                     from config.v2_settings import RoutingSettings
 
                     ch.routing = RoutingSettings(
-                        agent_backend=modal_values.get("backend", "opencode"),
+                        agent_name=modal_values.get("backend", "opencode"),
                         model=(
                             modal_values.get("opencode_model")
                             or modal_values.get("claude_model")
@@ -6701,7 +6857,11 @@ def _rewrite_show_runtime_location(session_id: str, location: str, *, external_p
 
 def _with_show_event_write_cookie(response: Response, session_id: str, *, enabled: bool) -> Response:
     if enabled:
-        response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+        # 'self' (not 'none') so the workbench can frame a private Show Page in the
+        # chat view — same origin as the page — while cross-origin clickjacking
+        # stays blocked. Direct navigation is unaffected (frame-ancestors only
+        # governs framing).
+        response.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
         response.set_cookie(
             SHOW_EVENT_WRITE_TOKEN_COOKIE,
             show_event_write_token(session_id),

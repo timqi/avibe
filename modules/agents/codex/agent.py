@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from core.avibe_cloud import avibe_cloud_url_available
-from core.system_prompt_injection import build_system_prompt_injection, get_enabled_agents_for_prompt
+from core.services.session_fork import pending_native_fork_source
+from core.system_prompt_injection import (
+    build_forked_session_correction_prompt,
+    build_system_prompt_injection,
+    get_enabled_agents_for_prompt,
+)
 from modules.agents.base import AgentRequest, BaseAgent
 from modules.agents.subagent_router import SubagentDefinition, load_codex_subagent
 from modules.agents.codex.event_handler import CodexEventHandler
@@ -74,6 +79,7 @@ class CodexAgent(BaseAgent):
         self._session_locks: Dict[str, asyncio.Lock] = {}
         # base_session_id → (thread_id, developer_instructions)
         self._thread_developer_instructions: Dict[str, tuple[str, str]] = {}
+        self._fork_correction_pending_base_sessions: set[str] = set()
 
     # ------------------------------------------------------------------
     # BaseAgent interface
@@ -269,6 +275,22 @@ class CodexAgent(BaseAgent):
             self._clear_thread_developer_instructions(bid)
 
         return count
+
+    def runtime_turn_keys(self) -> set[str]:
+        return {
+            self._runtime_turn_key_for_base_session(base_session_id)
+            for base_session_id in self._session_mgr.all_base_sessions()
+        }
+
+    def runtime_turn_keys_for_session_key(self, session_key: str) -> set[str]:
+        return {
+            self._runtime_turn_key_for_base_session(base_session_id)
+            for base_session_id in self._session_mgr.get_sessions_by_session_key(session_key)
+        }
+
+    def _runtime_turn_key_for_base_session(self, base_session_id: str) -> str:
+        cwd = self._session_mgr.get_cwd(base_session_id)
+        return f"{base_session_id}:{cwd}" if cwd else base_session_id
 
     async def refresh_auth_state(self) -> None:
         """Drop app-server runtime state so future turns pick up fresh auth."""
@@ -586,6 +608,47 @@ class CodexAgent(BaseAgent):
         self._remember_thread_developer_instructions(request.base_session_id, thread_id, developer_instructions)
         return thread_id
 
+    async def _fork_thread(
+        self,
+        transport: CodexTransport,
+        request: AgentRequest,
+        source_thread_id: str,
+    ) -> str:
+        """Fork an existing Codex thread and bind the new thread id."""
+        self.ensure_agent_session_id(request)
+        _, effective_model, _, _ = self._resolve_codex_agent_settings(request)
+        params: Dict[str, Any] = {
+            "threadId": source_thread_id,
+            "cwd": request.working_path,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        }
+        developer_instructions = self._build_thread_developer_instructions(request)
+        if developer_instructions:
+            params["developerInstructions"] = developer_instructions
+        if effective_model:
+            params["model"] = effective_model
+
+        self._mark_fork_correction_pending(request.base_session_id)
+        try:
+            resp = await transport.send_request("thread/fork", params)
+            thread_id = resp.get("id", "")
+            if not thread_id:
+                thread_obj = resp.get("thread")
+                if isinstance(thread_obj, dict):
+                    thread_id = thread_obj.get("id", "")
+            if not thread_id:
+                raise RuntimeError("Codex thread/fork returned no thread id")
+
+            await self._inject_forked_session_correction(transport, request, thread_id)
+        finally:
+            self._clear_fork_correction_pending(request.base_session_id)
+        self._session_mgr.set_thread_id(request.base_session_id, thread_id)
+        self.bind_agent_session_id(request, thread_id)
+        self._remember_thread_developer_instructions(request.base_session_id, thread_id, developer_instructions)
+        logger.info("Forked Codex thread %s from %s for session %s", thread_id, source_thread_id, request.base_session_id)
+        return thread_id
+
     def _resolve_codex_agent_settings(
         self,
         request: AgentRequest,
@@ -705,6 +768,10 @@ class CodexAgent(BaseAgent):
             logger.info("Resumed Codex thread %s for session %s", thread_id, request.base_session_id)
             return thread_id
 
+        fork_source = pending_native_fork_source(request.context, self.name)
+        if fork_source:
+            return await self._fork_thread(transport, request, fork_source)
+
         # No associated thread yet (genuinely first turn) — start fresh.
         return await self._start_thread(transport, request)
 
@@ -816,6 +883,36 @@ class CodexAgent(BaseAgent):
 
         return "\n\n".join(part for part in instruction_parts if part) or None
 
+    async def _inject_forked_session_correction(
+        self,
+        transport: CodexTransport,
+        request: AgentRequest,
+        thread_id: str,
+    ) -> None:
+        """Append a fork correction as Codex model-visible developer history.
+
+        Codex accepts ``developerInstructions`` on ``thread/fork``, but the fork
+        also copies the source thread's previous developer messages. Appending a
+        fresh developer item makes the target session id authoritative without
+        creating a user turn.
+        """
+        correction = build_forked_session_correction_prompt(request.context)
+        if not correction:
+            return
+        await transport.send_request(
+            "thread/inject_items",
+            {
+                "threadId": thread_id,
+                "items": [
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": correction}],
+                    }
+                ],
+            },
+        )
+
     async def _refresh_thread_developer_instructions_if_needed(
         self,
         transport: CodexTransport,
@@ -869,6 +966,20 @@ class CodexAgent(BaseAgent):
         if hasattr(self, "_thread_developer_instructions"):
             self._thread_developer_instructions.pop(base_session_id, None)
 
+    def _fork_correction_pending_sessions(self) -> set[str]:
+        if not hasattr(self, "_fork_correction_pending_base_sessions"):
+            self._fork_correction_pending_base_sessions = set()
+        return self._fork_correction_pending_base_sessions
+
+    def _mark_fork_correction_pending(self, base_session_id: str) -> None:
+        self._fork_correction_pending_sessions().add(base_session_id)
+
+    def _clear_fork_correction_pending(self, base_session_id: str) -> None:
+        self._fork_correction_pending_sessions().discard(base_session_id)
+
+    def is_fork_correction_pending(self, base_session_id: str) -> bool:
+        return base_session_id in self._fork_correction_pending_sessions()
+
     async def _start_turn(
         self,
         transport: CodexTransport,
@@ -913,6 +1024,7 @@ class CodexAgent(BaseAgent):
             raise RuntimeError("Codex turn/start returned no turn id")
 
         turn_state = self._turn_registry.finalize_turn_start_response(turn_id, request)
+        self._mark_runtime_turn_started(getattr(request, "context", None))
         bind_generated_image_snapshot = getattr(event_handler, "bind_generated_image_snapshot", None)
         if callable(bind_generated_image_snapshot):
             bind_generated_image_snapshot(thread_id, turn_id, request.base_session_id)
@@ -924,6 +1036,12 @@ class CodexAgent(BaseAgent):
             "registered" if turn_state else "already-finished",
         )
         return thread_id
+
+    def _mark_runtime_turn_started(self, context: Any) -> None:
+        service = getattr(getattr(self, "controller", None), "agent_service", None)
+        mark_started = getattr(service, "mark_runtime_turn_started", None)
+        if callable(mark_started):
+            mark_started(context)
 
     # ------------------------------------------------------------------
     # Input building

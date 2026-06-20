@@ -38,6 +38,8 @@ export type ApiContextType = {
   unsubscribeWebPush: (endpoint: string) => Promise<{ ok: boolean; disabled: boolean }>;
   sendWebPushTest: (payload?: { title?: string; body?: string; url?: string; endpoint?: string }) => Promise<WebPushTestResult>;
   setShowPageVisibility: (sessionId: string, visibility: string) => Promise<any>;
+  /** Create the session's Show Page if absent; resolves to `{ existed, ... }`. */
+  ensureShowPage: (sessionId: string) => Promise<any>;
   rotateShowPageShare: (sessionId: string) => Promise<any>;
   getBindCodes: () => Promise<any>;
   createBindCode: (type: string, expiresAt?: string) => Promise<any>;
@@ -72,6 +74,7 @@ export type ApiContextType = {
     flowId: string,
   ) => Promise<OAuthWebMutationResult>;
   removeBackendAuth: (backend: 'claude' | 'codex') => Promise<OAuthWebMutationResult>;
+  removeClaudeOAuthCredentials: () => Promise<OAuthWebMutationResult>;
   // Selectively clear just the stored API key — leave OAuth credentials
   // intact. Symmetric to OpenCode's per-provider DELETE: lets the user
   // drop a stale key without re-signing in. Codex also restarts its
@@ -119,7 +122,7 @@ export type ApiContextType = {
   larkTempWsStart: (appId: string, appSecret?: string, domain?: string) => Promise<any>;
   larkTempWsStop: () => Promise<any>;
   wechatStartLogin: () => Promise<any>;
-  wechatPollLogin: (sessionKey: string) => Promise<any>;
+  wechatPollLogin: (sessionKey: string, verifyCode?: string) => Promise<any>;
   doctor: () => Promise<any>;
   opencodeOptions: (cwd: string) => Promise<any>;
   opencodeSetupPermission: () => Promise<{ ok: boolean; message: string; config_path: string }>;
@@ -174,6 +177,7 @@ export type ApiContextType = {
   ) => Promise<{ ok: boolean; backends: GlobalPromptFile[] }>;
   listSessions: (params?: { projectId?: string; status?: 'active' | 'archived' | 'all'; limit?: number; beforeId?: string; q?: string; cache?: boolean }) => Promise<{ sessions: WorkbenchSession[]; next_before_id: string | null }>;
   createSession: (payload: WorkbenchSessionCreate) => Promise<WorkbenchSession>;
+  forkSession: (sessionId: string) => Promise<WorkbenchSession>;
   getSession: (sessionId: string, params?: { cache?: boolean }) => Promise<WorkbenchSession>;
   getSessionBootstrap: (sessionId: string) => Promise<WorkbenchSessionBootstrap>;
   updateSession: (sessionId: string, payload: Partial<WorkbenchSessionUpdate>) => Promise<WorkbenchSession>;
@@ -181,7 +185,12 @@ export type ApiContextType = {
   /** Counts of resources permanently reclaimed when archiving this session
    *  (bound tasks/watches + active runs) — drives the irreversible-confirm dialog. */
   getArchivePreview: (sessionId: string) => Promise<{ tasks: number; watches: number; runs: number; queued: number }>;
-  listSessionMessages: (sessionId: string, params?: { afterId?: string; beforeId?: string; limit?: number; tail?: boolean; cache?: boolean }) => Promise<{ messages: WorkbenchMessage[]; next_after_id: string | null; next_before_id?: string | null }>;
+  listSessionMessages: (sessionId: string, params?: { afterId?: string; beforeId?: string; aroundId?: string; limit?: number; tail?: boolean; cache?: boolean }) => Promise<{ messages: WorkbenchMessage[]; next_after_id: string | null; next_before_id?: string | null }>;
+  // Full-text search over message content across all sessions. Backed by the
+  // non-cached GET /api/search/messages (the query string varies per keystroke,
+  // so caching would only bloat the read cache). Results group matches by
+  // session, sessions ordered most-recent-match first.
+  searchMessages: (q: string, opts?: { limit?: number }) => Promise<MessageSearchResult>;
   sendSessionMessage: (sessionId: string, payload: { text?: string; content?: Record<string, unknown>; metadata?: Record<string, unknown>; author_id?: string; author_name?: string }) => Promise<WorkbenchMessage>;
   markSessionRead: (sessionId: string, untilMessageId?: string) => Promise<{ updated: number; unread_counts: Record<string, number>; unread_by_session: Record<string, number> }>;
   cancelSession: (
@@ -299,7 +308,7 @@ export type WorkbenchSession = {
 
 export type WorkbenchSessionCreate = {
   project_id: string;
-  // Optional: when omitted the server falls back to agents.default_backend.
+  // Optional: when omitted the server resolves the current default Agent.
   agent_backend?: string;
   agent_id?: string;
   agent_name?: string;
@@ -314,6 +323,7 @@ export type WorkbenchSessionUpdate = {
   title: string | null;
   agent_id: string | null;
   agent_name: string | null;
+  // Session execution snapshot, not a scope/default route selector.
   agent_backend: string;
   agent_variant: string;
   model: string | null;
@@ -514,6 +524,44 @@ export type WorkbenchMessage = {
   updated_at: string;
   delivered_at: string | null;
   read_at: string | null;
+};
+
+// One highlighted message-content hit from GET /api/search/messages, split by
+// the server so the UI never has to locate the match: ``prefix`` + ``match`` +
+// ``suffix`` reconstruct a window of the message text, with ``match`` the part
+// to highlight (empty when the snippet is just leading context).
+export type MessageSnippet = {
+  prefix: string;
+  match: string;
+  suffix: string;
+};
+
+// A single matching message within a session group. ``type`` is the coarse
+// chat role the row chip renders ('user' → YOU, otherwise AGENT); ``source``
+// carries provenance (harness/user/agent) like WorkbenchMessage.
+export type MessageSearchMatch = {
+  id: string;
+  author: string;
+  source: string | null;
+  type: 'user' | 'result' | string;
+  created_at: string;
+  snippet: MessageSnippet;
+};
+
+// Matches grouped by their session, with enough session/project context to
+// render a group header and (in P3/P4) navigate into the chat at the match.
+export type MessageSearchSession = {
+  session_id: string;
+  title: string | null;
+  project_id: string | null;
+  project_name: string | null;
+  matches: MessageSearchMatch[];
+};
+
+export type MessageSearchResult = {
+  sessions: MessageSearchSession[];
+  total: number;
+  session_count: number;
 };
 
 export type WorkbenchSessionBootstrap = {
@@ -921,12 +969,15 @@ export type ClaudeAuthState = {
   auth_mode: ClaudeAuthMode;
   // Live source the CLI is actually inheriting at launch (api_key when
   // V2Config injects ``ANTHROPIC_API_KEY`` and strips OAuth env vars,
-  // oauth when ``~/.claude/credentials.json`` has a usable token).
+  // oauth when Claude Code reports or stores a usable first-party login).
   active_auth_mode: ActiveAuthMode;
   has_api_key: boolean;
   api_key_length: number;
   api_key_masked: string | null;
   api_key_source?: ClaudeApiKeySource;
+  // Raw Claude Code account-token signal. This may remain true while Avibe
+  // is actively using API-key mode, so UI "signed in" indicators should use
+  // active_auth_mode instead.
   has_oauth_credentials: boolean;
   base_url: string | null;
   settings_path: string | null;
@@ -947,6 +998,9 @@ export type ClaudeAuthPayload = {
 
 export type ClaudeAuthSaveResult = ClaudeAuthState & {
   restart?: BackendRestartResult;
+  partial?: boolean;
+  warning?: string;
+  detail?: string;
 };
 
 // One entry in the OpenCode provider grid. The full catalog is built
@@ -1513,6 +1567,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     unsubscribeWebPush: (endpoint) => deleteJson('/api/web-push/subscriptions', { endpoint }),
     sendWebPushTest: (payload) => postJson('/api/web-push/test', payload ?? {}),
     setShowPageVisibility: (sessionId, visibility) => postJson(`/api/show-pages/${encodeURIComponent(sessionId)}/visibility`, { visibility }),
+    ensureShowPage: (sessionId) => postJson(`/api/show-pages/${encodeURIComponent(sessionId)}/ensure`, {}),
     rotateShowPageShare: (sessionId) => postJson(`/api/show-pages/${encodeURIComponent(sessionId)}/rotate-share`, {}),
     getBindCodes: () => getJson('/api/bind-codes'),
     createBindCode: (type, expiresAt) => postJson('/api/bind-codes', { type, expires_at: expiresAt }),
@@ -1552,6 +1607,8 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }),
     removeBackendAuth: (backend) =>
       postJson(`/api/backend/${encodeURIComponent(backend)}/auth/oauth/remove`, {}),
+    removeClaudeOAuthCredentials: () =>
+      postJson('/api/backend/claude/auth/oauth/credentials/remove', {}),
     removeBackendApiKey: (backend) =>
       postJson(`/api/backend/${encodeURIComponent(backend)}/auth/api-key/remove`, {}),
     testBackendAuth: (backend, options) =>
@@ -1600,7 +1657,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     larkTempWsStart: (appId, appSecret, domain) => postJson('/api/lark/temp_ws/start', { app_id: appId, app_secret: appSecret, domain: domain || 'feishu' }),
     larkTempWsStop: () => postJson('/api/lark/temp_ws/stop', {}),
     wechatStartLogin: () => postJson('/api/wechat/qr_login/start', {}),
-    wechatPollLogin: (sessionKey) => postJson('/api/wechat/qr_login/poll', { session_key: sessionKey }),
+    wechatPollLogin: (sessionKey, verifyCode) => postJson('/api/wechat/qr_login/poll', { session_key: sessionKey, verify_code: verifyCode || undefined }),
     doctor: () => postJson('/api/doctor', {}),
     opencodeOptions: (cwd) => postJson('/api/opencode/options', { cwd }),
     opencodeSetupPermission: () => postJson('/api/opencode/setup-permission', {}),
@@ -1672,6 +1729,8 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return params?.cache === false ? getJson(path) : getCachedJson(path);
     },
     createSession: (payload) => postJson('/api/sessions', payload),
+    forkSession: (sessionId) =>
+      postJson(`/api/sessions/${encodeURIComponent(sessionId)}/fork`, {}),
     getSession: (sessionId, params) =>
       params?.cache === false
         ? getJson(`/api/sessions/${encodeURIComponent(sessionId)}`)
@@ -1693,12 +1752,19 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const search = new URLSearchParams();
       if (params?.afterId) search.set('after_id', params.afterId);
       if (params?.beforeId) search.set('before_id', params.beforeId);
+      if (params?.aroundId) search.set('around_id', params.aroundId);
       if (params?.limit) search.set('limit', String(params.limit));
       if (params?.tail) search.set('tail', '1');
       const qs = search.toString();
       const base = `/api/sessions/${encodeURIComponent(sessionId)}/messages`;
       const path = qs ? `${base}?${qs}` : base;
       return params?.cache === false ? getJson(path) : getCachedJson(path);
+    },
+    searchMessages: (q, opts) => {
+      const search = new URLSearchParams();
+      search.set('q', q);
+      if (opts?.limit) search.set('limit', String(opts.limit));
+      return getJson(`/api/search/messages?${search.toString()}`);
     },
     sendSessionMessage: (sessionId, payload) =>
       postJson(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, payload),

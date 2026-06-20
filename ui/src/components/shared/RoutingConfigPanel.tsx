@@ -17,7 +17,6 @@ export interface RoutingConfigValue {
   custom_cwd: string;
   routing: {
     agent_name?: string | null;
-    agent_backend?: string | null;
     model?: string | null;
     reasoning_effort?: string | null;
     opencode_agent?: string | null;
@@ -105,9 +104,8 @@ export const RoutingConfigPanel: React.FC<RoutingConfigPanelProps> = ({
 
   const selectedVibeAgent = vibeAgents.find((agent) => agent.name === value.routing.agent_name) || null;
   const defaultVibeAgent = vibeAgents.find((agent) => agent.name === defaultAgentName) || null;
-  const legacyBackend = value.routing.agent_backend || null;
-  const inheritedVibeAgent = selectedVibeAgent || (!legacyBackend ? defaultVibeAgent : null);
-  const effectiveBackend = selectedVibeAgent?.backend || legacyBackend || defaultVibeAgent?.backend || globalConfig?.agents?.default_backend || 'opencode';
+  const inheritedVibeAgent = selectedVibeAgent || defaultVibeAgent;
+  const effectiveBackend = selectedVibeAgent?.backend || defaultVibeAgent?.backend || 'opencode';
   const effectiveModel = value.routing.model || inheritedVibeAgent?.model || '';
 
   const getOpenCodeReasoningOptions = (modelKey: string) => {
@@ -276,12 +274,10 @@ export const RoutingConfigPanel: React.FC<RoutingConfigPanelProps> = ({
               value={value.routing.agent_name || ''}
               onChange={(e) => {
                 const nextName = e.target.value || null;
-                const nextAgent = nextName ? vibeAgents.find((agent) => agent.name === nextName) || null : null;
                 onChange({
                   routing: {
                     ...value.routing,
                     agent_name: nextName,
-                    agent_backend: nextAgent?.backend || null,
                     model: null,
                     reasoning_effort: null,
                     opencode_model: null,

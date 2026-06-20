@@ -1,6 +1,7 @@
 """Core controller that coordinates between modules and handlers"""
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import threading
@@ -23,6 +24,7 @@ from core.handlers import (
 )
 from core.agent_auth_service import AgentAuthService
 from core.audio_asr import AudioAsrService
+from core.message_context import build_context_session_key
 from core.message_dispatcher import ConsolidatedMessageDispatcher
 from core.processing_indicator import ProcessingIndicatorService
 from core.runtime_commands import RuntimeCommandWatcher
@@ -208,12 +210,9 @@ class Controller:
         self._init_agents()
         self.agent_auth_service = AgentAuthService(self)
 
-        # Validate default_backend against registered agents
-        self._validate_default_backend()
         self.vibe_agent_store = VibeAgentStore()
         self.vibe_agent_store.ensure_builtin_default_agents(
             self._enabled_agent_backends(),
-            default_backend=getattr(self.agent_router, "global_default", DEFAULT_AGENT_BACKEND),
         )
 
         # Setup callbacks
@@ -278,9 +277,9 @@ class Controller:
         # Migrate legacy per-channel language into global config
         self._migrate_language_from_settings()
 
-        # Agent routing - use configured default_backend
-        default_backend = getattr(self.config, "default_backend", DEFAULT_AGENT_BACKEND)
-        self.agent_router = AgentRouter.from_file(None, platform=self.primary_platform, default_backend=default_backend)
+        # Legacy backend router. It is kept for platform runtime compatibility;
+        # product routing is resolved through VibeAgentStore.
+        self.agent_router = AgentRouter.from_file(None, platform=self.primary_platform)
         for platform in self.enabled_platforms:
             if platform not in self.agent_router.platform_routes:
                 self.agent_router.platform_routes[platform] = self.agent_router.platform_routes[self.primary_platform]
@@ -311,9 +310,8 @@ class Controller:
     def _enabled_agent_backends(self) -> list[str]:
         result: list[str] = []
         agent_config = getattr(self.config, "agents", None)
-        default_backend = getattr(self.agent_router, "global_default", DEFAULT_AGENT_BACKEND)
         if agent_config is None:
-            return [default_backend]
+            return list(getattr(self.agent_service, "agents", {}).keys()) or [DEFAULT_AGENT_BACKEND]
         for backend in ("opencode", "claude", "codex"):
             cfg = getattr(agent_config, backend, None)
             if bool(getattr(cfg, "enabled", False)):
@@ -617,36 +615,6 @@ class Controller:
             except Exception as e:
                 logger.error(f"Failed to initialize OpenCode agent: {e}")
 
-    def _validate_default_backend(self):
-        """Validate default_backend against registered agents and fallback if needed."""
-        current_default = self.agent_router.global_default
-        registered = set(self.agent_service.agents.keys())
-
-        if current_default not in registered:
-            # Find a fallback from registered agents
-            # Prefer: opencode > claude > codex > any
-            for fallback in ["opencode", "claude", "codex"]:
-                if fallback in registered:
-                    logger.warning(
-                        f"Configured default_backend '{current_default}' is not enabled. Falling back to '{fallback}'."
-                    )
-                    self.agent_router.global_default = fallback
-                    for route in self.agent_router.platform_routes.values():
-                        route.default = fallback
-                    return
-
-            # If no preferred fallback, use any registered agent
-            if registered:
-                fallback = next(iter(registered))
-                logger.warning(
-                    f"Configured default_backend '{current_default}' is not enabled. Falling back to '{fallback}'."
-                )
-                self.agent_router.global_default = fallback
-                for route in self.agent_router.platform_routes.values():
-                    route.default = fallback
-            else:
-                logger.error("No agents are registered! Check your configuration.")
-
     def _setup_callbacks(self):
         """Setup callback connections between modules"""
 
@@ -677,7 +645,7 @@ class Controller:
 
         # Register callbacks with the IM client
         self.im_client.register_callbacks(
-            on_message=self._dispatch_to_controller_loop(_on_im_message),
+            on_message=self._dispatch_im_message_to_controller_loop(_on_im_message),
             on_command=command_handlers,
             on_callback_query=self._dispatch_to_controller_loop(self.message_handler.handle_callback_query),
             on_settings_update=self._dispatch_to_controller_loop(self.settings_handler.handle_settings_update),
@@ -708,6 +676,91 @@ class Controller:
             return await asyncio.wrap_future(future)
 
         return _wrapped
+
+    def _dispatch_im_message_to_controller_loop(self, callback):
+        tracked_platforms = {"telegram", "wechat"}
+
+        async def _wrapped(context, *args, **kwargs):
+            platform = self._platform_for_im_callback_context(context)
+            if platform in tracked_platforms:
+                return await self._run_on_controller_loop(callback, context, *args, **kwargs)
+            self._schedule_controller_callback(callback, context, *args, **kwargs)
+            return None
+
+        return _wrapped
+
+    def _platform_for_im_callback_context(self, context) -> str:
+        platform = str(
+            getattr(context, "platform", None)
+            or (getattr(context, "platform_specific", None) or {}).get("platform")
+            or ""
+        ).strip()
+        if platform:
+            return platform
+        im_client = getattr(self, "im_client", None)
+        primary_platform = str(getattr(im_client, "primary_platform", "") or "").strip()
+        if primary_platform:
+            return primary_platform
+        module = str(getattr(type(im_client), "__module__", "") or "")
+        if module.startswith("modules.im.wechat"):
+            return "wechat"
+        if module.startswith("modules.im.telegram"):
+            return "telegram"
+        return ""
+
+    def _dispatch_to_controller_loop_background(self, callback):
+        async def _wrapped(*args, **kwargs):
+            self._schedule_controller_callback(callback, *args, **kwargs)
+
+        return _wrapped
+
+    async def _run_on_controller_loop(self, callback, *args, **kwargs):
+        loop = self._loop
+        if loop is None:
+            return await callback(*args, **kwargs)
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is loop:
+            return await callback(*args, **kwargs)
+
+        future = asyncio.run_coroutine_threadsafe(callback(*args, **kwargs), loop)
+        return await asyncio.wrap_future(future)
+
+    def _schedule_controller_callback(self, callback, *args, **kwargs) -> None:
+        async def _runner():
+            await callback(*args, **kwargs)
+
+        loop = self._loop
+        if loop is None:
+            task = asyncio.create_task(_runner())
+            task.add_done_callback(self._log_background_callback_result)
+            return
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is loop:
+            task = loop.create_task(_runner())
+            task.add_done_callback(self._log_background_callback_result)
+            return
+
+        future = asyncio.run_coroutine_threadsafe(_runner(), loop)
+        future.add_done_callback(self._log_background_callback_result)
+
+    @staticmethod
+    def _log_background_callback_result(future) -> None:
+        try:
+            future.result()
+        except (asyncio.CancelledError, concurrent.futures.CancelledError):
+            return
+        except Exception:
+            logger.error("Background IM message callback failed", exc_info=True)
 
     def _run_im_runtime(self) -> None:
         try:
@@ -809,7 +862,8 @@ class Controller:
         tracking never collide.
         """
         platform = context.platform or (context.platform_specific or {}).get("platform") or self.primary_platform
-        return f"{platform}::{self._get_settings_key(context)}"
+        settings_key = self._get_settings_key(context)
+        return build_context_session_key(context, platform=platform, settings_key=settings_key)
 
     def get_im_client_for_context(self, context: Optional[MessageContext] = None) -> BaseIMClient:
         if context is None:
@@ -951,11 +1005,10 @@ class Controller:
         """Unified agent resolution with dynamic override support.
 
         Priority:
-        1. explicit Vibe Agent selected by the Scope
-        2. migration fallback from legacy Scope agent_backend
+        1. explicit/session Vibe Agent target
+        2. existing session backend snapshot
         3. default Vibe Agent route
-        4. AgentRouter platform default (configured in code)
-        5. AgentService.default_agent ("claude")
+        4. AgentService.default_agent / first registered backend compatibility fallback
         """
         target = self._agent_run_target_payload(context)
         target_agent_name = target.get("agent_name") if target else None
@@ -966,33 +1019,25 @@ class Controller:
                 override_agent_name=str(target_agent_name),
                 required=False,
             )
-            if vibe_agent and vibe_agent.backend in self.agent_service.agents:
+            if vibe_agent:
                 return vibe_agent.backend
-        if target_backend and str(target_backend) in self.agent_service.agents:
+        if target_backend and str(target_backend) in {"opencode", "claude", "codex"}:
             return str(target_backend)
 
-        settings_key = self._get_settings_key(context)
-        settings_manager = self.get_settings_manager_for_context(context)
-        routing = settings_manager.get_channel_routing(settings_key)
         vibe_agent = self.resolve_vibe_agent_for_context(context, required=False)
-        if vibe_agent and vibe_agent.backend in self.agent_service.agents:
+        if vibe_agent:
             return vibe_agent.backend
 
-        if routing and routing.agent_backend:
-            # Migration fallback for scopes saved before Agent became the unified
-            # selection. New Scope settings should select agent_name instead.
-            if routing.agent_backend in self.agent_service.agents:
-                return routing.agent_backend
-            logger.warning(
-                f"Scope routing specifies legacy backend '{routing.agent_backend}' but it is not registered, "
-                f"falling back to static routing"
-            )
+        return self._fallback_registered_agent_backend()
 
-        # Fall back to static routing
-        platform = context.platform or (context.platform_specific or {}).get("platform") or self.primary_platform
-        resolved = self.agent_router.resolve(platform, settings_key)
-
-        return resolved
+    def _fallback_registered_agent_backend(self) -> str:
+        default_agent = getattr(self.agent_service, "default_agent", None)
+        registered = getattr(self.agent_service, "agents", {})
+        if default_agent in registered:
+            return str(default_agent)
+        if registered:
+            return next(iter(registered))
+        return DEFAULT_AGENT_BACKEND
 
     def resolve_vibe_agent_for_context(
         self,
@@ -1015,13 +1060,6 @@ class Controller:
         try:
             if agent_name:
                 return self.vibe_agent_store.require_enabled(agent_name)
-            legacy_backend = (target.get("agent_backend") if target else None) or (
-                routing.agent_backend if routing else None
-            )
-            if legacy_backend:
-                agent = self.vibe_agent_store.get_builtin_default_agent_for_backend(legacy_backend)
-                if agent is not None:
-                    return agent
             default_agent = self.vibe_agent_store.get_default_agent()
             if default_agent is not None:
                 return default_agent
@@ -1038,7 +1076,10 @@ class Controller:
     def _agent_run_target_payload(context: MessageContext) -> dict[str, Any]:
         payload = context.platform_specific or {}
         target = payload.get("agent_run_target")
-        return target if isinstance(target, dict) else {}
+        if isinstance(target, dict):
+            return target
+        session_target = payload.get("agent_session_target")
+        return session_target if isinstance(session_target, dict) else {}
 
     def get_opencode_overrides(self, context: MessageContext) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """Get OpenCode agent, model, and reasoning effort overrides for this channel.
