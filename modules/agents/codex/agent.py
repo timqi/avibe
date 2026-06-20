@@ -670,7 +670,15 @@ class CodexAgent(BaseAgent):
 
             # Wire up callbacks
             transport.on_notification(self._on_notification)
-            transport.on_server_request(self._on_server_request)
+            # Bind the cwd so any server request (e.g. an auto-approval) refreshes
+            # this transport's activity: a server request IS app-server liveness,
+            # and unlike notifications it isn't always tied to a resolvable
+            # turn/thread in params. Without this a turn that thinks silently and
+            # then asks for approval near the stuck-active cap could be wrongly
+            # force-evicted by the next sweep.
+            transport.on_server_request(
+                lambda req_id, method, params, _cwd=cwd: self._on_server_request(_cwd, req_id, method, params)
+            )
 
             await transport.start()
             self._transports[cwd] = transport
@@ -1208,11 +1216,15 @@ class CodexAgent(BaseAgent):
 
     async def _on_server_request(
         self,
+        cwd: str,
         req_id: int | str,
         method: str,
         params: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Handle server requests — auto-approve all."""
+        # A server request means this app-server is alive and actively driving a
+        # turn, so count it as activity for the stuck-active idle backstop.
+        self._touch_transport_activity(cwd)
         if method in (
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",

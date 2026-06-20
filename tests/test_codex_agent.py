@@ -2096,6 +2096,49 @@ class CodexTransportCwdStalenessTests(unittest.IsolatedAsyncioTestCase):
         agent.codex_config = SimpleNamespace(binary="codex", extra_args=[])
         return agent
 
+    async def test_server_request_refreshes_transport_activity(self):
+        # An auto-approved server request must refresh the bound cwd's activity
+        # so the stuck-active idle backstop doesn't force-evict a live turn that
+        # recently asked for approval.
+        agent = self._agent()
+        agent._transport_last_activity = {"/tmp/work": 0.0}
+
+        with patch.object(_MODULE.time, "monotonic", return_value=1234.0):
+            result = await agent._on_server_request(
+                "/tmp/work",
+                7,
+                "item/commandExecution/requestApproval",
+                {"itemId": "item-1"},
+            )
+
+        self.assertEqual(result, {"approved": True})
+        self.assertEqual(agent._transport_last_activity["/tmp/work"], 1234.0)
+
+    async def test_get_or_create_transport_binds_cwd_into_server_request_cb(self):
+        # The server-request callback registered on the transport must carry the
+        # cwd, so invoking it (as the transport would) refreshes that cwd.
+        import tempfile
+
+        agent = self._agent()
+        captured = {}
+
+        with tempfile.TemporaryDirectory() as cwd:
+            fresh = SimpleNamespace(
+                is_initialized=True,
+                start=AsyncMock(),
+                on_notification=Mock(),
+                on_server_request=Mock(side_effect=lambda cb: captured.update(cb=cb)),
+            )
+            with patch.object(_MODULE, "CodexTransport", return_value=fresh):
+                await agent._get_or_create_transport(cwd)
+
+            self.assertIn("cb", captured)
+            with patch.object(_MODULE.time, "monotonic", return_value=999.0):
+                result = await captured["cb"](1, "item/fileChange/requestApproval", {"itemId": "x"})
+
+            self.assertEqual(result, {"approved": True})
+            self.assertEqual(agent._transport_last_activity[cwd], 999.0)
+
     async def test_cached_transport_evicted_when_cwd_inode_changes(self):
         import tempfile
 
