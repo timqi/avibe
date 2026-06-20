@@ -82,32 +82,12 @@ Hard rule:
 
 - **Never restart the local `vibe` service for routine verification.**
 - The local `vibe` process may be the coding agent runtime itself; restarting it can interrupt the session.
-- **Tests and probes must be hermetic by default.** A test may exercise
-  production code paths, but its filesystem, process environment, service
-  endpoints, credential stores, caches, and external accounts must be isolated
-  from the developer's real machine unless the user explicitly asks for that
-  exact local operation. Treat every default resolver (`$HOME`, XDG dirs,
-  keychains, CLI config homes, token stores, running services, browser/user
-  profiles, and cloud accounts) as production data until the test redirects or
-  mocks it.
-- Isolation must cover the whole call path, not just the obvious dependency.
-  Mocking a network login, subprocess, or platform client is not enough if the
-  success/failure path still calls real cleanup, persistence, migration, install,
-  or detection helpers. Before adding or changing tests, trace every write-capable
-  helper they can reach and make the destination explicit: `tmp_path`,
-  `VIBE_REMOTE_HOME`, backend-specific homes such as `CODEX_HOME` /
-  `CLAUDE_CONFIG_DIR`, patched `Path.home()`, XDG env vars, fake servers, or
-  explicit `home=` / config arguments.
-- Add negative safety coverage for new write-capable surfaces. A regression test
-  should prove both that the resolver points at the isolated location and that a
-  representative real write lands there, not in live user state. This applies to
-  Avibe state, third-party agent homes (Codex, Claude Code, OpenCode), package
-  manager/global CLI config, browser profiles, OS keychains, and any future
-  backend-owned credential/cache store.
-- Tests marked `uses_real_paths` are for read-only path-resolution coverage
-  only. They must not call save/apply/delete/migration/install helpers, backend
-  auth setup flows, CLI login/logout commands, or anything else that can mutate
-  files, services, credentials, or accounts reachable from the real environment.
+- **Tests and probes must be hermetic by default.** Treat `$HOME`, XDG dirs,
+  keychains, CLI config/token stores, running services, browser profiles, and
+  cloud accounts as production data unless the user explicitly asks otherwise.
+- Any test that reaches write-capable production paths must redirect the whole
+  call path to test-owned state and prove a representative write cannot touch
+  real local or external user state; `uses_real_paths` tests must remain read-only.
 - Unless the user explicitly asks otherwise, use the Incus regression environment for user-facing verification.
 
 ### Regression Testing (Incus)
@@ -348,10 +328,6 @@ Testing guidance:
 - for reusable capability-first testing guidance, use `standards/scenario-testing/AGENTS.md` as the entrypoint; project-specific scenario metadata lives under `tests/scenarios/`
 - when a scenario catalog exists, make the scenario ID visible in the automated test and in the PR description
 - for multi-step auth/setup flows, update `tests/scenarios/auth_setup/catalog.yaml` and add or update a closed-loop scenario harness case under `tests/scenarios/auth_setup/test_auth_setup_scenarios.py`; keep provider-specific parsing and heuristics in focused unit tests
-- for tests that exercise write-capable production paths, include isolation
-  coverage: verify the relevant home/config/cache/account resolver points at
-  test-owned state, and verify a representative write cannot touch real local
-  or external user state
 - for UI changes, run `npm run build` in `ui/`
 - for cross-platform or user-facing verification, use the Incus regression workflow
 - until CI fully covers a flow, do a manual sanity check for the affected workflow when practical
