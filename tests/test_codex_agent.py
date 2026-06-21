@@ -619,6 +619,23 @@ class CodexAgentStopTests(unittest.IsolatedAsyncioTestCase):
         # runtime gate of the force-reaped stuck turn must be settled
         self.assertEqual(agent._event_handler.release_calls, ["ctx-1"])
 
+    async def test_evict_idle_transports_force_evict_release_falls_back_to_latest_request(self):
+        # Defensive path: if the active turn has no per-turn request mapping,
+        # the runtime gate is still settled via get_latest_request.
+        agent, stop_calls, _invalidated, _cleared = self._make_evict_agent(
+            active_turn="turn-1", last_activity=0.0
+        )
+        fallback_request = SimpleNamespace(context="ctx-latest", base_session_id="session-1")
+        agent._turn_registry.get_request_for_turn = lambda turn_id: None
+        agent._turn_registry.get_latest_request = lambda base_session_id: fallback_request
+
+        with patch.object(_MODULE.time, "monotonic", return_value=2000.0):
+            evicted = await agent.evict_idle_transports(600)
+
+        self.assertEqual(evicted, 1)
+        self.assertEqual(stop_calls, ["stop"])
+        self.assertEqual(agent._event_handler.release_calls, ["ctx-latest"])
+
     async def test_evict_idle_transports_keeps_active_transport_under_stuck_cap(self):
         # active turn idle past idle_timeout (600) but under the cap (1800):
         # still vetoed, NOT force-evicted.
