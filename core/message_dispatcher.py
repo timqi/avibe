@@ -39,6 +39,13 @@ def _coalesced_task_execution_ids(payload: dict[str, Any]) -> list[str]:
     return run_ids
 
 
+def _run_is_cancelled(run: Any) -> bool:
+    if not isinstance(run, dict):
+        return False
+    status = str(run.get("status") or "").strip().lower()
+    return status in {"canceled", "cancelled"}
+
+
 async def _stream_chunk(controller, context, *, text: str, message_id: Optional[str], kind: str) -> None:
     """Forward one durable agent message to the live streaming turn sink.
 
@@ -250,6 +257,26 @@ class ConsolidatedMessageDispatcher:
             if store is not None:
                 store.close()
 
+    def _record_agent_run_terminal_for_ids(
+        self,
+        *,
+        store: Any,
+        run_ids: list[str],
+        text: str,
+        message_id: str | None,
+        terminal_status: str | None,
+    ) -> None:
+        for run_id in run_ids:
+            get_run = getattr(store, "get_run", None)
+            if callable(get_run) and _run_is_cancelled(get_run(run_id)):
+                continue
+            store.record_run_message(
+                run_id,
+                text=text,
+                message_id=message_id,
+                terminal_status=terminal_status,
+            )
+
     def _record_agent_run_terminal_result(
         self,
         context: MessageContext,
@@ -261,20 +288,55 @@ class ConsolidatedMessageDispatcher:
         payload = context.platform_specific or {}
         if payload.get("task_trigger_kind") != "agent_run":
             return
-        run_id = str(payload.get("task_execution_id") or "").strip()
-        if not run_id:
+        run_ids = _coalesced_task_execution_ids(payload)
+        if not run_ids:
             return
         store = None
         try:
             store = SQLiteBackgroundTaskStore()
-            store.record_run_message(
-                run_id,
+            self._record_agent_run_terminal_for_ids(
+                store=store,
+                run_ids=run_ids,
                 text=text,
                 message_id=message_id,
                 terminal_status="failed" if is_error else "succeeded",
             )
         except Exception as err:
-            logger.warning("Failed to record agent run terminal result for %s: %s", run_id, err)
+            logger.warning("Failed to record agent run terminal result for %s: %s", ",".join(run_ids), err)
+        finally:
+            if store is not None:
+                store.close()
+
+    def _record_suppressed_agent_run_terminal_result(
+        self,
+        context: MessageContext,
+        text: str,
+        message_id: str | None,
+        *,
+        is_error: bool,
+    ) -> None:
+        payload = context.platform_specific or {}
+        if payload.get("task_trigger_kind") != "agent_run":
+            return
+        run_ids = _coalesced_task_execution_ids(payload)
+        if not run_ids:
+            return
+        store = None
+        try:
+            store = SQLiteBackgroundTaskStore()
+            self._record_agent_run_terminal_for_ids(
+                store=store,
+                run_ids=run_ids,
+                text=text,
+                message_id=message_id,
+                terminal_status="failed" if is_error else "succeeded",
+            )
+        except Exception as err:
+            logger.warning(
+                "Failed to record suppressed agent run terminal result for %s: %s",
+                ",".join(run_ids),
+                err,
+            )
         finally:
             if store is not None:
                 store.close()
@@ -596,8 +658,13 @@ class ConsolidatedMessageDispatcher:
                     canonical_type == "result"
                     and (context.platform_specific or {}).get("task_trigger_kind") == "agent_run"
                 ):
-                    terminal_status = "failed" if is_error else "succeeded"
-                if canonical_type == "result" or (context.platform_specific or {}).get("task_trigger_kind") != "agent_run":
+                    self._record_suppressed_agent_run_terminal_result(
+                        context,
+                        text,
+                        message_id,
+                        is_error=is_error,
+                    )
+                elif canonical_type == "result" or (context.platform_specific or {}).get("task_trigger_kind") != "agent_run":
                     self._record_suppressed_run_message(
                         context,
                         text,
