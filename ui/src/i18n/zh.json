@@ -561,6 +561,7 @@
     "title": "Avibe OS",
     "subtitle": "Agent操作系统 · 工作台",
     "workspaceLabel": "工作区",
+    "moreSettings": "更多设置",
     "openControlPanel": "设置",
     "backToWorkbench": "返回工作台",
     "newSession": "新建",
