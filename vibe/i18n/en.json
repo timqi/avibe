@@ -1,4 +1,12 @@
 {
+  "status": {
+    "backendUnresponsive": "backend not responding",
+    "done": "done",
+    "stopped": "stopped",
+    "failed": "failed",
+    "steps": "{count} st",
+    "tokens": "{count} tok"
+  },
   "fork": {
     "title": "Fork {title}",
     "titleUntitled": "Fork"
