@@ -396,19 +396,23 @@ def test_end_orphan_refuses_when_identity_unprovable(monkeypatch):
     assert reap.called is False
 
 
-def test_end_claude_interrupts_then_disconnects():
+def test_end_claude_interrupts_disconnects_and_reaps_subprocess(monkeypatch):
     interrupt = _AsyncFlag()
     cleanup = _AsyncFlag()
-    client = types.SimpleNamespace(interrupt=interrupt)
+    client = types.SimpleNamespace(interrupt=interrupt, _fake_pid=4321)
     session_handler = types.SimpleNamespace(claude_sessions={"slack_1:/w": client}, cleanup_session=cleanup)
     controller = _make_controller()
     controller.session_handler = session_handler
+    reap = _AsyncFlag(ret=1)
+    monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", reap)
 
     res = asyncio.run(
         running_agents.end_running_agent(controller, backend="claude", composite_key="slack_1:/w")
     )
     assert res["ok"] is True
     assert interrupt.called and cleanup.called
+    # The subprocess is reaped promptly (not left as an orphan for the sweeper).
+    assert reap.called and res["process_killed"] is True and res["pid"] == 4321
 
 
 def test_end_claude_session_not_live():
@@ -420,26 +424,52 @@ def test_end_claude_session_not_live():
     assert res["error"] == "session_not_live"
 
 
-def test_end_codex_interrupts_turn_and_clears_session():
+def test_end_codex_interrupts_clears_and_stops_last_transport():
     send = _AsyncFlag()
-    transport = types.SimpleNamespace(send_request=send)
+    stop = _AsyncFlag()
+    transport = types.SimpleNamespace(send_request=send, stop=stop)
     cleared = {}
+    transports = {"/w": transport}
     mgr = types.SimpleNamespace(
         get_cwd=lambda b: "/w",
         get_thread_id=lambda b: "th1",
         invalidate_thread=lambda b: cleared.__setitem__("inv", b),
+        sessions_for_cwd=lambda cwd: [],  # this was the last session on the cwd
     )
     treg = types.SimpleNamespace(
         get_active_turn=lambda b: "turn1",
         clear_session=lambda b: cleared.__setitem__("clr", b),
     )
-    codex = types.SimpleNamespace(_session_mgr=mgr, _turn_registry=treg, _transports={"/w": transport})
+    codex = types.SimpleNamespace(
+        _session_mgr=mgr, _turn_registry=treg, _transports=transports, _transport_last_activity={"/w": 0.0}
+    )
     res = asyncio.run(
         running_agents.end_running_agent(_make_controller(codex=codex), backend="codex", base_session_id="b1")
     )
     assert res["ok"] is True
     assert send.called  # turn/interrupt RPC sent
     assert cleared.get("inv") == "b1" and cleared.get("clr") == "b1"
+    # Last session on the cwd → the shared app-server transport is stopped + dropped.
+    assert stop.called and res["process_killed"] is True and "/w" not in transports
+
+
+def test_end_codex_keeps_transport_when_other_sessions_share_cwd():
+    transport = types.SimpleNamespace(send_request=_AsyncFlag(), stop=_AsyncFlag())
+    transports = {"/w": transport}
+    mgr = types.SimpleNamespace(
+        get_cwd=lambda b: "/w",
+        get_thread_id=lambda b: "th1",
+        invalidate_thread=lambda b: None,
+        sessions_for_cwd=lambda cwd: ["other-base"],  # another session still uses it
+    )
+    treg = types.SimpleNamespace(get_active_turn=lambda b: None, clear_session=lambda b: None)
+    codex = types.SimpleNamespace(_session_mgr=mgr, _turn_registry=treg, _transports=transports)
+    res = asyncio.run(
+        running_agents.end_running_agent(_make_controller(codex=codex), backend="codex", base_session_id="b1")
+    )
+    assert res["ok"] is True
+    # Shared transport stays up; not stopped, still registered.
+    assert res["process_killed"] is False and "/w" in transports
 
 
 def test_end_opencode_cancels_active_task():

@@ -18,6 +18,7 @@ import { Link } from 'react-router-dom';
 
 import { useApi } from '../../context/ApiContext';
 import type { RunningAgent } from '../../context/ApiContext';
+import { useToast } from '../../context/ToastContext';
 import { PlatformIcon } from '../visual/PlatformIcon';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
@@ -93,6 +94,7 @@ const stateMeta = (state: string) => STATE_META[(state as RunState)] ?? STATE_ME
 export const RunningAgentsTab: React.FC = () => {
   const { t } = useTranslation();
   const api = useApi();
+  const { showToast } = useToast();
   const [agents, setAgents] = useState<RunningAgent[]>([]);
   const [unreachable, setUnreachable] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -141,8 +143,9 @@ export const RunningAgentsTab: React.FC = () => {
   // (the next poll reconciles authoritatively anyway).
   const endAgent = useCallback(
     async (agent: RunningAgent) => {
+      let result: Awaited<ReturnType<typeof api.endRunningAgent>> | undefined;
       try {
-        await api.endRunningAgent({
+        result = await api.endRunningAgent({
           backend: agent.backend,
           state: agent.state,
           composite_key: agent.composite_key,
@@ -150,14 +153,19 @@ export const RunningAgentsTab: React.FC = () => {
           pid: agent.pid,
         });
       } catch (err) {
-        // Best-effort: a network failure shouldn't bubble into an unhandled
-        // rejection in the click handler. The poll keeps the row truthful.
+        // A network failure shouldn't bubble into an unhandled rejection.
         console.warn('running-agents: end failed', err);
-      } finally {
-        if (mountedRef.current) await fetchData(true);
       }
+      // Always give the user feedback — silence reads as "nothing happened".
+      if (result?.ok) {
+        showToast(t('agents.running.endedToast'), 'success');
+      } else {
+        const reason = result?.error || (result?.unreachable ? 'unreachable' : 'failed');
+        showToast(t('agents.running.endFailedToast', { error: reason }), 'error');
+      }
+      if (mountedRef.current) await fetchData(true);
     },
-    [api, fetchData],
+    [api, fetchData, showToast, t],
   );
 
   // Initial fetch

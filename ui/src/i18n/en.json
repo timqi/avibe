@@ -1516,6 +1516,8 @@
       "endIdle": "Disconnect",
       "endOrphan": "Kill process",
       "confirmEnd": "Confirm",
+      "endedToast": "Ended",
+      "endFailedToast": "Couldn't end ({{error}})",
       "pidShared": "(shared)"
     },
     "showDisabled": "Show disabled",

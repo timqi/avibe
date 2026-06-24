@@ -1516,6 +1516,8 @@
       "endIdle": "断开",
       "endOrphan": "杀进程",
       "confirmEnd": "确认",
+      "endedToast": "已结束",
+      "endFailedToast": "无法结束（{{error}}）",
       "pidShared": "（共享）"
     },
     "showDisabled": "显示已禁用",

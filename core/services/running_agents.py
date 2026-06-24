@@ -476,6 +476,15 @@ async def _end_claude(controller: "Controller", composite_key: Optional[str], ba
     client = sessions.get(ck) if ck else None
     if client is None:
         return {"ok": False, "error": "session_not_live"}
+    # Capture the OS pid BEFORE teardown — once the client disconnects its
+    # transport is gone and the pid is no longer resolvable.
+    pid: Optional[int] = None
+    try:
+        from modules.agents.claude_process_reaper import get_claude_client_pid
+
+        pid = get_claude_client_pid(client)
+    except Exception:  # noqa: BLE001
+        pid = None
     # Interrupt any in-flight turn first (best-effort), then disconnect + free the
     # SDK client / subprocess via the same path idle-eviction uses.
     try:
@@ -488,7 +497,18 @@ async def _end_claude(controller: "Controller", composite_key: Optional[str], ba
     except Exception as exc:  # noqa: BLE001
         logger.warning("end: claude cleanup_session failed for %s: %s", ck, exc)
         return {"ok": False, "error": "cleanup_failed", "detail": str(exc)}
-    return {"ok": True, "action": "ended", "backend": "claude"}
+    # ``disconnect`` only closes the SDK transport; the Claude CLI subprocess can
+    # linger (becoming an orphan the reaper would only collect on a later sweep),
+    # so "End" wouldn't actually free the process. Reap it promptly if still alive.
+    process_killed = False
+    if isinstance(pid, int):
+        try:
+            from modules.agents.claude_process_reaper import _reap_pid_set
+
+            process_killed = (await _reap_pid_set({pid}, terminate_timeout=2.0, logger=logger)) > 0
+        except Exception:  # noqa: BLE001
+            logger.debug("end: claude pid reap failed for %s", pid, exc_info=True)
+    return {"ok": True, "action": "ended", "backend": "claude", "pid": pid, "process_killed": process_killed}
 
 
 async def _end_codex(controller: "Controller", base_session_id: Optional[str]) -> dict[str, Any]:
@@ -521,10 +541,36 @@ async def _end_codex(controller: "Controller", base_session_id: Optional[str]) -
     except Exception as exc:  # noqa: BLE001
         logger.warning("end: codex clear failed for %s: %s", base_session_id, exc)
         return {"ok": False, "error": "clear_failed", "detail": str(exc)}
+    # The app-server transport is shared per cwd. If THIS was the last session on
+    # that cwd, stop it too so the codex process is actually freed (otherwise it
+    # lingers with zero sessions); if other sessions still use it, leave it up.
+    process_killed = False
+    if cwd and transport is not None:
+        remaining: list = []
+        try:
+            remaining = session_mgr.sessions_for_cwd(cwd)
+        except Exception:  # noqa: BLE001
+            remaining = []
+        if not remaining:
+            try:
+                await transport.stop()
+                transports.pop(cwd, None)
+                last_activity = getattr(agent, "_transport_last_activity", None)
+                if isinstance(last_activity, dict):
+                    last_activity.pop(cwd, None)
+                process_killed = True
+            except Exception:  # noqa: BLE001
+                logger.debug("end: codex transport stop failed for %s", cwd, exc_info=True)
     # ``interrupted`` is False when there was no active turn to stop (idle/stale):
     # the session state is still cleared, but the caller can tell nothing was
     # actively interrupted.
-    return {"ok": True, "action": "ended", "backend": "codex", "interrupted": interrupted}
+    return {
+        "ok": True,
+        "action": "ended",
+        "backend": "codex",
+        "interrupted": interrupted,
+        "process_killed": process_killed,
+    }
 
 
 async def _end_opencode(controller: "Controller", base_session_id: Optional[str]) -> dict[str, Any]:
