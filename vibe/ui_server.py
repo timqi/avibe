@@ -2231,7 +2231,7 @@ async def running_agents_end():
     socket; degrades to 503 when the controller is down."""
     from vibe import internal_client
 
-    payload = request.get_json(silent=True) or {}
+    payload = request.json or {}
     try:
         result = await internal_client.end_running_agent(payload)
     except internal_client.InternalServerUnavailable:
