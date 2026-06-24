@@ -222,6 +222,7 @@ def create_app(controller: "Controller") -> FastAPI:
             controller,
             backend=(str(payload.get("backend")).strip() or None) if payload.get("backend") else None,
             state=(str(payload.get("state")).strip() or None) if payload.get("state") else None,
+            session_id=payload.get("session_id") or None,
             composite_key=payload.get("composite_key") or None,
             base_session_id=payload.get("base_session_id") or None,
             pid=pid,

@@ -148,6 +148,7 @@ export const RunningAgentsTab: React.FC = () => {
         result = await api.endRunningAgent({
           backend: agent.backend,
           state: agent.state,
+          session_id: agent.session_id,
           composite_key: agent.composite_key,
           base_session_id: agent.base_session_id,
           pid: agent.pid,

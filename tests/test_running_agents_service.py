@@ -433,7 +433,7 @@ def test_end_codex_interrupts_clears_and_stops_last_transport():
     mgr = types.SimpleNamespace(
         get_cwd=lambda b: "/w",
         get_thread_id=lambda b: "th1",
-        invalidate_thread=lambda b: cleared.__setitem__("inv", b),
+        clear=lambda b: cleared.__setitem__("inv", b),
         sessions_for_cwd=lambda cwd: [],  # this was the last session on the cwd
     )
     treg = types.SimpleNamespace(
@@ -459,7 +459,7 @@ def test_end_codex_keeps_transport_when_other_sessions_share_cwd():
     mgr = types.SimpleNamespace(
         get_cwd=lambda b: "/w",
         get_thread_id=lambda b: "th1",
-        invalidate_thread=lambda b: None,
+        clear=lambda b: None,
         sessions_for_cwd=lambda cwd: ["other-base"],  # another session still uses it
     )
     treg = types.SimpleNamespace(get_active_turn=lambda b: None, clear_session=lambda b: None)
@@ -493,6 +493,51 @@ def test_end_opencode_cancels_active_task():
     )
     assert res["ok"] is True
     assert task.cancelled
+
+
+def test_end_active_workbench_turn_settles_via_manager(monkeypatch):
+    # An active turn owned by the Workbench FSM must be stopped through
+    # SessionTurnManager.cancel (settles FSM + cancels dispatch task) before the
+    # backend teardown — otherwise the Chat page stays stuck "running".
+    cancel = _AsyncFlag(ret={"ok": True})
+    manager = types.SimpleNamespace(is_in_flight=lambda sid: sid == "ses-wb", cancel=cancel)
+    interrupt = _AsyncFlag()
+    cleanup = _AsyncFlag()
+    client = types.SimpleNamespace(interrupt=interrupt)
+    controller = _make_controller()
+    controller.session_turns = manager
+    controller.session_handler = types.SimpleNamespace(claude_sessions={"slack_x:/w": client}, cleanup_session=cleanup)
+    monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", _AsyncFlag(ret=0))
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="claude", state="active", session_id="ses-wb", composite_key="slack_x:/w"
+        )
+    )
+    assert res["ok"] is True
+    assert cancel.called and res.get("turn_settled") is True
+    assert cleanup.called  # backend teardown still runs after the FSM settles
+
+
+def test_end_active_im_turn_skips_manager_cancel(monkeypatch):
+    # IM turns never enter in_flight, so manager.cancel must NOT fire; the direct
+    # backend teardown handles them.
+    cancel = _AsyncFlag()
+    manager = types.SimpleNamespace(is_in_flight=lambda sid: False, cancel=cancel)
+    client = types.SimpleNamespace(interrupt=_AsyncFlag())
+    controller = _make_controller()
+    controller.session_turns = manager
+    controller.session_handler = types.SimpleNamespace(claude_sessions={"slack_y:/w": client}, cleanup_session=_AsyncFlag())
+    monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", _AsyncFlag(ret=0))
+
+    res = asyncio.run(
+        running_agents.end_running_agent(
+            controller, backend="claude", state="active", session_id="slack-im", composite_key="slack_y:/w"
+        )
+    )
+    assert res["ok"] is True
+    assert cancel.called is False
+    assert "turn_settled" not in res
 
 
 def test_end_unknown_target():

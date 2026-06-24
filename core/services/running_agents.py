@@ -536,7 +536,11 @@ async def _end_codex(controller: "Controller", base_session_id: Optional[str]) -
         except Exception:  # noqa: BLE001
             logger.debug("end: codex turn/interrupt failed for %s", base_session_id, exc_info=True)
     try:
-        session_mgr.invalidate_thread(base_session_id)
+        # Fully remove the session's mappings (thread + cwd + session_key), not
+        # just ``invalidate_thread`` (which preserves cwd/session_key) — otherwise
+        # ``_collect_codex``'s ``all_base_sessions()`` still enumerates it and the
+        # row never disappears from the Running tab.
+        session_mgr.clear(base_session_id)
         turn_registry.clear_session(base_session_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("end: codex clear failed for %s: %s", base_session_id, exc)
@@ -597,11 +601,37 @@ async def _end_opencode(controller: "Controller", base_session_id: Optional[str]
     return {"ok": True, "action": "ended", "backend": "opencode"}
 
 
+async def _settle_workbench_turn(controller: "Controller", session_id: Optional[str]) -> bool:
+    """If a Workbench/chat turn is in flight for ``session_id``, stop it through
+    ``SessionTurnManager.cancel`` so the turn FSM settles: it interrupts the
+    backend, emits the terminal result, AND cancels the ``dispatch_turn`` task the
+    Chat page is awaiting. Skipping this (and only doing the backend teardown
+    below) would leave the chat session stuck "running" with sends queued.
+
+    Returns True if a turn was settled. No-op for IM/agent-run turns (which never
+    enter ``in_flight``) and when there is no turn owner.
+    """
+    if not session_id:
+        return False
+    manager = getattr(controller, "session_turns", None)
+    if manager is None or not getattr(manager, "is_in_flight", None):
+        return False
+    try:
+        if not manager.is_in_flight(session_id):
+            return False
+        await manager.cancel(session_id)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("end: workbench turn cancel failed for %s", session_id, exc_info=True)
+        return False
+
+
 async def end_running_agent(
     controller: "Controller",
     *,
     backend: Optional[str] = None,
     state: Optional[str] = None,
+    session_id: Optional[str] = None,
     composite_key: Optional[str] = None,
     base_session_id: Optional[str] = None,
     pid: Optional[int] = None,
@@ -609,10 +639,14 @@ async def end_running_agent(
     """Terminate a running agent's LIVE runtime, dispatched by backend + state.
 
     - orphan → SIGTERM/SIGKILL the leaked (verified, avibe-owned) process.
-    - claude → interrupt the turn + disconnect the SDK client (frees subprocess).
-    - codex  → interrupt the turn + clear the session's thread/turn state (the
-      shared app-server stays up for other sessions on the same cwd).
+    - claude → interrupt the turn + disconnect the SDK client + reap the subprocess.
+    - codex  → interrupt the turn + clear the session mappings (+ stop the shared
+      app-server when this was its last session).
     - opencode → abort the remote run + cancel the local polling task.
+
+    For an ACTIVE turn owned by the Workbench turn FSM, the turn is first settled
+    through ``SessionTurnManager.cancel`` (so the Chat page un-sticks and the
+    dispatch task is cancelled) before the backend teardown.
 
     Runs on the controller event loop (mutates loop-owned registries / awaits
     backend coroutines). There is deliberately NO self-protection: ending the
@@ -622,16 +656,28 @@ async def end_running_agent(
         if not isinstance(pid, int):
             return {"ok": False, "error": "pid_required_for_orphan"}
         return await _end_orphan_pid(pid)
+
+    # Settle a Workbench-FSM-owned active turn through the canonical cancel path
+    # first; the backend teardown below then frees the runtime.
+    turn_settled = False
+    if state == "active":
+        turn_settled = await _settle_workbench_turn(controller, session_id)
+
     if backend == "claude":
-        return await _end_claude(controller, composite_key, base_session_id)
-    if backend == "codex":
-        return await _end_codex(controller, base_session_id)
-    if backend == "opencode":
-        return await _end_opencode(controller, base_session_id)
-    # Fallback: a pid-only target with no backend is treated as an orphan kill.
-    if isinstance(pid, int):
+        result = await _end_claude(controller, composite_key, base_session_id)
+    elif backend == "codex":
+        result = await _end_codex(controller, base_session_id)
+    elif backend == "opencode":
+        result = await _end_opencode(controller, base_session_id)
+    elif isinstance(pid, int):
+        # Fallback: a pid-only target with no backend is treated as an orphan kill.
         return await _end_orphan_pid(pid)
-    return {"ok": False, "error": "unknown_target"}
+    else:
+        return {"ok": False, "error": "unknown_target"}
+
+    if isinstance(result, dict) and turn_settled:
+        result["turn_settled"] = True
+    return result
 
 
 def snapshot_running_agents(controller: "Controller") -> dict[str, Any]:

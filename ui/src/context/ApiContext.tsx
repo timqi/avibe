@@ -243,6 +243,7 @@ export type ApiContextType = {
   endRunningAgent: (payload: {
     backend?: string | null;
     state?: string | null;
+    session_id?: string | null;
     composite_key?: string | null;
     base_session_id?: string | null;
     pid?: number | null;
