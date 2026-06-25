@@ -221,7 +221,7 @@ class StatusBubbleResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("msg-2", "Final answer", "✅ done"), controller.im_client.sent)
         self.assertEqual(controller.im_client.deletes, ["msg-1"])  # delete attempted
         # Delete returned False → fall back to collapsing the bubble to a marker.
-        self.assertIn(("msg-1", "✅ done", None), controller.im_client.edits)
+        self.assertIn(("msg-1", "", "✅ done"), controller.im_client.edits)
 
     async def test_result_without_prior_bubble_sends_normally(self):
         controller = _StubController(platform="slack")
@@ -383,8 +383,8 @@ class StatusBubbleResultTests(unittest.IsolatedAsyncioTestCase):
             result_id = await d.emit_agent_message(ctx, "result", "Failed answer", is_error=True)
         self.assertEqual(result_id, "msg-2")  # fresh result message
         self.assertEqual(controller.im_client.deletes, ["msg-1"])  # delete attempted (failed)
-        self.assertIn(("msg-1", "⏹ failed", None), controller.im_client.edits)  # collapse fallback
-        self.assertNotIn(("msg-1", "✅ done", None), controller.im_client.edits)
+        self.assertIn(("msg-1", "", "⏹ failed"), controller.im_client.edits)  # collapse fallback
+        self.assertNotIn(("msg-1", "", "✅ done"), controller.im_client.edits)
 
     async def test_result_teardown_drops_lock_dict_entry(self):
         # C6: after a turn ends, the per-key consolidated lock must be dropped from
@@ -489,7 +489,7 @@ class BeginStatusBubbleTests(unittest.IsolatedAsyncioTestCase):
             result_id = await d.emit_agent_message(ctx, "result", "", is_error=True)
         self.assertIsNone(result_id)  # empty result delivers nothing
         # is_error + non-silent → "failed": ⏹ failed marker, not ✅.
-        self.assertIn(("msg-1", "⏹ failed", None), controller.im_client.edits)
+        self.assertIn(("msg-1", "", "⏹ failed"), controller.im_client.edits)
 
     async def test_silent_result_tidies_starting_bubble(self):
         controller = _StubController(platform="slack")
@@ -499,7 +499,7 @@ class BeginStatusBubbleTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("core.message_dispatcher.persist_agent_message"):
             await d.emit_agent_message(ctx, "result", "🛑 stopped", level="silent")
         # Silent but NOT is_error → clean ✅ done marker.
-        self.assertIn(("msg-1", "✅ done", None), controller.im_client.edits)
+        self.assertIn(("msg-1", "", "✅ done"), controller.im_client.edits)
 
     async def test_error_silent_result_tidies_starting_bubble_with_stop_marker(self):
         # A manually-stopped (silent + is_error) terminal collapses to ⏹ stopped.
@@ -509,7 +509,7 @@ class BeginStatusBubbleTests(unittest.IsolatedAsyncioTestCase):
         await d.begin_status_bubble(ctx)
         with mock.patch("core.message_dispatcher.persist_agent_message"):
             await d.emit_agent_message(ctx, "result", "", level="silent", is_error=True)
-        self.assertIn(("msg-1", "⏹ stopped", None), controller.im_client.edits)
+        self.assertIn(("msg-1", "", "⏹ stopped"), controller.im_client.edits)
 
     async def test_error_result_posts_fresh_message_with_failed_footer(self):
         # A non-empty errored (non-silent) result is delivered as a fresh message
@@ -617,7 +617,7 @@ class LivenessFooterTests(unittest.IsolatedAsyncioTestCase):
     def test_note_session_tokens_sets_absolute_snapshot(self):
         d = _dispatcher(_StubController())
         ctx = _ctx()
-        key = d._get_session_key(ctx)
+        key = d._token_session_key(ctx)
         d.note_session_tokens(ctx, total=38000)
         self.assertEqual(d._session_token_total[key], 38000)
         # Pure SET (not accumulate): a later snapshot replaces, and can DROP
@@ -628,6 +628,18 @@ class LivenessFooterTests(unittest.IsolatedAsyncioTestCase):
         d.note_session_tokens(ctx, total="nope")
         d.note_session_tokens(ctx, total=-5)
         self.assertEqual(d._session_token_total[key], 12000)
+
+    def test_token_totals_isolated_per_thread(self):
+        # Two threads in the SAME channel must not share the occupancy figure — a
+        # token update in one thread must not change the other thread's footer (P2).
+        d = _dispatcher(_StubController())
+        a = MessageContext(user_id="U1", channel_id="C1", platform="slack", thread_id="T-a")
+        b = MessageContext(user_id="U1", channel_id="C1", platform="slack", thread_id="T-b")
+        d.note_session_tokens(a, total=38000)
+        d.note_session_tokens(b, total=120000)
+        self.assertEqual(d._token_field(a), "38.0k tok")
+        self.assertEqual(d._token_field(b), "120k tok")
+        self.assertNotEqual(d._token_session_key(a), d._token_session_key(b))
 
     def test_body_action_time_decoration(self):
         d = _dispatcher(_StubController())

@@ -516,6 +516,13 @@ class ConsolidatedMessageDispatcher:
             return f"{n / 1_000_000:.1f}M"
         return f"{round(n / 1_000_000)}M"
 
+    def _token_session_key(self, context: MessageContext) -> str:
+        """Key for context-window occupancy: scoped per CONVERSATION (thread / DM),
+        not per channel. The channel-level ``_get_session_key`` alone would let one
+        thread's token update overwrite every other thread's footer in the same
+        channel, since distinct agent sessions are derived from the thread anchor (P2)."""
+        return f"{self._get_session_key(context)}:{context.thread_id or context.channel_id}"
+
     def note_session_tokens(self, context: MessageContext, *, total: int) -> None:
         """SET the session's current context-window occupancy shown in the footer.
 
@@ -530,7 +537,7 @@ class ConsolidatedMessageDispatcher:
         except (TypeError, ValueError):
             return
         if value >= 0:
-            self._session_token_total[self._get_session_key(context)] = value
+            self._session_token_total[self._token_session_key(context)] = value
 
     def _backend_dead(self, context: MessageContext) -> bool:
         """Best-effort backend-liveness probe (B1). Returns True ONLY when the
@@ -560,7 +567,7 @@ class ConsolidatedMessageDispatcher:
         """The ``{n} tok`` footer field for the session's current context-window
         occupancy, or "" when unknown/zero (a backend that does not report usage
         shows nothing)."""
-        tokens = self._session_token_total.get(self._get_session_key(context), 0)
+        tokens = self._session_token_total.get(self._token_session_key(context), 0)
         if tokens <= 0:
             return ""
         return self._t("status.tokens", count=self._format_token_count(tokens))
@@ -792,10 +799,14 @@ class ConsolidatedMessageDispatcher:
         if not bubble_id:
             return
         elapsed_s = self._now() - self._status_started_at.get(key, self._now())
-        text = self._status_footer_text(context, elapsed_s=elapsed_s, done=True, reason=reason)
+        marker = self._status_footer_text(context, elapsed_s=elapsed_s, done=True, reason=reason)
         target_context = self._get_target_context(context)
         try:
-            await im_client.edit_message(target_context, bubble_id, text=text, parse_mode="markdown")
+            # Render the marker as the footer (empty body → footer-only bubble) so
+            # the edit goes through the status-block path and REPLACES the bubble's
+            # blocks. A plain text-only chat.update would leave the old "running"
+            # Slack blocks visible, hiding the terminal marker (P2).
+            await im_client.edit_message(target_context, bubble_id, text="", subtext=marker, parse_mode="markdown")
         except Exception as err:
             logger.debug("Failed to collapse status bubble %s: %s", bubble_id, err)
 
