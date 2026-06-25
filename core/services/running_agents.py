@@ -187,22 +187,28 @@ def _collect_codex(controller: "Controller") -> list[dict[str, Any]]:
     if session_mgr is None:
         return rows
 
-    # Count sessions per cwd so the UI can flag a pid shared across sessions.
     # ``all_base_sessions`` unions three lock-free dicts internally, so guard it
     # against concurrent mutation (we run in a worker thread, §to_thread).
     base_ids = list(_safe_call(session_mgr.all_base_sessions, []))
     # Resolve each base's cwd once, then count sessions per cwd (so the UI can
     # flag a pid shared across sessions) — avoids a second get_cwd pass.
-    cwd_by_base: dict[str, Optional[str]] = {base: session_mgr.get_cwd(base) for base in base_ids}
+    entries: list[tuple[str, Optional[str], Any, Any]] = []
     cwd_session_count: dict[str, int] = {}
-    for cwd in cwd_by_base.values():
-        if cwd:
-            cwd_session_count[cwd] = cwd_session_count.get(cwd, 0) + 1
-
     for base in base_ids:
-        cwd = cwd_by_base.get(base)
+        cwd = session_mgr.get_cwd(base)
         active_turn = turn_registry.get_active_turn(base) if turn_registry is not None else None
         transport = transports.get(cwd) if cwd else None
+        # Idle eviction drops the app-server transport but preserves cwd/session
+        # mappings for resume bookkeeping. Such bases are not live and must not
+        # appear as phantom idle rows; keep only a transport-backed base or a still
+        # active turn that needs to remain visible.
+        if transport is None and active_turn is None:
+            continue
+        entries.append((base, cwd, active_turn, transport))
+        if cwd and transport is not None:
+            cwd_session_count[cwd] = cwd_session_count.get(cwd, 0) + 1
+
+    for base, cwd, active_turn, transport in entries:
         pid = getattr(transport, "pid", None) if transport is not None else None
         # No per-session elapsed for codex: ``_transport_last_activity`` is keyed
         # by cwd (shared across every session on that transport) and is touched on
@@ -216,7 +222,7 @@ def _collect_codex(controller: "Controller") -> list[dict[str, Any]]:
                 base_session_id=base,
                 workdir=cwd,
                 pid=pid,
-                pid_shared=bool(cwd and cwd_session_count.get(cwd, 0) > 1),
+                pid_shared=bool(cwd and transport is not None and cwd_session_count.get(cwd, 0) > 1),
                 elapsed_seconds=None,
             )
         )
@@ -337,7 +343,7 @@ def _enrich_from_db(rows: list[dict[str, Any]]) -> None:
     except Exception:  # noqa: BLE001
         return
 
-    meta_by_anchor: dict[str, dict[str, Any]] = {}
+    meta_by_anchor: dict[str, list[dict[str, Any]]] = {}
     try:
         # Runs controller-side (this aggregator is only reached from the
         # controller's internal server), so ``create_sqlite_engine()`` resolves
@@ -351,6 +357,7 @@ def _enrich_from_db(rows: list[dict[str, Any]]) -> None:
                     agent_sessions.c.id,
                     agent_sessions.c.session_anchor,
                     agent_sessions.c.scope_id,
+                    agent_sessions.c.agent_backend,
                     agent_sessions.c.title,
                     agent_sessions.c.workdir,
                     agent_sessions.c.agent_name,
@@ -365,18 +372,37 @@ def _enrich_from_db(rows: list[dict[str, Any]]) -> None:
             ).mappings()
             for row in result:
                 anchor = row["session_anchor"]
-                # Prefer the most-recently-active row when an anchor has several.
-                existing = meta_by_anchor.get(anchor)
-                if existing is None or (row["last_active_at"] or "") > (existing.get("last_active_at") or ""):
-                    meta_by_anchor[anchor] = dict(row)
+                meta_by_anchor.setdefault(anchor, []).append(dict(row))
     except Exception:  # noqa: BLE001
         logger.debug("running_agents: db enrichment failed", exc_info=True)
         return
 
     for r in rows:
-        meta = meta_by_anchor.get(r.get("base_session_id"))
+        meta = _choose_session_meta(r, meta_by_anchor.get(r.get("base_session_id")) or [])
         if meta:
             _apply_session_meta(r, meta)
+
+
+def _choose_session_meta(r: dict[str, Any], candidates: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Pick display metadata for one running row.
+
+    ``agent_sessions`` may contain separate rows for the same anchor under
+    different backends. Prefer the row matching the live backend; fall back to the
+    most recent row only when no backend match exists.
+    """
+    if not candidates:
+        return None
+    ordered = sorted(
+        candidates,
+        key=lambda row: (row.get("last_active_at") or "", row.get("id") or ""),
+        reverse=True,
+    )
+    backend = str(r.get("backend") or "").strip()
+    if backend:
+        for row in ordered:
+            if str(row.get("agent_backend") or "").strip() == backend:
+                return row
+    return ordered[0]
 
 
 def _apply_session_meta(r: dict[str, Any], meta: dict[str, Any]) -> None:
@@ -601,29 +627,167 @@ async def _end_opencode(controller: "Controller", base_session_id: Optional[str]
     return {"ok": True, "action": "ended", "backend": "opencode"}
 
 
-async def _settle_workbench_turn(controller: "Controller", session_id: Optional[str]) -> bool:
+async def _settle_workbench_turn(controller: "Controller", session_id: Optional[str]) -> Optional[dict[str, Any]]:
     """If a Workbench/chat turn is in flight for ``session_id``, stop it through
     ``SessionTurnManager.cancel`` so the turn FSM settles: it interrupts the
     backend, emits the terminal result, AND cancels the ``dispatch_turn`` task the
     Chat page is awaiting. Skipping this (and only doing the backend teardown
     below) would leave the chat session stuck "running" with sends queued.
 
-    Returns True if a turn was settled. No-op for IM/agent-run turns (which never
-    enter ``in_flight``) and when there is no turn owner.
+    Returns a success/failure result when the Workbench manager owned the turn;
+    returns ``None`` for IM/agent-run turns and when there is no turn owner.
     """
     if not session_id:
-        return False
+        return None
     manager = getattr(controller, "session_turns", None)
     if manager is None or not getattr(manager, "is_in_flight", None):
-        return False
+        return None
     try:
         if not manager.is_in_flight(session_id):
-            return False
-        await manager.cancel(session_id)
-        return True
+            return None
+        result = await manager.cancel(session_id)
+        if isinstance(result, dict) and result.get("ok"):
+            return {
+                "ok": True,
+                "action": "stopped",
+                "turn_settled": True,
+                "stop_status": result.get("status"),
+                "backend": result.get("backend"),
+            }
+        return {
+            "ok": False,
+            "error": (result or {}).get("code") or "stop_failed",
+            "turn_settled": False,
+            "detail": result,
+        }
     except Exception:  # noqa: BLE001
         logger.debug("end: workbench turn cancel failed for %s", session_id, exc_info=True)
-        return False
+        return {"ok": False, "error": "stop_failed", "turn_settled": False}
+
+
+def _workdir_from_composite(composite_key: Optional[str]) -> Optional[str]:
+    if not composite_key:
+        return None
+    _base, sep, workdir = composite_key.rpartition(":")
+    return workdir if sep and workdir else None
+
+
+def _live_workdir_for_backend(
+    controller: "Controller",
+    backend: Optional[str],
+    base_session_id: Optional[str],
+    composite_key: Optional[str],
+) -> Optional[str]:
+    workdir = _workdir_from_composite(composite_key)
+    if workdir or not base_session_id:
+        return workdir
+    if backend == "codex":
+        agent = _get_agent(controller, "codex")
+        session_mgr = getattr(agent, "_session_mgr", None)
+        get_cwd = getattr(session_mgr, "get_cwd", None)
+        if callable(get_cwd):
+            try:
+                return get_cwd(base_session_id)
+            except Exception:  # noqa: BLE001
+                logger.debug("end: failed to resolve codex cwd for %s", base_session_id, exc_info=True)
+    elif backend == "opencode":
+        agent = _get_agent(controller, "opencode")
+        session_mgr = getattr(agent, "_session_manager", None)
+        get_req = getattr(session_mgr, "get_request_session", None)
+        if callable(get_req):
+            try:
+                req_info = get_req(base_session_id)
+            except Exception:  # noqa: BLE001
+                req_info = None
+            if req_info and len(req_info) >= 2:
+                return req_info[1]
+    return None
+
+
+def _build_stop_context(
+    controller: "Controller",
+    *,
+    backend: Optional[str],
+    session_id: Optional[str],
+    composite_key: Optional[str],
+    base_session_id: Optional[str],
+) -> Any:
+    manager = getattr(controller, "session_turns", None)
+    build_context = getattr(manager, "_build_context", None)
+    context = None
+    if session_id and callable(build_context):
+        try:
+            context = build_context(session_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("end: failed to rebuild stop context for %s", session_id, exc_info=True)
+    if context is None:
+        try:
+            from modules.im import MessageContext
+        except Exception:  # noqa: BLE001
+            return None
+        channel_id = session_id or base_session_id or composite_key or "running-agent"
+        context = MessageContext(user_id="workbench", channel_id=str(channel_id), platform="avibe")
+    if getattr(context, "platform_specific", None) is None:
+        context.platform_specific = {}
+    payload = context.platform_specific
+    payload["suppress_stop_no_active_notice"] = True
+    effective_base_session_id = base_session_id or (_base_from_composite(composite_key) if composite_key else None)
+    if effective_base_session_id:
+        payload["backend_base_session_id"] = effective_base_session_id
+    if composite_key:
+        payload["backend_composite_session_id"] = composite_key
+    target = payload.get("agent_session_target")
+    if not isinstance(target, dict):
+        target = {}
+        payload["agent_session_target"] = target
+    if session_id and not target.get("id"):
+        target["id"] = session_id
+    if backend and not target.get("agent_backend"):
+        target["agent_backend"] = backend
+    if effective_base_session_id and not target.get("session_anchor"):
+        target["session_anchor"] = effective_base_session_id
+    workdir = _live_workdir_for_backend(controller, backend, effective_base_session_id, composite_key)
+    if workdir and not target.get("workdir"):
+        target["workdir"] = workdir
+    return context
+
+
+async def _stop_active_agent(
+    controller: "Controller",
+    *,
+    backend: Optional[str],
+    session_id: Optional[str],
+    composite_key: Optional[str],
+    base_session_id: Optional[str],
+) -> dict[str, Any]:
+    settled = await _settle_workbench_turn(controller, session_id)
+    if settled is not None:
+        if settled.get("backend") is None and backend:
+            settled["backend"] = backend
+        return settled
+
+    handler = getattr(controller, "command_handler", None)
+    handle_stop = getattr(handler, "handle_stop", None)
+    if not callable(handle_stop):
+        return {"ok": False, "error": "stop_unavailable"}
+    context = _build_stop_context(
+        controller,
+        backend=backend,
+        session_id=session_id,
+        composite_key=composite_key,
+        base_session_id=base_session_id,
+    )
+    if context is None:
+        return {"ok": False, "error": "context_unavailable"}
+    try:
+        handled = bool(await handle_stop(context))
+    except Exception:  # noqa: BLE001
+        logger.debug("end: canonical stop failed for %s", base_session_id or session_id, exc_info=True)
+        return {"ok": False, "error": "stop_failed"}
+    if handled:
+        return {"ok": True, "action": "stopped", "backend": backend, "turn_settled": False}
+    payload = getattr(context, "platform_specific", None) or {}
+    return {"ok": False, "error": str(payload.get("stop_failure_reason") or "stop_failed")}
 
 
 async def end_running_agent(
@@ -657,11 +821,14 @@ async def end_running_agent(
             return {"ok": False, "error": "pid_required_for_orphan"}
         return await _end_orphan_pid(pid)
 
-    # Settle a Workbench-FSM-owned active turn through the canonical cancel path
-    # first; the backend teardown below then frees the runtime.
-    turn_settled = False
     if state == "active":
-        turn_settled = await _settle_workbench_turn(controller, session_id)
+        return await _stop_active_agent(
+            controller,
+            backend=backend,
+            session_id=session_id,
+            composite_key=composite_key,
+            base_session_id=base_session_id,
+        )
 
     if backend == "claude":
         result = await _end_claude(controller, composite_key, base_session_id)
@@ -675,8 +842,6 @@ async def end_running_agent(
     else:
         return {"ok": False, "error": "unknown_target"}
 
-    if isinstance(result, dict) and turn_settled:
-        result["turn_settled"] = True
     return result
 
 

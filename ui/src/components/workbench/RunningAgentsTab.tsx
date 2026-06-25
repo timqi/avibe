@@ -53,7 +53,7 @@ function shortWorkdir(workdir: string | null): string {
 // visually jump. (Deliberately excludes elapsed_seconds, which ticks every poll.)
 function identityKey(a: RunningAgent): string {
   return (
-    a.session_id ??
+    (a.session_id ? `${a.backend}:${a.session_id}` : null) ??
     a.composite_key ??
     `${a.backend}:${a.base_session_id ?? ''}:${a.workdir ?? ''}:${a.pid ?? ''}:${a.native_session_id ?? ''}`
   );
@@ -91,7 +91,11 @@ const STATE_META: Record<
 };
 const stateMeta = (state: string) => STATE_META[(state as RunState)] ?? STATE_META.idle;
 
-export const RunningAgentsTab: React.FC = () => {
+interface RunningAgentsTabProps {
+  onActiveCountChange?: (count: number | null) => void;
+}
+
+export const RunningAgentsTab: React.FC<RunningAgentsTabProps> = ({ onActiveCountChange }) => {
   const { t } = useTranslation();
   const api = useApi();
   const { showToast } = useToast();
@@ -118,9 +122,11 @@ export const RunningAgentsTab: React.FC = () => {
         if (!result.ok && result.unreachable) {
           setUnreachable(true);
           setAgents([]);
+          onActiveCountChange?.(null);
         } else {
           setUnreachable(false);
           setAgents(sortAgents(result.agents ?? []));
+          onActiveCountChange?.((result.counts as any)?.active ?? 0);
         }
       } catch {
         // Any unexpected fetch failure (network/401/non-JSON) means we cannot
@@ -129,12 +135,13 @@ export const RunningAgentsTab: React.FC = () => {
         if (mountedRef.current) {
           setUnreachable(true);
           setAgents([]);
+          onActiveCountChange?.(null);
         }
       } finally {
         if (mountedRef.current && !isBackground) setLoading(false);
       }
     },
-    [api],
+    [api, onActiveCountChange],
   );
 
   // End a running agent's live runtime, dispatched controller-side by
@@ -333,11 +340,9 @@ const RunningAgentRow: React.FC<RunningAgentRowProps> = ({ agent, onEnd }) => {
         <StateDot state={agent.state} t={t} />
 
         {/* Elapsed */}
-        {agent.elapsed_seconds != null && (
+        {agent.elapsed_seconds != null && agent.state !== 'active' && (
           <span className="font-mono text-[11px] text-muted">
-            {agent.state === 'active'
-              ? t('agents.running.busy', { elapsed: formatElapsed(agent.elapsed_seconds) })
-              : t('agents.running.idleElapsed', { elapsed: formatElapsed(agent.elapsed_seconds) })}
+            {t('agents.running.idleElapsed', { elapsed: formatElapsed(agent.elapsed_seconds) })}
           </span>
         )}
 

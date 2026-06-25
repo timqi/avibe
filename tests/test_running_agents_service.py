@@ -44,6 +44,9 @@ class _FakeSessionMgr:
     def get_cwd(self, base):
         return self._cwd_by_base.get(base)
 
+    def get_sessions_by_session_key(self, _session_key):
+        return list(self._cwd_by_base.keys())
+
 
 class _FakeTurnRegistry:
     def __init__(self, active_by_base):
@@ -212,6 +215,24 @@ def test_codex_shared_pid_one_row_per_session():
     assert snap["counts"]["by_backend"]["codex"] == 3
 
 
+def test_codex_skips_evicted_idle_base_without_transport():
+    mgr = _FakeSessionMgr({"live": "/work/live", "evicted": "/work/gone", "active": "/work/active"})
+    turns = _FakeTurnRegistry({"active": "turn-1"})
+    codex = types.SimpleNamespace(
+        _session_mgr=mgr,
+        _turn_registry=turns,
+        _transports={"/work/live": _FakeTransport(7001)},
+    )
+    controller = _make_controller(codex=codex)
+    snap = running_agents.snapshot_running_agents(controller)
+    by_base = {r["base_session_id"]: r for r in snap["agents"]}
+
+    assert set(by_base) == {"live", "active"}
+    assert by_base["live"]["state"] == "idle"
+    assert by_base["active"]["state"] == "active"
+    assert by_base["active"]["pid"] is None
+
+
 def test_opencode_active_requests_have_no_pid():
     oc = types.SimpleNamespace(_active_requests={"base-oc": _FakeTask(done=False)})
     controller = _make_controller(opencode=oc)
@@ -313,6 +334,18 @@ def test_real_slack_session_labeled_and_openable():
     assert row["platform"] == "slack"
     assert row["trigger_source"] == "human"
     assert row["openable_in_chat"] is True  # real IM session is openable
+
+
+def test_session_meta_prefers_matching_backend_before_recent_fallback():
+    candidates = [
+        {"id": "ses-claude", "agent_backend": "claude", "last_active_at": "2026-01-01T00:00:00"},
+        {"id": "ses-codex", "agent_backend": "codex", "last_active_at": "2026-01-02T00:00:00"},
+    ]
+    claude_row = running_agents._make_row(backend="claude", state="idle", base_session_id="same-anchor")
+    unknown_row = running_agents._make_row(backend="opencode", state="idle", base_session_id="same-anchor")
+
+    assert running_agents._choose_session_meta(claude_row, candidates)["id"] == "ses-claude"
+    assert running_agents._choose_session_meta(unknown_row, candidates)["id"] == "ses-codex"
 
 
 def test_orphan_skips_dead_and_reused_pids(monkeypatch):
@@ -497,16 +530,26 @@ def test_end_opencode_cancels_active_task():
 
 def test_end_active_workbench_turn_settles_via_manager(monkeypatch):
     # An active turn owned by the Workbench FSM must be stopped through
-    # SessionTurnManager.cancel (settles FSM + cancels dispatch task) before the
-    # backend teardown — otherwise the Chat page stays stuck "running".
-    cancel = _AsyncFlag(ret={"ok": True})
+    # SessionTurnManager.cancel. The real Claude stop path pops the SDK client
+    # during cancel; End must still return success and must not run a duplicate
+    # backend teardown that would now report session_not_live.
+    sessions = {"slack_x:/w": types.SimpleNamespace(interrupt=_AsyncFlag())}
+
+    class _WorkbenchCancel:
+        def __init__(self):
+            self.called = False
+
+        async def __call__(self, _session_id):
+            self.called = True
+            sessions.pop("slack_x:/w", None)
+            return {"ok": True, "status": "cancel_requested", "backend": "claude"}
+
+    cancel = _WorkbenchCancel()
     manager = types.SimpleNamespace(is_in_flight=lambda sid: sid == "ses-wb", cancel=cancel)
-    interrupt = _AsyncFlag()
     cleanup = _AsyncFlag()
-    client = types.SimpleNamespace(interrupt=interrupt)
     controller = _make_controller()
     controller.session_turns = manager
-    controller.session_handler = types.SimpleNamespace(claude_sessions={"slack_x:/w": client}, cleanup_session=cleanup)
+    controller.session_handler = types.SimpleNamespace(claude_sessions=sessions, cleanup_session=cleanup)
     monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", _AsyncFlag(ret=0))
 
     res = asyncio.run(
@@ -516,18 +559,28 @@ def test_end_active_workbench_turn_settles_via_manager(monkeypatch):
     )
     assert res["ok"] is True
     assert cancel.called and res.get("turn_settled") is True
-    assert cleanup.called  # backend teardown still runs after the FSM settles
+    assert cleanup.called is False
+    assert sessions == {}
 
 
-def test_end_active_im_turn_skips_manager_cancel(monkeypatch):
-    # IM turns never enter in_flight, so manager.cancel must NOT fire; the direct
-    # backend teardown handles them.
+def test_end_active_im_turn_uses_canonical_stop_path(monkeypatch):
+    # IM turns never enter Workbench in_flight, but active End must still use the
+    # canonical /stop path so backend adapters release pending requests, runtime
+    # gates, and terminal silent results before their registries change.
     cancel = _AsyncFlag()
     manager = types.SimpleNamespace(is_in_flight=lambda sid: False, cancel=cancel)
-    client = types.SimpleNamespace(interrupt=_AsyncFlag())
+    seen = {}
+
+    async def _handle_stop(context):
+        seen["context"] = context
+        return True
+
+    command_handler = types.SimpleNamespace(handle_stop=_handle_stop)
+    cleanup = _AsyncFlag()
     controller = _make_controller()
     controller.session_turns = manager
-    controller.session_handler = types.SimpleNamespace(claude_sessions={"slack_y:/w": client}, cleanup_session=_AsyncFlag())
+    controller.command_handler = command_handler
+    controller.session_handler = types.SimpleNamespace(claude_sessions={"slack_y:/w": object()}, cleanup_session=cleanup)
     monkeypatch.setattr("modules.agents.claude_process_reaper._reap_pid_set", _AsyncFlag(ret=0))
 
     res = asyncio.run(
@@ -537,7 +590,14 @@ def test_end_active_im_turn_skips_manager_cancel(monkeypatch):
     )
     assert res["ok"] is True
     assert cancel.called is False
-    assert "turn_settled" not in res
+    assert res["action"] == "stopped"
+    assert res["turn_settled"] is False
+    assert cleanup.called is False
+    payload = seen["context"].platform_specific
+    assert payload["backend_base_session_id"] == "slack_y"
+    assert payload["backend_composite_session_id"] == "slack_y:/w"
+    assert payload["agent_session_target"]["agent_backend"] == "claude"
+    assert payload["suppress_stop_no_active_notice"] is True
 
 
 def test_end_unknown_target():

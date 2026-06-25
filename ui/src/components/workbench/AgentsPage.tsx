@@ -198,6 +198,10 @@ export const AgentsPage: React.FC = () => {
     refresh().then(() => setSelected(agent));
   };
 
+  const handleRunningActiveCountChange = useCallback((count: number | null) => {
+    setRunningActiveCount(count);
+  }, []);
+
   const updateField = async (patch: Partial<VibeAgentFull>) => {
     if (!selected) return;
     try {
@@ -336,7 +340,7 @@ export const AgentsPage: React.FC = () => {
       </div>
 
       {/* Running tab body */}
-      {agentsTab === 'running' && <RunningAgentsTab />}
+      {agentsTab === 'running' && <RunningAgentsTab onActiveCountChange={handleRunningActiveCountChange} />}
 
       {/* Toolbar — design.pen Imduv: search + backend filter + spacer + Import + 新建 Agent */}
       <div className={clsx('flex flex-wrap items-center gap-2.5', agentsTab === 'running' ? 'hidden' : detailOpen && 'max-lg:hidden')}>
