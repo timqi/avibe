@@ -435,6 +435,12 @@ class ConsolidatedMessageDispatcher:
         creates the bubble via the idempotent guard, so nothing is lost.
         """
         try:
+            # No-delivery runs (scheduled / watch / agent-run targeting a Slack or
+            # Discord no-delivery session) suppress every emitted message at the
+            # chokepoint; this turn-start post runs BEFORE that branch, so guard it
+            # here too or a private run would leak a visible ⏳ bubble to the channel.
+            if (context.platform_specific or {}).get("suppress_delivery"):
+                return
             if self._concise_progress_style(context) != "concise":
                 return
             consolidated_key = self._get_consolidated_message_key(context)

@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from modules.im import MessageContext
 from modules.im.discord import DiscordBot
 from modules.im.slack import SlackBot
 
@@ -119,6 +120,28 @@ class DeletionCapabilityTests(unittest.TestCase):
         self.assertIsNotNone(content)
         self.assertLessEqual(len(content), 2000)
         self.assertTrue(content.endswith(f"-# {subtext}"))
+
+
+class SlackMarkdownOverLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_over_limit_markdown_keeps_legacy_path_without_subtext(self):
+        # A result over the markdown-block cap (12k) but under the dispatcher's
+        # inline limit must stay on the LEGACY mrkdwn path: passing subtext would
+        # route it through the status-bubble send, which rejects bodies > the cap,
+        # so the result would fail to post inline. The done-footer is dropped here.
+        bot = SlackBot.__new__(SlackBot)
+        bot._ensure_clients = lambda: None  # type: ignore[method-assign]
+        calls: list[dict] = []
+
+        async def _send_message(context, text, parse_mode=None, reply_to=None, subtext=None):
+            calls.append({"len": len(text), "subtext": subtext})
+            return "msg-legacy"
+
+        bot.send_message = _send_message  # type: ignore[method-assign]
+        ctx = MessageContext(user_id="U1", channel_id="C1", platform="slack")
+        mid = await bot.send_markdown_message(ctx, "x" * 13000, subtext="✅ done · 248k tok")
+        self.assertEqual(mid, "msg-legacy")
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0]["subtext"])  # legacy path: no subtext attached
 
 
 if __name__ == "__main__":

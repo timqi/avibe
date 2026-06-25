@@ -402,6 +402,18 @@ class BeginStatusBubbleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m for m, _, _ in controller.im_client.sent], ["msg-1"])
         self.assertEqual(controller.im_client.edits, [])
 
+    async def test_begin_noop_when_suppress_delivery(self):
+        # No-delivery runs (scheduled / watch targeting a Slack/Discord no-delivery
+        # session) must NOT leak a visible turn-start bubble — the turn-start post
+        # runs before the chokepoint's suppress-delivery branch, so it is guarded here.
+        controller = _StubController(platform="slack")
+        d = _dispatcher(controller)
+        ctx = _ctx()
+        ctx.platform_specific = {"suppress_delivery": True}
+        await d.begin_status_bubble(ctx)
+        self.assertEqual(controller.im_client.sent, [])
+        self.assertEqual(controller.im_client.edits, [])
+
     async def test_begin_noop_when_style_off(self):
         controller = _StubController(platform="slack", progress_style="off")
         d = _dispatcher(controller)
