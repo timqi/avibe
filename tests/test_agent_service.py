@@ -422,6 +422,72 @@ def test_real_indicator_shows_queued_reaction_on_second_message_while_first_hold
     asyncio.run(_run())
 
 
+def test_queued_reaction_does_not_delay_gate_acquire_fifo() -> None:
+    """Regression (Codex P1): a contended turn must reserve its FIFO place on the
+    runtime gate WITHOUT waiting for the (network) queued-reaction call. If the 👌
+    add were awaited before acquire(), a later same-runtime message could acquire
+    first and reorder prompts."""
+
+    async def _run():
+        log: list[str] = []
+        block = asyncio.Event()
+
+        class _SlowIndicator:
+            async def show_queued_reaction(self, _request):
+                log.append("show_queued_start")
+                await block.wait()  # simulate slow Slack/Feishu reaction API
+                return True
+
+            async def promote_reaction_to_running(self, _request):
+                log.append("promote")
+
+            async def finish(self, _request_or_handle):
+                log.append("finish")
+
+        controller = _Controller()
+        controller.processing_indicator = _SlowIndicator()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        first_request = _request("first")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+        gate = service._get_turn_gate("session:/repo")
+
+        second = asyncio.create_task(service.handle_message("claude", _request("second")))
+        # Let the second turn run far enough to fire the queued-reaction task and
+        # reach acquire(). Its show_queued is blocked forever, so if acquire() were
+        # gated behind it the gate would have NO waiter.
+        entered_queue = False
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if not entered_queue and gate.lock._waiters and len(gate.lock._waiters) >= 1:
+                entered_queue = True
+            if entered_queue and "show_queued_start" in log:
+                break
+        # The turn reserved its FIFO place on the gate (it is a waiter) even though
+        # its queued reaction is still blocked — proving acquire() was NOT gated
+        # behind the reaction network call.
+        assert entered_queue
+        assert "show_queued_start" in log  # the queued reaction was kicked off concurrently
+
+        # Cleanup: unblock everything and let the tasks settle.
+        block.set()
+        release_first.set()
+        service.release_runtime_turn(first_request.context)
+        for task in (first, second):
+            try:
+                await asyncio.wait_for(task, timeout=3)
+            except Exception:
+                pass
+
+    asyncio.run(_run())
+
+
 def test_agent_service_allows_distinct_runtime_keys_in_parallel() -> None:
     async def _run():
         service = AgentService(controller=_Controller())

@@ -54,36 +54,50 @@ class AgentService:
         # and is a no-op on platforms / modes without a reaction indicator (e.g.
         # WeChat, typing-only, avibe Web).
         indicator = getattr(self.controller, "processing_indicator", None)
-        queued_reaction_shown = False
+        queued_reaction_task: Optional[asyncio.Task] = None
         if indicator is not None and gate.lock.locked():
-            try:
-                queued_reaction_shown = bool(await indicator.show_queued_reaction(request))
-            except Exception:
-                logger.debug("Failed to show queued reaction", exc_info=True)
+            # Contended: show the queued 👌. Fire it as a CONCURRENT task instead of
+            # awaiting it here — awaiting a network reaction call before acquire()
+            # would leave this turn OUT of the lock's FIFO waiter queue, so a later
+            # same-runtime message could reach acquire() first and reorder prompts
+            # within the session (Codex P1). Calling acquire() immediately reserves
+            # this turn's place in the queue; the task adds 👌 concurrently while we
+            # block, and we join it after acquiring (before promoting to 👀).
+            queued_reaction_task = asyncio.create_task(indicator.show_queued_reaction(request))
         try:
             await gate.lock.acquire()
         except BaseException:
             # Cancellation (e.g. SIGTERM / shutdown) while still waiting in the
             # queue is raised by acquire() OUTSIDE the main try block below, so its
-            # CancelledError handler never runs. Clean up the queued 👌 (and any
-            # eager typing) here so it does not leak permanently on the message.
-            if queued_reaction_shown and indicator is not None:
+            # CancelledError handler never runs. Let the queued-reaction task settle,
+            # then clean up the 👌 (and any eager typing) so it does not leak.
+            if queued_reaction_task is not None:
                 try:
-                    # Pass the request (not the handle) so finish() clears BOTH the
-                    # handle and the flat request.ack_reaction_* fields. finish()
-                    # resolves the handle via request.processing_indicator.
-                    await indicator.finish(request)
-                except Exception:
-                    logger.debug("Failed to clean up queued reaction on cancel", exc_info=True)
+                    await queued_reaction_task
+                except BaseException:
+                    pass
+                if indicator is not None:
+                    try:
+                        # Pass the request (not the handle) so finish() clears BOTH
+                        # the handle and the flat request.ack_reaction_* fields.
+                        await indicator.finish(request)
+                    except Exception:
+                        logger.debug("Failed to clean up queued reaction on cancel", exc_info=True)
             raise
         gate.token = uuid.uuid4().hex
         gate.backend = agent.name
         gate.runtime_started = False
         self._stamp_runtime_turn(request, runtime_key, gate.token)
+        # Settle the concurrently-added queued 👌 (it usually finished while we were
+        # blocked on acquire) before promoting, so promote sees the final state.
+        if queued_reaction_task is not None:
+            try:
+                await queued_reaction_task
+            except Exception:
+                logger.debug("Failed to settle queued reaction", exc_info=True)
         # The turn truly starts now (gate acquired): flip the queued 👌 to the
-        # running 👀 (or add 👀 directly on the non-busy fast path). Done first so a
-        # non-contended turn barely flashes 👌. Guarded so a reaction failure can
-        # never break the turn.
+        # running 👀 (or add 👀 directly on the non-busy fast path). Guarded so a
+        # reaction failure can never break the turn.
         if indicator is not None:
             try:
                 await indicator.promote_reaction_to_running(request)
