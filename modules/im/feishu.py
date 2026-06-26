@@ -43,6 +43,8 @@ _EMOJI_MAP: Dict[str, str] = {
     "👀": "OnIt",
     "robot_face": "SMART",
     "🤖": "SMART",
+    "ok_hand": "OK",
+    "👌": "OK",
     "thumbsup": "THUMBSUP",
     "👍": "THUMBSUP",
     "+1": "THUMBSUP",

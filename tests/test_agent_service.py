@@ -318,6 +318,108 @@ def test_agent_service_cleans_queued_reaction_when_cancelled_while_waiting() -> 
     asyncio.run(_run())
 
 
+class _ReactionIM:
+    """Records the real reaction add/remove calls per message id."""
+
+    def __init__(self):
+        self.events: list[tuple[str, str, str]] = []
+
+    async def add_reaction(self, context, message_id, emoji):
+        self.events.append(("add", message_id, emoji))
+        return True
+
+    async def remove_reaction(self, context, message_id, emoji):
+        self.events.append(("remove", message_id, emoji))
+        return True
+
+
+class _RealIndicatorController(_Controller):
+    """Wires the REAL ProcessingIndicatorService so the gate exercises the actual
+    show_queued/promote path (not a recording stub)."""
+
+    def __init__(self, im: _ReactionIM):
+        super().__init__()
+        from core.processing_indicator import ProcessingIndicatorService
+
+        self.config = SimpleNamespace(ack_mode="reaction", language="en")
+        self._im = im
+        self.processing_indicator = ProcessingIndicatorService(self)
+
+    def get_im_client_for_context(self, _context):
+        return self._im
+
+
+def _reaction_request(message: str, message_id: str, runtime_key: str = "session:/repo"):
+    from core.processing_indicator import ProcessingIndicatorHandle
+
+    context = SimpleNamespace(
+        platform_specific={},
+        message_id=message_id,
+        platform="slack",
+        channel_id="C1",
+    )
+    handle = ProcessingIndicatorHandle(context=context, reaction_indicator_selected=True)
+    return SimpleNamespace(
+        context=context,
+        message=message,
+        composite_session_id=runtime_key,
+        processing_indicator=handle,
+        ack_reaction_message_id=None,
+        ack_reaction_emoji=None,
+        ack_message_id=None,
+        typing_indicator_active=False,
+        typing_indicator_task=None,
+    )
+
+
+def test_real_indicator_shows_queued_reaction_on_second_message_while_first_holds_gate() -> None:
+    """High-fidelity: the REAL ProcessingIndicatorService must put 👌 on the SECOND
+    message while the FIRST still holds the runtime gate, then promote it to 👀."""
+
+    async def _run():
+        from core.processing_indicator import ACK_REACTION_EMOJI, QUEUED_REACTION_EMOJI
+
+        im = _ReactionIM()
+        controller = _RealIndicatorController(im)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        req1 = _reaction_request("first", "m1")
+        first = asyncio.create_task(service.handle_message("claude", req1))
+        for _ in range(200):
+            if ("add", "m1", ACK_REACTION_EMOJI) in im.events:
+                break
+            await asyncio.sleep(0)
+        # First (uncontended) has started and shows the running 👀.
+        assert ("add", "m1", ACK_REACTION_EMOJI) in im.events, im.events
+
+        req2 = _reaction_request("second", "m2")
+        second = asyncio.create_task(service.handle_message("claude", req2))
+        for _ in range(200):
+            if ("add", "m2", QUEUED_REACTION_EMOJI) in im.events:
+                break
+            await asyncio.sleep(0)
+
+        # THE KEY ASSERTION: the queued 👌 is on m2 while m1's turn still holds the
+        # gate (m2 has not been promoted to 👀 yet).
+        assert ("add", "m2", QUEUED_REACTION_EMOJI) in im.events, im.events
+        assert ("add", "m2", ACK_REACTION_EMOJI) not in im.events, im.events
+
+        release_first.set()
+        service.release_runtime_turn(req1.context)
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+
+        # Once m2's turn starts, 👌 is removed and 👀 added on m2.
+        assert ("remove", "m2", QUEUED_REACTION_EMOJI) in im.events, im.events
+        assert ("add", "m2", ACK_REACTION_EMOJI) in im.events, im.events
+
+    asyncio.run(_run())
+
+
 def test_agent_service_allows_distinct_runtime_keys_in_parallel() -> None:
     async def _run():
         service = AgentService(controller=_Controller())
