@@ -865,6 +865,61 @@ class Controller:
         settings_key = self._get_settings_key(context)
         return build_context_session_key(context, platform=platform, settings_key=settings_key)
 
+    def backend_alive(self, context: MessageContext) -> Optional[bool]:
+        """Best-effort backend liveness for the concise status bubble's footer.
+
+        Delegates to ``AgentService.backend_alive`` (which dispatches to the
+        per-backend probe). Returns ``None`` when unknown — the dispatcher
+        treats ``None``/missing as alive so it never false-alarms ⚠️.
+        """
+        service = getattr(self, "agent_service", None)
+        probe = getattr(service, "backend_alive", None)
+        if not callable(probe):
+            return None
+        try:
+            return probe(context)
+        except Exception:
+            logger.debug("backend_alive delegation failed", exc_info=True)
+            return None
+
+    # ---- concise status-bubble settings (read by the message dispatcher) ----
+
+    def get_progress_style_for_context(self, context: MessageContext) -> str:
+        """Resolve the process-message UX style for this context: concise|verbose|off.
+
+        Currently a global config setting; per-channel overrides can layer on top
+        here later without touching the dispatcher.
+        """
+        value = getattr(self.config, "agent_progress_style", "concise")
+        return value if value in ("concise", "verbose", "off") else "concise"
+
+    def uses_concise_status_bubble(self, context: MessageContext) -> bool:
+        """True when this turn renders a concise status bubble (Slack/Discord +
+        progress_style=concise). The single source of truth shared by the message
+        dispatcher (which creates the bubble) and the processing indicator (which
+        suppresses its ack-message/reaction so there is no duplicate signal)."""
+        # Resolve platform with the SAME fallback the dispatcher's _get_platform
+        # uses (config.platform) so the bubble-creation gate and this suppression
+        # gate never disagree on an edge config; both then read the SAME
+        # ``supports_status_bubble`` capability rather than a hardcoded platform set.
+        platform = (
+            context.platform
+            or (context.platform_specific or {}).get("platform")
+            or getattr(self.config, "platform", None)
+            or self.primary_platform
+        )
+        if not get_platform_descriptor(platform).capabilities.supports_status_bubble:
+            return False
+        return self.get_progress_style_for_context(context) == "concise"
+
+    def get_heartbeat_interval_ms_for_context(self, context: MessageContext) -> int:
+        value = getattr(self.config, "agent_status_heartbeat_ms", 15000)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 15000
+
+    def get_no_output_hint_after_ms_for_context(self, context: MessageContext) -> int:
+        value = getattr(self.config, "agent_status_no_output_ms", 180000)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 180000
+
     def get_im_client_for_context(self, context: Optional[MessageContext] = None) -> BaseIMClient:
         if context is None:
             return self.im_clients[self.primary_platform]
@@ -1149,6 +1204,7 @@ class Controller:
         *,
         is_error: bool = False,
         level: str = "normal",
+        status_label: Optional[str] = None,
     ):
         """Backward-compatible entrypoint; delegated to message dispatcher."""
         return await self.message_dispatcher.emit_agent_message(
@@ -1158,7 +1214,18 @@ class Controller:
             parse_mode=parse_mode,
             is_error=is_error,
             level=level,
+            status_label=status_label,
         )
+
+    def note_session_tokens(self, context: MessageContext, *, total: int) -> None:
+        """Report the session's current context-window occupancy for the status
+        footer (backend-agnostic). SETs an absolute snapshot; the next footer render
+        shows it. No-op if the dispatcher is unavailable (partially-wired test
+        controllers)."""
+        dispatcher = getattr(self, "message_dispatcher", None)
+        if dispatcher is None:
+            return
+        dispatcher.note_session_tokens(context, total=total)
 
     # Main run method
     def run(self):

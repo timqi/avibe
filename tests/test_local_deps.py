@@ -8,9 +8,78 @@ shape.
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
+import tarfile
+
 import pytest
 
 from vibe import api
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _fake_avault_archive(content: bytes = b"#!/bin/sh\necho avault 0.1.0\n") -> bytes:
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w:gz") as archive:
+        info = tarfile.TarInfo("avault")
+        info.size = len(content)
+        info.mode = 0o755
+        archive.addfile(info, io.BytesIO(content))
+    return raw.getvalue()
+
+
+def _installable_avault_release(monkeypatch, *, target: str = "macos-arm64", sha256: str | None = None):
+    archive = _fake_avault_archive()
+    digest = sha256 or hashlib.sha256(archive).hexdigest()
+    manifest = {
+        "schema_version": 1,
+        "versions": {
+            api.AVAULT_VERSION: {
+                target: {
+                    "asset": f"avault-{api.AVAULT_VERSION}-{target}.tar.gz",
+                    "sha256": digest,
+                }
+            }
+        },
+    }
+    calls: list[str] = []
+
+    def fake_urlopen(request, timeout=30):
+        url = request.full_url
+        calls.append(url)
+        if url.endswith("/manifest.json"):
+            return _FakeHTTPResponse(json.dumps(manifest).encode("utf-8"))
+        if url.endswith(f"/avault-{api.AVAULT_VERSION}-{target}.tar.gz"):
+            return _FakeHTTPResponse(archive)
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(api.shutil, "which", lambda _binary: None)
+    def fake_candidate_cli_paths(binary: str):
+        expanded = api.Path(api.os.path.expanduser(binary))
+        has_path_separator = api.os.sep in binary or (api.os.altsep is not None and api.os.altsep in binary)
+        if expanded.is_absolute() or has_path_separator:
+            return [expanded]
+        if binary == "avault":
+            return [api.Path.home() / ".local" / "bin" / "avault"]
+        return []
+
+    monkeypatch.setattr(api, "_candidate_cli_paths", fake_candidate_cli_paths)
+    return calls
 
 
 def test_install_askill_uses_official_curl_installer(monkeypatch):
@@ -111,6 +180,220 @@ def test_askill_status_present_parses_version(monkeypatch):
     monkeypatch.setattr(api.subprocess, "run", lambda *a, **k: _R())
     s = api.askill_status()
     assert s["installed"] and s["version"] == "0.1.13" and s["status"] == "ready"
+
+
+def test_install_avault_uses_existing_configured_binary(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "/opt/avault/bin/avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/opt/avault/bin/avault" if b == "/opt/avault/bin/avault" else None)
+
+    out = api.install_avault()
+
+    assert out["ok"] is True
+    assert out["path"] == "/opt/avault/bin/avault"
+
+
+def test_install_avault_unsupported_platform_is_clear_failure(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda _b: None)
+    monkeypatch.setattr("platform.system", lambda: "FreeBSD")
+    monkeypatch.setattr("platform.machine", lambda: "riscv64")
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: pytest.fail("should not download"))
+
+    out = api.install_avault()
+
+    assert out["ok"] is False
+    assert "no avault build for FreeBSD-riscv64" in out["message"]
+
+
+def test_install_avault_force_keeps_existing_binary_on_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "/opt/avault/bin/avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/opt/avault/bin/avault" if b == "/opt/avault/bin/avault" else None)
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: pytest.fail("should not download"))
+
+    out = api.install_avault(force=True)
+
+    assert out["ok"] is True
+    assert out["path"] == "/opt/avault/bin/avault"
+
+
+def test_avault_target_detects_macos_arm64(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+
+    assert api._avault_target() == ("macos-arm64", "Darwin-arm64")
+
+
+def test_avault_target_detects_linux_x64(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("platform.machine", lambda: "amd64")
+
+    assert api._avault_target() == ("linux-x64", "Linux-amd64")
+
+
+def test_install_avault_downloads_manifest_verifies_and_installs(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    calls = _installable_avault_release(monkeypatch, target="macos-arm64")
+
+    out = api.install_avault()
+
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    assert out["ok"] is True
+    assert out["path"] == str(installed)
+    assert installed.exists()
+    assert installed.stat().st_mode & 0o777 == 0o755
+    assert api.resolve_cli_path("avault") == str(installed)
+    assert calls == [
+        f"https://github.com/avibe-bot/avault/releases/download/v{api.AVAULT_VERSION}/manifest.json",
+        f"https://github.com/avibe-bot/avault/releases/download/v{api.AVAULT_VERSION}/avault-{api.AVAULT_VERSION}-macos-arm64.tar.gz",
+    ]
+
+
+def test_install_avault_downloads_linux_x64_asset(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    calls = _installable_avault_release(monkeypatch, target="linux-x64")
+
+    out = api.install_avault()
+
+    assert out["ok"] is True
+    assert calls[-1].endswith(f"/avault-{api.AVAULT_VERSION}-linux-x64.tar.gz")
+
+
+def test_install_avault_checksum_mismatch_installs_nothing(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    _installable_avault_release(monkeypatch, target="macos-arm64", sha256="0" * 64)
+
+    out = api.install_avault()
+
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    assert out["ok"] is False
+    assert "checksum" in out["message"]
+    assert not installed.exists()
+
+
+def test_install_avault_is_idempotent_when_present(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api.shutil, "which", lambda _binary: None)
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    installed.write_text("#!/bin/sh\n", encoding="utf-8")
+    installed.chmod(0o755)
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: pytest.fail("should not download"))
+
+    out = api.install_avault()
+
+    assert out["ok"] is True
+    assert out["path"] == str(installed)
+
+
+def test_install_avault_force_redownloads_when_present(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    installed.write_text("old\n", encoding="utf-8")
+    installed.chmod(0o755)
+    calls = _installable_avault_release(monkeypatch, target="macos-arm64")
+
+    out = api.install_avault(force=True)
+
+    assert out["ok"] is True
+    assert len(calls) == 2
+    assert installed.read_text(encoding="utf-8").startswith("#!/bin/sh")
+
+
+def test_ensure_avault_force_uses_managed_binary_after_install(monkeypatch):
+    configured = api.Path.home() / "custom" / "avault"
+    configured.parent.mkdir(parents=True, exist_ok=True)
+    configured.write_text("#!/bin/sh\necho old\n", encoding="utf-8")
+    configured.chmod(0o755)
+    cfg = api.save_config({})
+    cfg.agents.avault.cli_path = str(configured)
+    cfg.save()
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    _installable_avault_release(monkeypatch, target="macos-arm64")
+
+    out = api.ensure_avault_installed(force=True)
+
+    installed = api.Path.home() / ".local" / "bin" / "avault"
+    assert out["ok"] is True
+    assert out["path"] == str(installed)
+    assert api.V2Config.load().agents.avault.cli_path == str(installed)
+    assert api._resolve_avault_cli_path() == str(installed)
+
+
+def test_avault_resolves_path_fallback_when_configured_path_missing(monkeypatch):
+    seen = []
+
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "/missing/avault")
+
+    def fake_resolve(binary):
+        seen.append(binary)
+        return "/usr/local/bin/avault" if binary == "avault" else None
+
+    monkeypatch.setattr(api, "resolve_cli_path", fake_resolve)
+
+    assert api._resolve_avault_cli_path() == "/usr/local/bin/avault"
+    assert seen == ["/missing/avault", "avault"]
+
+
+def test_ensure_avault_idempotent_when_present(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/avault")
+    flag = {"installed": False}
+    monkeypatch.setattr(api, "install_avault", lambda force=False: flag.__setitem__("installed", True) or {"ok": True})
+
+    out = api.ensure_avault_installed()
+
+    assert out == {"ok": True, "installed": True, "changed": False, "path": "/usr/local/bin/avault"}
+    assert flag["installed"] is False
+
+
+def test_ensure_avault_force_rechecks_existing_binary(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/usr/local/bin/avault")
+    flag = {"installed": False}
+    monkeypatch.setattr(api, "install_avault", lambda force=False: flag.__setitem__("installed", True) or {"ok": True})
+
+    out = api.ensure_avault_installed(force=True)
+
+    assert flag["installed"] is True
+    assert out["ok"] is True
+    assert out["installed"] is True
+    assert out["changed"] is True
+
+
+def test_avault_status_missing(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: None)
+    s = api.avault_status()
+    assert s["id"] == "avault"
+    assert s["installed"] is False and s["status"] == "missing" and s["version"] is None
+
+
+def test_avault_status_present_parses_version(monkeypatch):
+    monkeypatch.setattr(api, "_configured_avault_cli_path", lambda: "avault")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda b: "/x/avault")
+    monkeypatch.setattr(api, "_command_env_for", lambda p: {})
+    monkeypatch.setattr(api, "isolated_subprocess_kwargs", lambda: {})
+
+    class _R:
+        returncode = 0
+        stdout = "avault 0.0.1\n"
+        stderr = ""
+
+    monkeypatch.setattr(api.subprocess, "run", lambda *a, **k: _R())
+    s = api.avault_status()
+    assert s["installed"] and s["version"] == "0.0.1" and s["status"] == "ready"
 
 
 def test_askill_update_status_compares_latest(monkeypatch):
@@ -230,6 +513,11 @@ def test_dependencies_status_shape(monkeypatch):
             "path": "/x",
         },
     )
+    monkeypatch.setattr(
+        api,
+        "avault_status",
+        lambda: {"id": "avault", "installed": True, "version": "0.0.1", "status": "ready", "path": "/x/avault"},
+    )
     import core.show_runtime as srt_mod
 
     class _Mgr:
@@ -240,9 +528,11 @@ def test_dependencies_status_shape(monkeypatch):
     out = api.dependencies_status()
     assert out["ok"]
     by = {d["id"]: d for d in out["deps"]}
-    assert list(by) == ["askill", "show-runtime", "node"]
+    assert list(by) == ["askill", "avault", "show-runtime", "node"]
     assert by["askill"]["status"] == "ready" and by["askill"]["version"] == "0.1.13" and by["askill"]["required"]
     assert by["askill"]["latest_version"] is None and by["askill"]["has_update"] is False
+    assert by["avault"]["status"] == "ready" and by["avault"]["version"] == "0.0.1" and by["avault"]["required"]
+    assert by["avault"]["latest_version"] is None and by["avault"]["has_update"] is False
     assert by["show-runtime"]["installed"] and by["show-runtime"]["version"] == "1.4.0"
     assert by["node"]["installed"] and by["node"]["version"] == "20.11"
 
@@ -253,6 +543,11 @@ def test_dependencies_status_node_unsupported_not_ready(monkeypatch):
         api,
         "askill_update_status",
         lambda **_: {"id": "askill", "installed": True, "version": "0.1.13", "status": "ready", "path": "/x"},
+    )
+    monkeypatch.setattr(
+        api,
+        "avault_status",
+        lambda: {"id": "avault", "installed": True, "version": "0.0.1", "status": "ready", "path": "/x/avault"},
     )
     import core.show_runtime as srt_mod
 
@@ -267,12 +562,19 @@ def test_dependencies_status_node_unsupported_not_ready(monkeypatch):
 
 def test_reconcile_startup_dependencies_installs_askill_and_defers_runtime_prepare(monkeypatch):
     askill_calls = []
+    avault_calls = []
 
     def fake_ensure(force=False):
         askill_calls.append(force)
         return {"ok": True, "installed": True, "changed": True, "path": "/x/askill"}
 
     monkeypatch.setattr(api, "ensure_askill_installed", fake_ensure)
+
+    def fake_ensure_avault(force=False):
+        avault_calls.append(force)
+        return {"ok": True, "installed": True, "changed": False, "path": "/x/avault"}
+
+    monkeypatch.setattr(api, "ensure_avault_installed", fake_ensure_avault)
 
     import core.show_runtime as srt_mod
 
@@ -300,6 +602,7 @@ def test_reconcile_startup_dependencies_installs_askill_and_defers_runtime_prepa
 
     assert out["ok"] is True
     assert askill_calls == [False]
+    assert avault_calls == [False]
     assert manager.prepared == []
     assert out["node"]["status"] == "ready"
     assert out["show_runtime"] == {"ok": True, "status": "pending_prewarm", "reason": None}
@@ -307,6 +610,7 @@ def test_reconcile_startup_dependencies_installs_askill_and_defers_runtime_prepa
 
 def test_reconcile_startup_dependencies_does_not_prepare_runtime_without_node(monkeypatch):
     monkeypatch.setattr(api, "ensure_askill_installed", lambda force=False: {"ok": True, "installed": True})
+    monkeypatch.setattr(api, "ensure_avault_installed", lambda force=False: {"ok": True, "installed": True})
 
     import core.show_runtime as srt_mod
 
@@ -329,6 +633,7 @@ def test_reconcile_startup_dependencies_does_not_prepare_runtime_without_node(mo
 def test_reconcile_startup_dependencies_can_be_disabled(monkeypatch):
     monkeypatch.setenv("VIBE_STARTUP_DEPENDENCY_RECONCILE", "0")
     monkeypatch.setattr(api, "ensure_askill_installed", lambda force=False: pytest.fail("should not reconcile"))
+    monkeypatch.setattr(api, "ensure_avault_installed", lambda force=False: pytest.fail("should not reconcile"))
 
     out = api.reconcile_startup_dependencies()
 
@@ -388,6 +693,28 @@ def test_start_dependency_install_job_runs_askill(monkeypatch):
     cur = job
     for _ in range(100):
         cur = api.get_agent_install_job(job["job_id"], backend="askill")
+        if cur.get("status") != "running":
+            break
+        _t.sleep(0.02)
+    assert flag["called"] is True
+    assert cur["status"] == "succeeded" and cur["ok"] is True
+
+
+def test_start_dependency_install_job_runs_avault(monkeypatch):
+    import time as _t
+
+    flag = {"called": False}
+
+    def fake_ensure(force=False):
+        flag["called"] = True
+        return {"ok": True, "installed": True, "changed": False, "path": "/x/avault"}
+
+    monkeypatch.setattr(api, "ensure_avault_installed", fake_ensure)
+    job = api.start_dependency_install_job("avault")
+    assert job["ok"] and job["backend"] == "avault" and job.get("job_id")
+    cur = job
+    for _ in range(100):
+        cur = api.get_agent_install_job(job["job_id"], backend="avault")
         if cur.get("status") != "running":
             break
         _t.sleep(0.02)

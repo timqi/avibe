@@ -46,6 +46,7 @@ from vibe.upgrade import (
 )
 from vibe.restart_supervisor import schedule_restart
 from vibe.claude_model_catalog import DEFAULT_CLAUDE_MODEL_ALIASES, load_catalog_models
+from vibe.i18n import t as backend_t
 from modules.agents.catalog import (
     agent_backend_catalog_payload,
     agent_backend_descriptors,
@@ -954,6 +955,9 @@ def config_to_payload(config: V2Config, *, include_secrets: bool = False) -> dic
         "include_user_info": config.include_user_info,
         "reply_enhancements": config.reply_enhancements,
         "show_pages_prompt": config.show_pages_prompt,
+        "agent_progress_style": config.agent_progress_style,
+        "agent_status_heartbeat_ms": config.agent_status_heartbeat_ms,
+        "agent_status_no_output_ms": config.agent_status_no_output_ms,
         "setup_completed": config.setup_completed,
     }
     return payload
@@ -1273,6 +1277,104 @@ def set_default_vibe_agent(name: str) -> dict:
         return {"ok": True, "default_agent_name": agent.name, "agent": _vibe_agent_payload(agent, brief=True)}
     finally:
         store.close()
+
+
+# ----- Vaults (secret management; design: docs/plans/vaults.md) -----
+# Thin web-facing wrappers over storage.vault_service. Reads are masked (no values);
+# values are only ever delivered to agents via the CLI (vibe vault run/fetch/...).
+
+
+class VaultApiError(ValueError):
+    """A vault REST error carrying a stable code + HTTP status for the route layer."""
+
+    def __init__(self, message: str, *, code: str = "vault_error", status: int = 400):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+def _vault_engine():
+    from storage.db import create_sqlite_engine
+    from storage.importer import ensure_sqlite_state, resolve_primary_platform_from_config
+
+    # Resolve the platform from config like the other CLI/data paths — if the Vaults
+    # route is the first to initialize SQLite on an upgraded install with legacy
+    # sessions, ``ensure_sqlite_state`` requires a platform and would otherwise raise.
+    ensure_sqlite_state(primary_platform=resolve_primary_platform_from_config(paths.get_state_dir()))
+    return create_sqlite_engine(paths.get_sqlite_state_path())
+
+
+def get_vault_secrets(*, group: Optional[str] = None) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    with engine.connect() as conn:
+        secrets = vault_service.list_secrets(conn, group=group)
+    return {"ok": True, "secrets": secrets}
+
+
+def create_vault_secret(payload: dict) -> dict:
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    name = str(payload.get("name") or "").strip()
+    value = payload.get("value")
+    if value is None or value == "":
+        raise VaultApiError("value is required", code="empty_value")
+    if not vault_crypto.is_valid_secret_name(name):
+        raise VaultApiError("invalid secret name (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name")
+    tags = payload.get("tags") if isinstance(payload.get("tags"), list) else None
+    policy = payload.get("policy") if isinstance(payload.get("policy"), dict) else None
+    value = str(value)
+    # Seal via avault before the DB transaction. The transient plaintext POST lives only here
+    # (one request, not reused) and is piped to avault's stdin; we keep only the ciphertext.
+    try:
+        sealed = avault_seal(name, value.encode("utf-8"))
+    except AvaultError as exc:
+        raise VaultApiError(f"avault seal failed: {exc}", code="avault_failed") from exc
+    preview = vault_service.value_preview(value)
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            meta = vault_service.create_secret(
+                conn,
+                name=name,
+                sealed=sealed,
+                preview=preview,
+                group=str(payload.get("group") or vault_service.DEFAULT_GROUP),
+                tags=tags,
+                description=payload.get("description"),
+                policy=policy,
+            )
+    except vault_service.InvalidSecretNameError as exc:
+        raise VaultApiError("invalid secret name (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name") from exc
+    except vault_service.SecretExistsError as exc:
+        raise VaultApiError(f"secret '{name}' already exists", code="secret_exists", status=409) from exc
+    except vault_service.UnsupportedProtectionError as exc:
+        raise VaultApiError(str(exc), code="protected_tier_unavailable") from exc
+    return {"ok": True, "secret": meta}
+
+
+def delete_vault_secret(name: str) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            vault_service.delete_secret(conn, name)
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
+    return {"ok": True, "removed": True, "name": name}
+
+
+def get_vault_audit(*, secret_name: Optional[str] = None, limit: int = 100) -> dict:
+    from storage import vault_service
+
+    engine = _vault_engine()
+    with engine.connect() as conn:
+        events = vault_service.list_audit(conn, secret_name=secret_name, limit=limit)
+    return {"ok": True, "events": events}
 
 
 def import_vibe_agents(payload: dict) -> dict:
@@ -3185,11 +3287,14 @@ def _run_install_command(
 
 
 # =============================================================================
-# Local dependencies (askill) — required tools avibe installs for the user
+# Local dependencies (askill / avault) — required tools avibe installs for the user
 # =============================================================================
 
 
 _ASKILL_INSTALL_LOCK = threading.Lock()
+_AVAULT_INSTALL_LOCK = threading.Lock()
+AVAULT_VERSION = "0.1.0"
+_AVAULT_RELEASE_BASE_URL = f"https://github.com/avibe-bot/avault/releases/download/v{AVAULT_VERSION}/"
 
 
 def _truncate_install_output(output: str, limit: int = 8192) -> str:
@@ -3277,6 +3382,429 @@ def askill_status() -> dict:
     except Exception:  # noqa: BLE001
         version = None
     return {"id": "askill", "installed": True, "version": version, "status": "ready", "path": path}
+
+
+def _configured_avault_cli_path() -> str:
+    try:
+        return str(V2Config.load().agents.avault.cli_path or "avault")
+    except Exception:  # noqa: BLE001
+        return "avault"
+
+
+def _resolve_avault_cli_path() -> str | None:
+    configured = _configured_avault_cli_path()
+    resolved = resolve_cli_path(configured)
+    if resolved:
+        return resolved
+    if configured != "avault":
+        return resolve_cli_path("avault")
+    return None
+
+
+def _avault_target() -> tuple[str | None, str]:
+    import platform
+
+    system = platform.system()
+    machine = platform.machine()
+    normalized_system = system.lower()
+    normalized_machine = machine.lower()
+    platform_label = f"{system or 'unknown'}-{machine or 'unknown'}"
+
+    if normalized_system == "darwin" and normalized_machine == "arm64":
+        return "macos-arm64", platform_label
+    if normalized_system == "linux" and normalized_machine in {"x86_64", "amd64"}:
+        return "linux-x64", platform_label
+    return None, platform_label
+
+
+def _avault_managed_bin_path() -> Path:
+    return Path.home() / ".local" / "bin" / "avault"
+
+
+def _persist_avault_cli_path(path: str) -> None:
+    try:
+        try:
+            load_config()
+        except FileNotFoundError:
+            save_config({})
+        with CONFIG_LOCK:
+            cfg = load_config()
+            previous = getattr(cfg.agents.avault, "cli_path", "") or ""
+            if previous != path:
+                cfg.agents.avault.cli_path = path
+                cfg.save()
+                logger.info(
+                    "install_avault: updated V2Config cli_path: %s -> %s",
+                    previous or "<unset>",
+                    path,
+                )
+    except Exception as exc:
+        logger.warning("install_avault: failed to persist cli_path: %s", exc)
+        raise
+
+
+def _download_avault_release_file(url: str) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "avibe/avault-installer",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - public GitHub release asset
+        return response.read()
+
+
+def _extract_avault_binary(archive_bytes: bytes, output_path: Path) -> None:
+    import io
+    import tarfile
+
+    output_real = output_path.parent.resolve()
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+        member = next((item for item in archive.getmembers() if item.name == "avault"), None)
+        if member is None or not member.isfile():
+            raise ValueError("archive does not contain the avault executable")
+        target = (output_path.parent / member.name).resolve()
+        if target.parent != output_real or target.name != "avault":
+            raise ValueError("archive contains an unsafe avault path")
+        source = archive.extractfile(member)
+        if source is None:
+            raise ValueError("archive does not contain readable avault data")
+        with output_path.open("wb") as out:
+            shutil.copyfileobj(source, out)
+
+
+def _clear_macos_quarantine(path: Path) -> None:
+    if os.sys.platform != "darwin":
+        return
+    try:
+        os.removexattr(path, "com.apple.quarantine")
+    except (AttributeError, FileNotFoundError, OSError):
+        pass
+
+
+def install_avault(force: bool = False) -> dict:
+    """Install (or refresh) avault, the required local custody-core dependency.
+
+    Downloads the Avibe-pinned public avault release manifest and tarball,
+    verifies the manifest sha256, safely extracts the single ``avault`` member,
+    and atomically installs it into Avibe's managed CLI location.
+    """
+    path = _resolve_avault_cli_path()
+    if path and not force:
+        return {
+            "ok": True,
+            "message": backend_t("dependencies.avault.ready"),
+            "output": None,
+            "path": path,
+        }
+
+    import hashlib
+    import tempfile
+
+    target, platform_label = _avault_target()
+    if target is None:
+        if path:
+            return {
+                "ok": True,
+                "message": backend_t("dependencies.avault.ready"),
+                "output": None,
+                "path": path,
+                "changed": False,
+            }
+        return {
+            "ok": False,
+            "message": backend_t("dependencies.avault.noBuild", platform=platform_label),
+            "output": None,
+            "path": None,
+        }
+
+    try:
+        manifest_url = urllib.parse.urljoin(_AVAULT_RELEASE_BASE_URL, "manifest.json")
+        manifest = json.loads(_download_avault_release_file(manifest_url).decode("utf-8"))
+        entry = manifest["versions"][AVAULT_VERSION][target]
+        asset = entry["asset"]
+        expected_sha256 = str(entry["sha256"]).strip().lower()
+        if not isinstance(asset, str) or not asset.endswith(".tar.gz") or "/" in asset:
+            raise ValueError("manifest contains an invalid avault asset name")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError("manifest contains an invalid avault sha256")
+
+        archive_url = urllib.parse.urljoin(_AVAULT_RELEASE_BASE_URL, asset)
+        archive_bytes = _download_avault_release_file(archive_url)
+        actual_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+        if actual_sha256 != expected_sha256:
+            return {
+                "ok": False,
+                "message": backend_t("dependencies.avault.checksumMismatch"),
+                "output": f"expected {expected_sha256}, got {actual_sha256}",
+                "path": None,
+            }
+
+        install_path = _avault_managed_bin_path()
+        install_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="avault-install-", dir=install_path.parent) as tmp_dir:
+            tmp_path = Path(tmp_dir) / "avault"
+            _extract_avault_binary(archive_bytes, tmp_path)
+            tmp_path.chmod(0o755)
+            os.replace(tmp_path, install_path)
+        install_path.chmod(0o755)
+        _clear_macos_quarantine(install_path)
+        _persist_avault_cli_path(str(install_path))
+
+        return {
+            "ok": True,
+            "message": backend_t("dependencies.avault.installed", version=AVAULT_VERSION),
+            "output": f"Installed avault {AVAULT_VERSION} for {target}",
+            "path": str(install_path),
+            "changed": True,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("avault install failed: %s", exc, exc_info=True)
+        return {
+            "ok": False,
+            "message": backend_t("dependencies.avault.installFailed", error=str(exc)),
+            "output": None,
+            "path": None,
+        }
+
+
+def ensure_avault_installed(force: bool = False) -> dict:
+    """Ensure avault is present. Idempotent until the manifest installer lands."""
+    if not _AVAULT_INSTALL_LOCK.acquire(blocking=False):
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "avault_install_already_running",
+            "message": backend_t("dependencies.avault.alreadyRunning"),
+        }
+    try:
+        existing = _resolve_avault_cli_path()
+        if existing and not force:
+            return {"ok": True, "installed": True, "changed": False, "path": existing}
+        result = install_avault(force=force)
+        resolved = _resolve_avault_cli_path()
+        installed = bool(resolved)
+        result["installed"] = installed
+        if "changed" not in result:
+            result["changed"] = installed and bool(result.get("ok")) and (not existing or force)
+        result["path"] = resolved
+        if result.get("ok") and not installed:
+            result["ok"] = False
+            result["message"] = (
+                result.get("message") or backend_t("dependencies.avault.installedNotFound")
+            )
+        return result
+    finally:
+        _AVAULT_INSTALL_LOCK.release()
+
+
+def avault_status() -> dict:
+    """Report whether avault is installed and its version (best-effort)."""
+    path = _resolve_avault_cli_path()
+    if not path:
+        return {"id": "avault", "installed": False, "version": None, "status": "missing", "path": None}
+    version: str | None = None
+    try:
+        proc = subprocess.run(
+            [path, "version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_command_env_for(path),
+            **isolated_subprocess_kwargs(),
+        )
+        text = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode == 0 and text:
+            version = text.split()[-1]
+    except Exception:  # noqa: BLE001
+        version = None
+    return {"id": "avault", "installed": True, "version": version, "status": "ready", "path": path}
+
+
+# ---------------------------------------------------------------------------
+# avault client — Avibe's only path to value cryptography.
+#
+# Every Vaults value operation (seal on create, deliver on use, key backup) is a
+# one-shot ``avault`` subprocess. Plaintext/keys flow only INTO avault via stdin;
+# avault returns ciphertext, a delivery exit code, an HTTP response, or a written
+# file — never plaintext. The daemon never holds the master key and never decrypts.
+# (Design: avibe docs/plans/avault-custody-core.md §18; verbs: avault/docs/DESIGN.md.)
+# ---------------------------------------------------------------------------
+
+# avibe's wait must outlast avault's own fetch timeout (10s connect + 30s total).
+_AVAULT_TIMEOUT_SECONDS = 20.0
+_AVAULT_FETCH_TIMEOUT_SECONDS = 60.0
+# avault exits 70 for an internal failure (bad envelope, decrypt error, store error)
+# before any delivery side effect — distinct from a delivered child's own exit code.
+_AVAULT_INTERNAL_ERROR_CODE = 70
+
+
+class AvaultError(Exception):
+    """An ``avault`` invocation failed. Messages never carry secret material —
+    avault is designed to keep secrets out of its stdout/stderr and errors."""
+
+
+def _avault_detail(proc: "subprocess.CompletedProcess") -> str:
+    """Best-effort, secret-free detail from a failed avault run (its stderr)."""
+    raw = proc.stderr
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    return (raw or "").strip()
+
+
+def _require_avault_path() -> str:
+    path = _resolve_avault_cli_path()
+    if not path:
+        raise AvaultError(backend_t("dependencies.avault.missing"))
+    return path
+
+
+def _run_avault(
+    args: list[str],
+    *,
+    stdin: bytes | None = None,
+    timeout: float = _AVAULT_TIMEOUT_SECONDS,
+) -> "subprocess.CompletedProcess":
+    """Run a capturing one-shot avault command. Bulk blobs go via ``stdin``."""
+    path = _require_avault_path()
+    try:
+        return subprocess.run(
+            [path, *args],
+            input=stdin,
+            capture_output=True,
+            timeout=timeout,
+            env=_command_env_for(path),
+            **isolated_subprocess_kwargs(),
+        )
+    except FileNotFoundError as exc:
+        raise AvaultError("avault binary not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AvaultError("avault timed out") from exc
+
+
+def _envelope_payload(sealed) -> dict:
+    """Serialize a stored envelope for an avault stdin request (no plaintext)."""
+    return {"ciphertext": sealed.ciphertext, "nonce": sealed.nonce, "wrap_meta": sealed.wrap_meta}
+
+
+def avault_seal(name: str, value: bytes):
+    """Seal a value under the machine key via avault; return a :class:`Sealed`.
+
+    ``value`` is piped straight to avault's stdin and never persisted or logged here.
+    """
+    from storage.vault_crypto import Sealed
+
+    proc = _run_avault(["seal", "--name", name], stdin=value)
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault seal failed")
+    try:
+        payload = json.loads(proc.stdout)
+        return Sealed(
+            ciphertext=payload["ciphertext"],
+            nonce=payload["nonce"],
+            wrap_meta=payload["wrap_meta"],
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise AvaultError("avault seal returned malformed output") from exc
+
+
+def avault_deliver_run(secrets: list[dict], command: list[str]) -> int:
+    """Run ``command`` with the secrets injected as env vars, inside avault.
+
+    ``secrets`` is ``[{"name": <secret name>, "env": <env var>, "envelope": <Sealed>}]``.
+    avault decrypts, spawns the child with that env, waits, and zeroizes — the
+    plaintext never returns here. The child inherits this process's stdio so its
+    output passes through; the run-secrets JSON (envelopes only, no plaintext)
+    goes on avault's stdin to stay out of ``ps``. Returns the child's exit code
+    (``128 + signal`` if signalled), or raises :class:`AvaultError` if avault could
+    not start the child.
+    """
+    path = _require_avault_path()
+    payload = json.dumps(
+        [
+            {"name": s["name"], "env": s["env"], "envelope": _envelope_payload(s["envelope"])}
+            for s in secrets
+        ]
+    ).encode("utf-8")
+    try:
+        proc = subprocess.Popen(
+            [path, "deliver", "run", "--", *command],
+            stdin=subprocess.PIPE,
+            env=_command_env_for(path),
+            **isolated_subprocess_kwargs(),
+        )
+    except FileNotFoundError as exc:
+        raise AvaultError("avault binary not found") from exc
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(payload)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        # avault exited before reading stdin (e.g. bad request); fall through to wait()
+        # which surfaces its exit code.
+        pass
+    return proc.wait()
+
+
+def avault_deliver_fetch(name: str, sealed, request: dict) -> dict:
+    """Broker an HTTP request inside avault with the secret injected at egress.
+
+    ``request`` must include ``allowed_hosts`` (avault rejects the target otherwise).
+    Returns ``{"status", "headers", "body"}`` — the response only, never the secret.
+    """
+    body = json.dumps(
+        {"name": name, "envelope": _envelope_payload(sealed), "request": request}
+    ).encode("utf-8")
+    proc = _run_avault(["deliver", "fetch"], stdin=body, timeout=_AVAULT_FETCH_TIMEOUT_SECONDS)
+    # avault exits 0 for 2xx and 1 for a non-2xx HTTP status; both still emit the
+    # response JSON. Any higher code is an avault-level failure (no response).
+    if proc.returncode not in (0, 1):
+        raise AvaultError(_avault_detail(proc) or "avault fetch failed")
+    try:
+        return json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise AvaultError("avault fetch returned malformed output") from exc
+
+
+def avault_deliver_inject(path: str, fmt: str, secrets: list[dict]) -> None:
+    """Render the secrets to a 0600 file at ``path`` (dotenv/json) inside avault.
+
+    ``secrets`` is ``[{"name": <secret name>, "key": <file key>, "envelope": <Sealed>}]``.
+    """
+    body = json.dumps(
+        {
+            "path": str(path),
+            "format": fmt,
+            "secrets": [
+                {"name": s["name"], "key": s["key"], "envelope": _envelope_payload(s["envelope"])}
+                for s in secrets
+            ],
+        }
+    ).encode("utf-8")
+    proc = _run_avault(["deliver", "inject"], stdin=body)
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault inject failed")
+
+
+def avault_key_export(passphrase: str) -> dict:
+    """Export the machine key as a passphrase-wrapped backup blob via avault."""
+    proc = _run_avault(["key", "export"], stdin=passphrase.encode("utf-8"))
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault key export failed")
+    try:
+        return json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise AvaultError("avault key export returned malformed output") from exc
+
+
+def avault_key_import(blob: dict, passphrase: str, *, force: bool = False) -> None:
+    """Restore the machine key from an :func:`avault_key_export` blob via avault."""
+    body = json.dumps({"passphrase": passphrase, "blob": blob}).encode("utf-8")
+    args = ["key", "import"] + (["--force"] if force else [])
+    proc = _run_avault(args, stdin=body)
+    if proc.returncode != 0:
+        raise AvaultError(_avault_detail(proc) or "avault key import failed")
 
 
 def _askill_auto_update_disabled() -> bool:
@@ -3371,7 +3899,7 @@ def reconcile_askill_auto_update() -> dict:
 # Dependencies aggregate + manual install jobs (askill / show runtime)
 # =============================================================================
 
-_ALLOWED_DEP_INSTALLS = {"askill", "show-runtime"}
+_ALLOWED_DEP_INSTALLS = {"askill", "avault", "show-runtime"}
 _STARTUP_DEPENDENCY_RECONCILE_LOCK = threading.Lock()
 _DEFAULT_STARTUP_SHOW_PAGE_PREWARM_LIMIT = 3
 _MAX_STARTUP_SHOW_PAGE_PREWARM_LIMIT = 10
@@ -3398,6 +3926,20 @@ def dependencies_status() -> dict:
             "latest_version": a.get("latest_version"),
             "has_update": a.get("has_update", False),
             "status": a["status"],
+        }
+    )
+
+    av = avault_status()
+    deps.append(
+        {
+            "id": "avault",
+            "kind": "tool",
+            "required": True,
+            "installed": av["installed"],
+            "version": av.get("version"),
+            "latest_version": None,
+            "has_update": False,
+            "status": av["status"],
         }
     )
 
@@ -3520,6 +4062,7 @@ def reconcile_startup_dependencies() -> dict:
         "ok": True,
         "node": {"ok": False, "status": "unknown"},
         "askill": {"ok": False, "status": "unknown"},
+        "avault": {"ok": False, "status": "unknown"},
         "show_runtime": {"ok": False, "status": "unknown"},
     }
     try:
@@ -3529,6 +4072,13 @@ def reconcile_startup_dependencies() -> dict:
             logger.warning("Startup dependency reconcile failed to ensure askill: %s", exc, exc_info=True)
             askill = {"ok": False, "message": str(exc)}
         result["askill"] = askill
+
+        try:
+            avault = ensure_avault_installed(force=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Startup dependency reconcile failed to ensure avault: %s", exc, exc_info=True)
+            avault = {"ok": False, "message": str(exc)}
+        result["avault"] = avault
 
         try:
             from core.show_runtime import get_show_runtime_manager
@@ -3564,7 +4114,11 @@ def reconcile_startup_dependencies() -> dict:
             result["show_runtime"] = {"ok": False, "status": "failed", "reason": str(exc)}
 
         result["duration_ms"] = int((time.monotonic() - started_at) * 1000)
-        result["ok"] = bool(result["askill"].get("ok")) and bool(result["show_runtime"].get("ok"))
+        result["ok"] = (
+            bool(result["askill"].get("ok"))
+            and bool(result["avault"].get("ok"))
+            and bool(result["show_runtime"].get("ok"))
+        )
         return result
     finally:
         _STARTUP_DEPENDENCY_RECONCILE_LOCK.release()
@@ -3605,7 +4159,12 @@ def start_dependency_install_job(dep: str) -> dict:
 
     def _worker() -> None:
         try:
-            result = ensure_askill_installed(force=True) if dep == "askill" else _prepare_show_runtime_job()
+            if dep == "askill":
+                result = ensure_askill_installed(force=True)
+            elif dep == "avault":
+                result = ensure_avault_installed(force=True)
+            else:
+                result = _prepare_show_runtime_job()
             ok = bool(result.get("ok"))
             with _AGENT_INSTALL_JOB_LOCK:
                 current = _AGENT_INSTALL_JOBS.get(job_id)
