@@ -43,11 +43,53 @@ class AgentService:
         agent = self.get(agent_name)
         runtime_key = self._runtime_turn_key(agent, request)
         gate = self._get_turn_gate(runtime_key)
-        await gate.lock.acquire()
+        # Surface the queued 👌 reaction BEFORE acquiring the gate, then promote it
+        # to the running 👀 once the gate is acquired (mirroring how the status
+        # bubble is posted only after the gate). We deliberately do NOT gate this on
+        # gate.lock.locked(): that single-instant check misses a turn that is in
+        # fact queued whenever this message reaches the gate a moment after the
+        # holder did, and was why a queued message could show no 👌 at all. So we
+        # always show 👌 first — if the gate is free, acquire() returns immediately
+        # and promote_reaction_to_running flips 👌→👀 right away (a brief flash); if
+        # it is contended, the 👌 stays for the whole wait. Reaction add/remove is
+        # owned by the processing indicator and is a no-op on platforms / modes
+        # without a reaction indicator (e.g. WeChat, typing-only, avibe Web).
+        indicator = getattr(self.controller, "processing_indicator", None)
+        queued_reaction_shown = False
+        if indicator is not None:
+            try:
+                queued_reaction_shown = bool(await indicator.show_queued_reaction(request))
+            except Exception:
+                logger.debug("Failed to show queued reaction", exc_info=True)
+        try:
+            await gate.lock.acquire()
+        except BaseException:
+            # Cancellation (e.g. SIGTERM / shutdown) while still waiting in the
+            # queue is raised by acquire() OUTSIDE the main try block below, so its
+            # CancelledError handler never runs. Clean up the queued 👌 (and any
+            # eager typing) here so it does not leak permanently on the message.
+            if queued_reaction_shown and indicator is not None:
+                try:
+                    # Pass the request (not the handle) so finish() clears BOTH the
+                    # handle and the flat request.ack_reaction_* fields. finish()
+                    # resolves the handle via request.processing_indicator.
+                    await indicator.finish(request)
+                except Exception:
+                    logger.debug("Failed to clean up queued reaction on cancel", exc_info=True)
+            raise
         gate.token = uuid.uuid4().hex
         gate.backend = agent.name
         gate.runtime_started = False
         self._stamp_runtime_turn(request, runtime_key, gate.token)
+        # The turn truly starts now (gate acquired): flip the queued 👌 to the
+        # running 👀 (or add 👀 directly on the non-busy fast path). Done first so a
+        # non-contended turn barely flashes 👌. Guarded so a reaction failure can
+        # never break the turn.
+        if indicator is not None:
+            try:
+                await indicator.promote_reaction_to_running(request)
+            except Exception:
+                logger.debug("Failed to promote reaction to running", exc_info=True)
         try:
             # INBOUND status chokepoint (one of exactly two — the other is the outbound
             # MessageDispatcher.emit_agent_message). Every turn, every source (chat /

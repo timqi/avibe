@@ -224,6 +224,100 @@ def test_agent_service_serializes_same_runtime_until_terminal_release() -> None:
     asyncio.run(_run())
 
 
+class _RecordingIndicator:
+    """Records the queued/promote/finish reaction calls the gate drives."""
+
+    def __init__(self, log: list[str]):
+        self._log = log
+
+    async def show_queued_reaction(self, _request):
+        self._log.append("show_queued")
+        return True
+
+    async def promote_reaction_to_running(self, _request):
+        self._log.append("promote")
+
+    async def finish(self, _request_or_handle):
+        self._log.append("finish")
+
+
+class _IndicatorController(_Controller):
+    def __init__(self, log: list[str]):
+        super().__init__()
+        self.processing_indicator = _RecordingIndicator(log)
+
+
+def test_agent_service_shows_queued_reaction_then_promotes_on_start() -> None:
+    async def _run():
+        log: list[str] = []
+        controller = _IndicatorController(log)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        first_request = _request("first")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+
+        second = asyncio.create_task(service.handle_message("claude", _request("second")))
+        await asyncio.sleep(0.05)
+        # Every turn shows the queued 👌 before acquiring the gate; only the first
+        # (which already holds the gate) has promoted to 👀 so far. The second is
+        # blocked on acquire() with its 👌 still showing.
+        assert "show_queued" in log
+        assert log.count("promote") == 1
+
+        service.release_runtime_turn(first_request.context)
+        release_first.set()
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+
+        assert log.count("show_queued") == 2  # both turns surface the queued reaction
+        assert log.count("promote") == 2  # both turns promoted when they started
+        assert "finish" not in log  # no cancellation occurred
+
+    asyncio.run(_run())
+
+
+def test_agent_service_cleans_queued_reaction_when_cancelled_while_waiting() -> None:
+    async def _run():
+        log: list[str] = []
+        controller = _IndicatorController(log)
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        release_first = asyncio.Event()
+        agent = _RuntimeAgent(release_first)
+        service.register(agent)
+
+        first_request = _request("first")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+
+        second = asyncio.create_task(service.handle_message("claude", _request("second")))
+        await asyncio.sleep(0.05)
+        assert "show_queued" in log
+
+        # Cancel the queued message while it is still blocked on gate.acquire():
+        # its queued 👌 must be cleaned up (P0.1), and it must never promote.
+        second.cancel()
+        try:
+            await second
+        except asyncio.CancelledError:
+            pass
+
+        assert "finish" in log
+        assert log.count("promote") == 1
+
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+
+    asyncio.run(_run())
+
+
 def test_agent_service_allows_distinct_runtime_keys_in_parallel() -> None:
     async def _run():
         service = AgentService(controller=_Controller())
