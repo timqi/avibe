@@ -201,6 +201,29 @@ class QueuedReactionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await svc.finish(handle)  # cancels the typing keepalive task
         self.assertFalse(handle.typing_indicator_active)
 
+    async def test_promote_falls_back_to_message_when_typing_unsupported(self):
+        # P2 follow-up: a platform with reactions + message but NO typing
+        # (Lark/Feishu). A failed reaction add must fall through to the ack message,
+        # not leave the user with no indicator.
+        im = _FakeIM(add_ok=False)
+        svc = _svc(im)
+        svc._capabilities = lambda ctx: object()
+        svc._mode_supported = lambda caps, mode, ctx: {"typing": False, "message": True}.get(mode, True)
+        started: list = []
+
+        async def _msg(handle, agent_name):
+            started.append(("message", agent_name))
+            handle.ack_message_id = "ack-1"
+            return True
+
+        svc._start_message_indicator = _msg
+        handle = ProcessingIndicatorHandle(context=_ctx(), reaction_indicator_selected=True)
+
+        await svc.promote_reaction_to_running(handle, agent_name="claude")
+        self.assertIsNone(handle.ack_reaction_emoji)  # reaction did not stick
+        self.assertEqual(started, [("message", "claude")])  # fell back to ack message
+        self.assertEqual(handle.ack_message_id, "ack-1")
+
     async def test_request_parallel_fields_synced(self):
         im = _FakeIM()
         svc = _svc(im)

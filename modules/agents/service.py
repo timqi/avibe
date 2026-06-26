@@ -102,7 +102,7 @@ class AgentService:
                     logger.debug("Failed to settle queued reaction", exc_info=True)
             if indicator is not None:
                 try:
-                    await indicator.promote_reaction_to_running(request)
+                    await indicator.promote_reaction_to_running(request, agent_name=agent_name)
                 except Exception:
                     logger.debug("Failed to promote reaction to running", exc_info=True)
             # INBOUND status chokepoint (one of exactly two — the other is the outbound

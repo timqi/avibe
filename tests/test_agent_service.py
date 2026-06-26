@@ -234,7 +234,7 @@ class _RecordingIndicator:
         self._log.append("show_queued")
         return True
 
-    async def promote_reaction_to_running(self, _request):
+    async def promote_reaction_to_running(self, _request, *, agent_name=None):
         self._log.append("promote")
 
     async def finish(self, _request_or_handle):
@@ -435,7 +435,7 @@ def test_gate_released_when_cancelled_during_promote() -> None:
             async def show_queued_reaction(self, _request):
                 return False
 
-            async def promote_reaction_to_running(self, _request):
+            async def promote_reaction_to_running(self, _request, *, agent_name=None):
                 promote_started.set()
                 await block.wait()  # cancel hits here, inside the managed try
 
@@ -489,7 +489,7 @@ def test_queued_reaction_does_not_delay_gate_acquire_fifo() -> None:
                 await block.wait()  # simulate slow Slack/Feishu reaction API
                 return True
 
-            async def promote_reaction_to_running(self, _request):
+            async def promote_reaction_to_running(self, _request, *, agent_name=None):
                 log.append("promote")
 
             async def finish(self, _request_or_handle):

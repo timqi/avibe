@@ -336,12 +336,13 @@ class ProcessingIndicatorService:
             self._sync_reaction_to_request(handle, request)
         return applied
 
-    async def promote_reaction_to_running(self, request_or_handle: Any) -> None:
+    async def promote_reaction_to_running(self, request_or_handle: Any, *, agent_name: Optional[str] = None) -> None:
         """Switch the reaction to the running 👀 when this turn actually starts.
 
         queued 👌 shown -> remove 👌 then add 👀; nothing shown yet (non-busy fast
         path) -> add 👀; already 👀 -> no-op (idempotent). No-op when the reaction
-        indicator is not the selected mode.
+        indicator is not the selected mode. If the 👀 add fails at runtime, fall back
+        through the remaining indicator modes (``agent_name`` labels the ack message).
         """
         handle, request = self._resolve_handle(request_or_handle)
         if not handle.reaction_indicator_selected:
@@ -369,15 +370,19 @@ class ProcessingIndicatorService:
             handle.ack_reaction_message_id = None
             handle.ack_reaction_emoji = None
         applied = await self._start_reaction_indicator(handle, emoji=ACK_REACTION_EMOJI)
-        if not applied and not handle.typing_indicator_active:
-            # The reaction add failed at runtime (e.g. Slack missing reactions scope,
-            # or a transient API error). Because start() deferred the reaction, the
-            # normal mode loop never got to try a lower candidate — fall back to a
-            # typing indicator here so the user still gets a processing ack instead of
-            # none at all (P2). Best-effort and capability-gated.
+        if not applied and not handle.typing_indicator_active and not handle.ack_message_id:
+            # The reaction add failed at runtime (e.g. missing reactions scope or a
+            # transient API error). Because start() deferred the reaction, the normal
+            # mode loop never tried a lower candidate — fall through the remaining
+            # modes here so the user still gets a processing ack instead of none (P2):
+            # typing first when supported, else the ack message (e.g. Lark/Feishu
+            # support reactions + message but NOT typing). Best-effort, capability-gated.
             capabilities = self._capabilities(handle.context)
+            fell_back = False
             if self._mode_supported(capabilities, "typing", handle.context):
-                await self._start_typing_indicator(handle)
+                fell_back = await self._start_typing_indicator(handle)
+            if not fell_back and self._mode_supported(capabilities, "message", handle.context):
+                await self._start_message_indicator(handle, agent_name or "")
         self._sync_reaction_to_request(handle, request)
 
     @staticmethod
