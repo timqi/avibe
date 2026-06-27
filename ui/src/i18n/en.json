@@ -2089,6 +2089,29 @@
     "standard": "Standard",
     "signing": "Signing",
     "secretCount": "{{count}} secrets",
+    "grants": {
+      "title": "Active access",
+      "subtitle": "Grants agents can use right now — revoke to cut access immediately.",
+      "expiresIn": "expires in {{time}}",
+      "expired": "expired",
+      "revoke": "Revoke",
+      "revokeConfirm": "Revoke access to \"{{scope}}\" now? Agents lose it immediately.",
+      "revoked": "Revoked access to {{scope}}",
+      "scope": {
+        "secret": "Secret",
+        "skill": "Skill",
+        "group": "Group"
+      },
+      "dur": {
+        "hm": "{{h}}h {{m}}m",
+        "ms": "{{m}}m {{s}}s",
+        "s": "{{s}}s"
+      },
+      "session": {
+        "bound": "Session-bound",
+        "any": "Any session"
+      }
+    },
     "view": {
       "all": "All",
       "byGroup": "By group"
