@@ -601,6 +601,25 @@
   "apps": {
     "title": "Apps",
     "soon": "Soon",
+    "editor": {
+      "label": "Editor",
+      "desc": "A fast code editor for files on this machine.",
+      "empty": "No file open",
+      "emptyHint": "Open a file from Files to edit it here.",
+      "openInWindow": "Open in editor window",
+      "saveBeforePopOut": "Save before opening in a window",
+      "confirmDiscardClose": "Discard unsaved changes and close this window?",
+      "selectAll": "Select all",
+      "copyAll": "Copy all"
+    },
+    "dock": {
+      "newInstanceHint": "⌘-click for a new window"
+    },
+    "window": {
+      "minimize": "Minimize",
+      "maximize": "Maximize",
+      "restore": "Restore"
+    },
     "fileBrowser": {
       "label": "File Browser",
       "desc": "Browse, view, and edit files on this machine.",

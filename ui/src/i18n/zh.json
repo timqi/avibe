@@ -601,6 +601,25 @@
   "apps": {
     "title": "应用",
     "soon": "即将上线",
+    "editor": {
+      "label": "编辑器",
+      "desc": "本机文件的快速代码编辑器。",
+      "empty": "未打开文件",
+      "emptyHint": "从「文件」中打开一个文件，在这里编辑。",
+      "openInWindow": "在编辑器窗口中打开",
+      "saveBeforePopOut": "请先保存，再在新窗口中打开",
+      "confirmDiscardClose": "放弃未保存的更改并关闭此窗口？",
+      "selectAll": "全选",
+      "copyAll": "全部复制"
+    },
+    "dock": {
+      "newInstanceHint": "⌘ 点击可新建窗口"
+    },
+    "window": {
+      "minimize": "最小化",
+      "maximize": "最大化",
+      "restore": "还原"
+    },
     "fileBrowser": {
       "label": "文件浏览器",
       "desc": "浏览、查看、编辑这台机器上的文件。",

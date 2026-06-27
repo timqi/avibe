@@ -88,6 +88,7 @@ class TerminalService:
         # One entry per session id, each in exactly one phase. Capacity is simply
         # len(self._sessions) — no cross-collection arithmetic to keep in sync.
         self._sessions: dict[str, _Session] = {}
+        self._terminating: set[str] = set()
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task | None = None
         self._closed = False
@@ -204,6 +205,8 @@ class TerminalService:
         async with self._lock:
             self._forget_finished_locked()
             current = self._sessions.get(session_id)
+            if session_id in self._terminating:
+                raise TerminalServiceError("session_opening")
             if current is not None and current.phase in (_Phase.OPENING, _Phase.CLOSING):
                 # Either an open is in progress, or the session is mid-teardown (e.g. the
                 # reaper is awaiting a kill-session). Reject rather than reuse the id — a
@@ -221,7 +224,8 @@ class TerminalService:
             # registers), shutdown must still see this id as persistent and kill its existing
             # tmux session — otherwise the replaced session leaks untracked after `vibe stop`.
             was_persistent = current is not None and current.persistent
-            self._sessions[session_id] = _Session(session_id, _Phase.OPENING, persistent=was_persistent)
+            opening_slot = _Session(session_id, _Phase.OPENING, persistent=was_persistent)
+            self._sessions[session_id] = opening_slot
         registered = False
         spawned: TerminalConnection | None = None
         try:
@@ -269,7 +273,7 @@ class TerminalService:
             )
             async with self._lock:
                 slot = self._sessions.get(session_id)
-                if slot is not None and slot.phase is _Phase.OPENING:
+                if slot is opening_slot and slot.phase is _Phase.OPENING:
                     slot.phase = _Phase.ATTACHED
                     slot.connection = spawned
                     slot.persistent = persistent
@@ -281,33 +285,71 @@ class TerminalService:
             return spawned
         except BaseException:
             if not registered:
-                await self._abandon_open(session_id, spawned)
+                await self._abandon_open(session_id, opening_slot, spawned)
             raise
 
-    async def _abandon_open(self, session_id: str, spawned: TerminalConnection | None) -> None:
-        # Reconcile an open that never registered. Decide first whether our OPENING slot is
-        # still ours: if it is gone (the service shut down, or we were superseded) there is no
-        # one left to track the child, so kill its tmux session for real instead of merely
-        # detaching it — otherwise a terminal opened during `vibe stop`/reload would leave an
-        # orphaned tmux server. If the slot is still ours, just detach and re-track below when
-        # the session survived (a failed reconnect must never lose a live session).
+    async def _abandon_open(
+        self,
+        session_id: str,
+        opening_slot: _Session,
+        spawned: TerminalConnection | None,
+    ) -> None:
+        # Reconcile an open that never registered. The slot object is the open-attempt token:
+        # a same-id slot created later is not ours, so a stale abandon must not remove it or
+        # kill its tmux session by id.
+        terminating_open = False
+        killed_session = False
         async with self._lock:
             slot = self._sessions.get(session_id)
-            ours = slot is not None and slot.phase is _Phase.OPENING
-            if ours:
-                self._sessions.pop(session_id, None)
-        if spawned is not None:
-            await self._teardown_client(spawned, kill_session=not ours)
-        # Re-track only when our slot is still ours AND a tmux session for this id is alive —
-        # which covers a failed reconnect to an existing DETACHED session (its tmux server is
-        # still up) regardless of whether our own child spawned. A session that does not exist
-        # (fresh open whose spawn failed before creating one) is simply dropped.
-        if ours and await _tmux_has_session(session_id):
+            owns_slot = slot is opening_slot and slot.phase in (_Phase.OPENING, _Phase.CLOSING)
+            terminating_open = owns_slot and slot.phase is _Phase.CLOSING
+            slot_missing = slot is None
+        try:
+            kill_spawned_session = slot_missing or terminating_open
+            if spawned is not None:
+                await self._teardown_client(spawned, kill_session=kill_spawned_session)
+                killed_session = kill_spawned_session and spawned.persistent
+            # Re-track only when our slot is still ours AND a tmux session for this id is alive —
+            # which covers a failed reconnect to an existing DETACHED session (its tmux server is
+            # still up) regardless of whether our own child spawned. A session that does not exist
+            # (fresh open whose spawn failed before creating one) is simply dropped.
             async with self._lock:
-                if session_id not in self._sessions:
-                    self._sessions[session_id] = _Session(
-                        session_id, _Phase.DETACHED, persistent=True, detached_at=time.monotonic()
-                    )
+                slot = self._sessions.get(session_id)
+                owns_slot = slot is opening_slot and slot.phase in (_Phase.OPENING, _Phase.CLOSING)
+                current_terminating_open = owns_slot and slot.phase is _Phase.CLOSING
+                terminating_open = terminating_open or current_terminating_open
+            if not owns_slot:
+                return
+            if current_terminating_open:
+                if not killed_session:
+                    await _kill_tmux_session(session_id)
+                    killed_session = True
+                return
+
+            alive = await _tmux_has_session(session_id)
+            needs_terminate_kill = False
+            async with self._lock:
+                slot = self._sessions.get(session_id)
+                if slot is opening_slot and slot.phase is _Phase.CLOSING:
+                    terminating_open = True
+                    needs_terminate_kill = not killed_session
+                elif slot is opening_slot and slot.phase is _Phase.OPENING:
+                    if alive:
+                        opening_slot.phase = _Phase.DETACHED
+                        opening_slot.connection = None
+                        opening_slot.persistent = True
+                        opening_slot.detached_at = time.monotonic()
+                    else:
+                        self._sessions.pop(session_id, None)
+            if needs_terminate_kill:
+                await _kill_tmux_session(session_id)
+                killed_session = True
+        finally:
+            if terminating_open:
+                async with self._lock:
+                    if self._sessions.get(session_id) is opening_slot:
+                        self._sessions.pop(session_id, None)
+                    self._terminating.discard(session_id)
 
     async def close(self, connection: TerminalConnection) -> None:
         async with self._lock:
@@ -323,6 +365,42 @@ class TerminalService:
             await self._teardown_client(connection, kill_session=False)
             return
         await self._finalize_connection(connection)
+
+    async def terminate(self, session_id: str) -> bool:
+        """End a terminal session by id and remove it from capacity accounting.
+
+        Used by windowed terminals whose UI lifetime is intentionally ephemeral. A
+        normal websocket close detaches from tmux for reconnect durability; this path
+        kills the backing session so closing a window frees the backend slot.
+        """
+
+        safe_session_id = sanitize_session_id(session_id)
+        async with self._lock:
+            if safe_session_id in self._terminating:
+                return False
+            slot = self._sessions.get(safe_session_id)
+            tracked = slot is not None
+            self._terminating.add(safe_session_id)
+            terminating_slot = slot
+            connection = slot.connection if slot is not None else None
+            pending_open = slot is not None and slot.phase is _Phase.OPENING
+            if slot is not None:
+                slot.phase = _Phase.CLOSING
+
+        try:
+            if pending_open:
+                return tracked
+            if connection is not None:
+                await self._teardown_client(connection, kill_session=True)
+            else:
+                await _kill_tmux_session(safe_session_id)
+        finally:
+            async with self._lock:
+                if not (pending_open and self._sessions.get(safe_session_id) is terminating_slot):
+                    if terminating_slot is not None and self._sessions.get(safe_session_id) is terminating_slot:
+                        self._sessions.pop(safe_session_id, None)
+                    self._terminating.discard(safe_session_id)
+        return tracked
 
     async def _finalize_connection(self, connection: TerminalConnection) -> None:
         # Detach the client, then settle the CLOSING slot against tmux reality. The slot stays

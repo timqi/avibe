@@ -4,6 +4,7 @@ import { ChevronRight, Download, File as FileIcon, Folder, FolderPlus, Loader2, 
 import clsx from 'clsx';
 
 import { useWorkbenchProjectsTree } from '../../context/WorkbenchProjectsContext';
+import { useWindowManager } from '../../context/WindowManagerContext';
 import { previewKind } from '../../lib/filePreview';
 import {
   contentUrl,
@@ -21,8 +22,8 @@ import {
 } from '../../lib/filesApi';
 import { Button } from '../ui/button';
 
-// Lazy-load the editor so CodeMirror + @codemirror/language-data stay out of the
-// main bundle until a text file is actually opened.
+// Lazy-load the editor so Monaco stays out of the main bundle until a text file
+// is actually opened.
 const FileEditorPane = lazy(() => import('./FileEditorPane').then((m) => ({ default: m.FileEditorPane })));
 
 type Selected = { path: string; name: string; kind: string; mime: string | null; mtime: number | null; size: number | null };
@@ -34,7 +35,10 @@ const MAX_EDIT_BYTES = 1024 * 1024;
 // Whole-machine Finder: favorites rail (pinned projects + OS defaults), a
 // breadcrumb + dir/file list (left), and a content pane (right) that views or
 // edits the selected file. Backend contract: src/lib/filesApi.ts → /api/files/*.
-export const AppsFileBrowserPage: React.FC = () => {
+export const AppsFileBrowserPage: React.FC<{ windowed?: boolean; windowId?: string }> = ({
+  windowed = false,
+  windowId,
+}) => {
   const { t } = useTranslation();
   const { projects } = useWorkbenchProjectsTree();
   const [cwd, setCwd] = useState('');
@@ -139,13 +143,27 @@ export const AppsFileBrowserPage: React.FC = () => {
   const crumbs = cwd ? pathCrumbs(cwd) : [];
 
   return (
-    <div className="flex h-[calc(100dvh-7rem)] min-h-[460px] flex-col gap-3 md:h-[calc(100vh-8rem)]">
-      <div>
-        <h1 className="text-[18px] font-semibold text-foreground">{t('apps.fileBrowser.label')}</h1>
-        <p className="text-[12px] text-muted">{t('apps.fileBrowser.tagline')}</p>
-      </div>
+    <div
+      className={
+        windowed
+          ? 'flex h-full w-full flex-col'
+          : 'flex h-[calc(100dvh-7rem)] min-h-[460px] flex-col gap-3 md:h-[calc(100vh-8rem)]'
+      }
+    >
+      {!windowed && (
+        <div>
+          <h1 className="text-[18px] font-semibold text-foreground">{t('apps.fileBrowser.label')}</h1>
+          <p className="text-[12px] text-muted">{t('apps.fileBrowser.tagline')}</p>
+        </div>
+      )}
 
-      <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-border bg-surface">
+      <div
+        className={
+          windowed
+            ? 'flex min-h-0 flex-1 overflow-hidden bg-surface'
+            : 'flex min-h-0 flex-1 overflow-hidden rounded-xl border border-border bg-surface'
+        }
+      >
         {/* Left: breadcrumb toolbar + favorites + listing */}
         <div className="flex w-full min-w-0 flex-col md:w-[320px] md:border-r md:border-border">
           <div className="flex items-center gap-1.5 border-b border-border px-2.5 py-2">
@@ -283,14 +301,17 @@ export const AppsFileBrowserPage: React.FC = () => {
 
         {/* Right: content pane (desktop) */}
         <div className="hidden min-w-0 flex-1 md:flex">
-          <ContentPane selected={selected} />
+          <ContentPane selected={selected} windowed={windowed} windowId={windowId} />
         </div>
       </div>
 
-      {/* Mobile: content opens below the list when a file is selected */}
+      {/* Mobile: content opens below the list when a file is selected. This pane is
+          md:hidden but still mounted on desktop — and windows only ever render on
+          desktop — so it must NOT take `windowId`, or its (clean) editor's close guard
+          would clobber the visible desktop editor's (dirty) guard for the same window. */}
       {selected && (
         <div className="flex min-h-[50vh] flex-col overflow-hidden rounded-xl border border-border bg-surface md:hidden">
-          <ContentPane selected={selected} />
+          <ContentPane selected={selected} windowed={windowed} />
         </div>
       )}
     </div>
@@ -316,8 +337,13 @@ const FavRow: React.FC<{ icon: React.ReactNode; label: string; active: boolean; 
   </button>
 );
 
-const ContentPane: React.FC<{ selected: Selected | null }> = ({ selected }) => {
+const ContentPane: React.FC<{ selected: Selected | null; windowed: boolean; windowId?: string }> = ({
+  selected,
+  windowed,
+  windowId,
+}) => {
   const { t } = useTranslation();
+  const wm = useWindowManager();
   if (!selected) {
     return (
       <div className="grid flex-1 place-items-center p-6 text-center text-[12.5px] text-muted">
@@ -346,7 +372,25 @@ const ContentPane: React.FC<{ selected: Selected | null }> = ({ selected }) => {
       >
         {/* key by path: remount per file so an in-flight save/load can never apply its
             result to a different file (stale clean/dirty baseline or wrong expected_mtime). */}
-        <FileEditorPane key={selected.path} path={selected.path} filename={selected.name} mtime={selected.mtime} />
+        <FileEditorPane
+          key={selected.path}
+          path={selected.path}
+          filename={selected.name}
+          mtime={selected.mtime}
+          windowId={windowId}
+          // Inside a window, offer to pop the file out into its own Editor window.
+          // Carry the editor's live mtime (it may have saved since this row opened),
+          // not the row's stale metadata, so the new window won't false-conflict.
+          onPopOut={
+            windowed
+              ? (live) =>
+                  wm.openApp('editor', {
+                    title: selected.name,
+                    params: { path: selected.path, filename: selected.name, mtime: live.mtime },
+                  })
+              : undefined
+          }
+        />
       </Suspense>
     );
   }
