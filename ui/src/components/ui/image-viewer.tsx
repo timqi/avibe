@@ -45,6 +45,17 @@ export const ImageViewerProvider: React.FC<{ images: string[]; children: React.R
   // Controls the zoom/pan transform (wired to the desktop +/- buttons). The
   // wrapper is keyed on ``src`` so paging to another image remounts it back to 1x.
   const transformRef = React.useRef<ReactZoomPanPinchRef>(null);
+  // True while/after a pan in the current press, so the trailing click (which may
+  // land on the dark stage after dragging a zoomed image) doesn't close the modal.
+  // Reset on each pointer-down; clicking the empty stage WITHOUT panning closes.
+  const interactedRef = React.useRef(false);
+  // The <img> has pointer-events:none under react-zoom-pan-pinch (the wrapper owns
+  // gestures), so we can't tell "clicked the image" from "clicked the empty stage"
+  // by event target — decide by hit-testing the image's rect in the backdrop click.
+  const imgRef = React.useRef<HTMLImageElement>(null);
+  // The 90vw×90vh zoom stage. A zoomed image's rect overflows it (clipped), so the
+  // close hit-test must also require the click to be inside the visible stage.
+  const stageRef = React.useRef<HTMLDivElement>(null);
 
   const index = src ? images.indexOf(src) : -1;
   const pageable = index >= 0 && images.length > 1;
@@ -88,7 +99,29 @@ export const ImageViewerProvider: React.FC<{ images: string[]; children: React.R
       {src && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6 backdrop-blur-sm"
-          onClick={close}
+          onPointerDown={() => {
+            interactedRef.current = false;
+          }}
+          onClick={(e) => {
+            // A real pan happened this press → don't treat the release as a close.
+            if (interactedRef.current) return;
+            // Keep the viewer open only when the click is on the VISIBLE image:
+            // inside the image rect AND inside the stage. (A zoomed image's rect
+            // overflows the stage; those clipped parts are dark margin → close.)
+            const inside = (rect?: DOMRect) =>
+              !!rect &&
+              e.clientX >= rect.left &&
+              e.clientX <= rect.right &&
+              e.clientY >= rect.top &&
+              e.clientY <= rect.bottom;
+            if (
+              inside(imgRef.current?.getBoundingClientRect()) &&
+              inside(stageRef.current?.getBoundingClientRect())
+            ) {
+              return;
+            }
+            close();
+          }}
           role="dialog"
           aria-modal="true"
         >
@@ -179,10 +212,10 @@ export const ImageViewerProvider: React.FC<{ images: string[]; children: React.R
               pinch-zoom (user-scalable=no, for the iOS keyboard fix), so the
               lightbox provides its own. Mobile: pinch to zoom, drag to pan, double
               tap to toggle. Desktop: wheel to zoom, drag to pan, double-click /
-              the +/- buttons. Keyed on src so paging resets to a fit view. The
-              wrapping div stops a click inside the image area from closing the
-              viewer (the dark backdrop around it still closes on click). */}
-          <div onClick={(e) => e.stopPropagation()}>
+              the +/- buttons. Keyed on src so paging resets to a fit view. Closing
+              by click is decided in the backdrop handler (hit-test the image rect +
+              the pan flag), since the library makes the <img> pointer-events:none. */}
+          <div ref={stageRef}>
             <TransformWrapper
               key={src}
               ref={transformRef}
@@ -191,9 +224,20 @@ export const ImageViewerProvider: React.FC<{ images: string[]; children: React.R
               maxScale={5}
               centerOnInit
               doubleClick={{ mode: 'toggle' }}
+              onPanning={() => {
+                // Set only on ACTUAL movement (not pan-start, which fires on
+                // pointer-down), so a clean tap on the empty stage still closes.
+                interactedRef.current = true;
+              }}
             >
-              <TransformComponent wrapperStyle={{ maxHeight: '90vh', maxWidth: '90vw', cursor: 'grab' }}>
+              {/* The zoom viewport is the whole 90vw×90vh stage, NOT shrunk to the
+                  image box (the #681 bug: a wide-but-short image was boxed in its
+                  letterbox strip, so zooming couldn't grow it into the free height).
+                  The content auto-sizes to the image and centerOnInit centers it in
+                  the stage; zooming scales the image into the full area. */}
+              <TransformComponent wrapperStyle={{ width: '90vw', height: '90vh', cursor: 'grab' }}>
                 <img
+                  ref={imgRef}
                   src={src}
                   alt=""
                   className="max-h-[90vh] max-w-[90vw] rounded-lg object-contain shadow-2xl"
