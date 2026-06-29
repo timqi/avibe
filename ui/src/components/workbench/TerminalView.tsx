@@ -3,7 +3,6 @@ import { useTranslation } from 'react-i18next';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import clsx from 'clsx';
 import { RotateCw } from 'lucide-react';
 
 import { Button } from '../ui/button';
@@ -13,10 +12,21 @@ import { Button } from '../ui/button';
 // frames ({type:"resize",cols,rows}); server sends PTY output as BINARY and
 // {type:"ready"|"exit"} as TEXT. Lazy-loaded by AppsTerminalPage so xterm stays
 // out of the main bundle.
-type Status = 'connecting' | 'ready' | 'closed' | 'disabled' | 'error';
+export type TerminalStatus = 'connecting' | 'ready' | 'closed' | 'disabled' | 'error';
 
 const ENC = new TextEncoder();
 const MAX_BUSY_RETRIES = 3; // auto-retry a transient "busy" (1013) close this many times
+
+// The terminal window is theme-locked to dark (registry lockTheme: a shell is conventionally
+// dark, like a code editor), so xterm carries a fixed dark palette regardless of the global theme.
+const TERMINAL_BG = '#0b0b12';
+const TERMINAL_THEME = {
+  background: TERMINAL_BG,
+  foreground: '#e4e4e7',
+  cursor: '#e4e4e7',
+  cursorAccent: TERMINAL_BG,
+  selectionBackground: 'rgba(148,163,184,0.35)',
+};
 
 // Accessory key bar for phones (their soft keyboards lack these). Each button sends the raw
 // byte sequence the PTY expects; Ctrl is a sticky modifier. Labels go through i18n (the
@@ -38,7 +48,12 @@ function buildWsUrl(sessionId: string): string {
   return `${proto}://${window.location.host}/api/terminal/${encodeURIComponent(sessionId)}`;
 }
 
-export const TerminalView: React.FC<{ sessionId: string; onPersistent?: (persistent: boolean) => void }> = ({ sessionId, onPersistent }) => {
+export const TerminalView: React.FC<{
+  sessionId: string;
+  onPersistent?: (persistent: boolean) => void;
+  /** Report connection status up so the tab bar can show one combined status + persistence chip. */
+  onStatus?: (status: TerminalStatus, exitCode: number | null) => void;
+}> = ({ sessionId, onPersistent, onStatus }) => {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -51,21 +66,30 @@ export const TerminalView: React.FC<{ sessionId: string; onPersistent?: (persist
   // the WS effect (which doesn't depend on the prop) always calls the latest callback.
   const onPersistentRef = useRef(onPersistent);
   onPersistentRef.current = onPersistent;
-  const [status, setStatus] = useState<Status>('connecting');
+  const [status, setStatus] = useState<TerminalStatus>('connecting');
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [reconnectKey, setReconnectKey] = useState(0);
+
+  // Surface connection status to the parent (tab bar). The standalone status row inside the
+  // body was removed — only the terminating states render an in-body overlay (below).
+  const onStatusRef = useRef(onStatus);
+  onStatusRef.current = onStatus;
+  useEffect(() => {
+    onStatusRef.current?.(status, exitCode);
+  }, [status, exitCode]);
 
   useEffect(() => {
     const term = new Terminal({
       fontSize: 13,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
       cursorBlink: true,
-      theme: { background: '#0b0b12' },
+      theme: TERMINAL_THEME,
       allowProposedApi: true,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
     termRef.current = term;
+    const settleTimers: number[] = [];
     const refit = () => {
       const el = containerRef.current;
       // Skip when the container is hidden (a background tab uses display:none → 0×0): fitting to
@@ -79,14 +103,24 @@ export const TerminalView: React.FC<{ sessionId: string; onPersistent?: (persist
         /* container not measured yet */
       }
     };
+    // A single fit can land before BOTH the layout and xterm's own character-cell metrics have
+    // settled. On some browsers (notably Safari) the cell size finalises a frame or two after
+    // open while the CONTAINER box never changes again — so the ResizeObserver never fires to
+    // correct an initial under-fit, and the terminal stays only a few rows tall with the rest of
+    // the window blank ("only the top third renders"). Re-fit across the next couple of frames
+    // plus a short tail of timeouts so the row count converges no matter when metrics settle;
+    // once it's correct, fit() is a no-op.
+    const settle = () => {
+      refit();
+      requestAnimationFrame(() => {
+        refit();
+        requestAnimationFrame(refit);
+      });
+      settleTimers.push(window.setTimeout(refit, 120), window.setTimeout(refit, 360));
+    };
     if (containerRef.current) {
       term.open(containerRef.current);
-      refit();
-      // The window opens with a scale transition (transform doesn't change layout size,
-      // so the container's height is already real) but the first fit can still land before
-      // the panel is laid out — refit on the next frame so xterm uses the FULL height
-      // instead of getting stuck a few rows tall (the "only top half / can't scroll" bug).
-      requestAnimationFrame(refit);
+      settle();
     }
 
     const onData = term.onData((data: string) => {
@@ -124,6 +158,9 @@ export const TerminalView: React.FC<{ sessionId: string; onPersistent?: (persist
             busyRetriesRef.current = 0; // a successful attach resets the transient-retry budget
             setStatus('ready');
             onPersistentRef.current?.(!!msg.persistent);
+            // The shell is live and about to paint its first content — settle the fit again so a
+            // late cell-metric correction doesn't leave the terminal a few rows tall.
+            settle();
           } else if (msg.type === 'exit') {
             setExitCode(typeof msg.code === 'number' ? msg.code : null);
             setStatus('closed');
@@ -158,6 +195,7 @@ export const TerminalView: React.FC<{ sessionId: string; onPersistent?: (persist
 
     return () => {
       if (retryTimerRef.current != null) window.clearTimeout(retryTimerRef.current);
+      for (const id of settleTimers) window.clearTimeout(id);
       ro.disconnect();
       onData.dispose();
       onResize.dispose();
@@ -190,41 +228,43 @@ export const TerminalView: React.FC<{ sessionId: string; onPersistent?: (persist
     termRef.current?.focus();
   };
 
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-[11.5px] text-muted">
-        <span
-          className={clsx(
-            'size-2 shrink-0 rounded-full',
-            status === 'ready' ? 'bg-mint' : status === 'connecting' ? 'bg-amber-400' : 'bg-muted',
-          )}
-        />
-        <span>
-          {t(`apps.terminal.status.${status}`)}
-          {status === 'closed' && exitCode != null ? ` · ${t('apps.terminal.exitCode', { code: exitCode })}` : ''}
-        </span>
-        {(status === 'closed' || status === 'error') && (
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            className="ml-auto h-6 gap-1 px-2 text-[11px]"
-            onClick={() => {
-              busyRetriesRef.current = 0;
-              setReconnectKey((k) => k + 1);
-            }}
-          >
-            <RotateCw className="size-3" /> {t('apps.terminal.reconnect')}
-          </Button>
-        )}
-      </div>
+  const reconnect = () => {
+    busyRetriesRef.current = 0;
+    setReconnectKey((k) => k + 1);
+  };
 
+  return (
+    <div className="flex h-full min-h-0 flex-col" style={{ backgroundColor: TERMINAL_BG }}>
       {status === 'disabled' ? (
         <div className="grid flex-1 place-items-center p-6 text-center text-[12.5px] text-muted">
           <div className="max-w-md">{t('apps.terminal.disabled')}</div>
         </div>
       ) : (
-        <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden bg-[#0b0b12] p-1.5" />
+        <div className="relative min-h-0 flex-1">
+          <div ref={containerRef} className="absolute inset-0 overflow-hidden p-1.5" />
+          {(status === 'closed' || status === 'error') && (
+            // The "connected" status no longer occupies its own row — it lives in the tab bar.
+            // Only the terminating states surface in the body, as a centred overlay that offers
+            // a reconnect (the dimmed last output stays visible underneath).
+            <div className="absolute inset-0 grid place-items-center bg-surface/85 p-6 text-center backdrop-blur-[1px]">
+              <div className="flex flex-col items-center gap-3">
+                <span className="text-[12.5px] text-muted">
+                  {t(`apps.terminal.status.${status}`)}
+                  {status === 'closed' && exitCode != null ? ` · ${t('apps.terminal.exitCode', { code: exitCode })}` : ''}
+                </span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 gap-1.5 px-3 text-[12px]"
+                  onClick={reconnect}
+                >
+                  <RotateCw className="size-3" /> {t('apps.terminal.reconnect')}
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
       )}
 
       {status !== 'disabled' && (

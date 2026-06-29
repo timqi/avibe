@@ -6,6 +6,7 @@ import clsx from 'clsx';
 import { useApi } from '../../context/ApiContext';
 import { apiFetch } from '../../lib/apiFetch';
 import { acquireTerminalSlot, releaseTerminalSlot } from '../../lib/terminalSlots';
+import type { TerminalStatus } from './TerminalView';
 
 // Lazy so xterm.js stays out of the main bundle until a terminal opens.
 const TerminalView = lazy(() => import('./TerminalView').then((m) => ({ default: m.TerminalView })));
@@ -28,7 +29,7 @@ function getSessionId(identity: string | null, key?: string): string {
   }
 }
 
-type Tab = { key: number; slot: number | null };
+type Tab = { key: number; slot: number | null; title?: string };
 
 // DELETE a slot-backed terminal session, then release its slot ONLY on a confirmed teardown
 // (HTTP ok or 404). If the delete failed (expired auth, CSRF/origin rejection, network error, 5xx)
@@ -58,6 +59,20 @@ export const TerminalTabs: React.FC<{ windowed?: boolean }> = ({ windowed = fals
   // Whether sessions actually persist (tmux available) — reported by TerminalView's ready frame.
   // Drives the tab-bar badge so it never falsely promises persistence for a plain-shell fallback.
   const [persistent, setPersistent] = useState(false);
+  // Per-tab connection status (reported by each TerminalView). The tab bar shows the ACTIVE tab's
+  // status merged with the persistence badge into ONE chip — there's no standalone status row.
+  const [statuses, setStatuses] = useState<Record<number, TerminalStatus>>({});
+  // Inline tab rename: the tab being renamed + its draft label (double-click a tab to start).
+  const [editing, setEditing] = useState<{ key: number; value: string } | null>(null);
+  const commitRename = () => {
+    setEditing((cur) => {
+      if (cur) {
+        const v = cur.value.trim();
+        setTabs((ts) => ts.map((x) => (x.key === cur.key ? { ...x, title: v || undefined } : x)));
+      }
+      return null;
+    });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -88,6 +103,12 @@ export const TerminalTabs: React.FC<{ windowed?: boolean }> = ({ windowed = fals
     setActive(tab.key);
   };
   const closeTab = (key: number) => {
+    setStatuses((m) => {
+      if (!(key in m)) return m;
+      const next = { ...m };
+      delete next[key];
+      return next;
+    });
     setTabs((ts) => {
       const tab = ts.find((x) => x.key === key);
       if (tab) disposeTab(tab);
@@ -130,7 +151,7 @@ export const TerminalTabs: React.FC<{ windowed?: boolean }> = ({ windowed = fals
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col bg-surface">
-      {/* Tab bar (iwYIX): tabs + ＋, persistent badge on the right. */}
+      {/* Tab bar (iwYIX): tabs + ＋, combined status + persistence chip on the right. */}
       <div className="flex items-center gap-1 border-b border-border bg-surface-2/70 px-2 py-1">
         <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {tabs.map((tab, i) => (
@@ -141,10 +162,33 @@ export const TerminalTabs: React.FC<{ windowed?: boolean }> = ({ windowed = fals
                 tab.key === active ? 'bg-surface text-foreground shadow-[inset_0_-2px_0_0_var(--mint)]' : 'text-muted hover:bg-foreground/[0.05]',
               )}
             >
-              <button type="button" onClick={() => setActive(tab.key)} className="flex items-center gap-1.5">
-                <SquareTerminal className="size-3.5 text-mint" />
-                {t('apps.terminal.tabTitle', { n: i + 1 })}
-              </button>
+              {editing && editing.key === tab.key ? (
+                <span className="flex items-center gap-1.5">
+                  <SquareTerminal className="size-3.5 shrink-0 text-mint" />
+                  <input
+                    autoFocus
+                    value={editing.value}
+                    onChange={(e) => setEditing({ key: tab.key, value: e.target.value })}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitRename();
+                      else if (e.key === 'Escape') setEditing(null);
+                    }}
+                    onBlur={commitRename}
+                    className="w-20 bg-transparent text-[12px] text-foreground focus:outline-none"
+                  />
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setActive(tab.key)}
+                  onDoubleClick={() => setEditing({ key: tab.key, value: tab.title ?? t('apps.terminal.tabTitle', { n: i + 1 }) })}
+                  title={t('apps.terminal.renameHint')}
+                  className="flex items-center gap-1.5"
+                >
+                  <SquareTerminal className="size-3.5 text-mint" />
+                  {tab.title ?? t('apps.terminal.tabTitle', { n: i + 1 })}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => closeTab(tab.key)}
@@ -165,11 +209,32 @@ export const TerminalTabs: React.FC<{ windowed?: boolean }> = ({ windowed = fals
             <Plus className="size-3.5" strokeWidth={2.5} />
           </button>
         </div>
-        {persistent && (
-          <span className="shrink-0 rounded-full border border-mint/30 bg-mint/[0.08] px-2 py-0.5 text-[10px] font-medium text-mint">
-            {t('apps.terminal.persistent')}
-          </span>
-        )}
+        {/* One chip merges connection status + persistence (Alex: "connected" must not take its
+            own row). Connected + tmux-backed shows the persistence label with a green dot; else it
+            shows the connection status. Terminating states also get a reconnect inside the body. */}
+        {(() => {
+          const st = statuses[active] ?? 'connecting';
+          const persistentReady = persistent && st === 'ready';
+          const dotClass =
+            st === 'ready'
+              ? 'bg-mint'
+              : st === 'connecting'
+                ? 'bg-amber-400'
+                : st === 'closed' || st === 'error'
+                  ? 'bg-destructive'
+                  : 'bg-muted';
+          return (
+            <span
+              className={clsx(
+                'flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-medium',
+                persistentReady ? 'border-mint/30 bg-mint/[0.08] text-mint' : 'border-border bg-surface text-muted',
+              )}
+            >
+              <span className={clsx('size-1.5 rounded-full', dotClass)} />
+              {persistentReady ? t('apps.terminal.persistent') : t(`apps.terminal.status.${st}`)}
+            </span>
+          );
+        })()}
       </div>
 
       {/* Panels: all tabs stay mounted so switching preserves each shell; hidden ones use
@@ -181,7 +246,11 @@ export const TerminalTabs: React.FC<{ windowed?: boolean }> = ({ windowed = fals
             <div key={tab.key} className={clsx('absolute inset-0', tab.key === active ? 'block' : 'hidden')}>
               {sid == null ? loading : (
                 <Suspense fallback={loading}>
-                  <TerminalView sessionId={sid} onPersistent={setPersistent} />
+                  <TerminalView
+                    sessionId={sid}
+                    onPersistent={setPersistent}
+                    onStatus={(s) => setStatuses((m) => (m[tab.key] === s ? m : { ...m, [tab.key]: s }))}
+                  />
                 </Suspense>
               )}
             </div>

@@ -32,6 +32,11 @@ export const AppWindow: React.FC<{ win: WindowInstance; layerWidth: number; laye
   // CSS owns the timing). Minimizing is a pure mounted hide (see className) so the
   // window body — terminal session, editor buffer — stays alive and intact.
   const [exitKind, setExitKind] = useState<'close' | null>(null);
+  // Animate window GEOMETRY (maximize/restore) but NOT during a drag/resize, which must track the
+  // pointer instantly. `dragging` is state (not a ref) so the transition is enabled in the SAME render
+  // that changes the bounds — otherwise the geometry jumps before the transition class arrives and
+  // maximize/restore don't animate at all.
+  const [dragging, setDragging] = useState(false);
 
   // Keep a visible window reachable when the geometry around it changes without a
   // drag: the layer shrinking, or the window being restored / un-maximized after the
@@ -72,6 +77,7 @@ export const AppWindow: React.FC<{ win: WindowInstance; layerWidth: number; laye
     // titlebar/handle stops propagation, so the root's own focus handler won't run.
     rootRef.current?.focus({ preventScroll: true });
     draggingRef.current = true;
+    setDragging(true);
     const startX = e.clientX;
     const startY = e.clientY;
     const start = { ...win.bounds };
@@ -88,6 +94,7 @@ export const AppWindow: React.FC<{ win: WindowInstance; layerWidth: number; laye
     };
     const onUp = () => {
       draggingRef.current = false;
+      setDragging(false);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
@@ -128,6 +135,10 @@ export const AppWindow: React.FC<{ win: WindowInstance; layerWidth: number; laye
       // Keyboard chords resolve their target window from the DOM-focused element via
       // this id, so they act on the window you're actually typing in (not just the top).
       data-window-id={win.id}
+      // Per-app theme: the File Browser follows the global light/dark; the Editor and Terminal
+      // lock to dark (VS Code-style) via their registry `lockTheme`. `data-theme` re-cascades that
+      // token set to this window's subtree; an omitted (undefined) value inherits the global theme.
+      data-theme={def.lockTheme}
       // Minimized windows stay mounted (to preserve their body state) but go fully
       // inert: hidden from assistive tech, out of the tab order, non-interactive —
       // and React/the browser moves focus out automatically.
@@ -152,12 +163,19 @@ export const AppWindow: React.FC<{ win: WindowInstance; layerWidth: number; laye
       }}
       className={clsx(
         'group/win absolute flex flex-col overflow-hidden border bg-surface-2 outline-none',
-        'origin-center transition-[transform,opacity] duration-200 ease-out',
+        // Minimize shrinks toward the bottom-left (where the Dock lives) for a macOS-like genie;
+        // otherwise scale from center for the open/close keyframe.
+        win.minimized ? 'origin-bottom-left' : 'origin-center',
+        // Geometry animates (maximize/restore) except during a drag/resize, which must track the
+        // pointer instantly.
+        dragging
+          ? 'transition-[transform,opacity] duration-200 ease-out'
+          : 'transition-[left,top,width,height,transform,opacity] duration-200 ease-out',
         win.maximized ? 'rounded-none' : 'rounded-xl',
         exitKind === 'close' ? 'animate-appwindow-out' : 'animate-appwindow-in',
-        // Minimize = mounted hide: the body stays alive (terminal/editor state
-        // preserved) while the window scales away and stops taking pointer events.
-        win.minimized ? 'pointer-events-none scale-90 opacity-0' : 'pointer-events-auto',
+        // Minimize = mounted hide: the body stays alive (terminal/editor state preserved) while the
+        // window scales away toward the Dock and stops taking pointer events.
+        win.minimized ? 'pointer-events-none scale-[0.18] opacity-0' : 'pointer-events-auto',
         focused
           ? 'border-border-strong shadow-[0_28px_60px_-12px_rgba(0,0,0,0.7)]'
           : 'border-border shadow-[0_16px_40px_-16px_rgba(0,0,0,0.6)]',
