@@ -122,6 +122,13 @@ export function pathCrumbs(path: string): { label: string; path: string }[] {
   return out;
 }
 
+// The parent directory of a path, Windows-aware (reuses pathCrumbs' separator handling) so the
+// editor opens its explorer on the right root for POSIX, Windows drive, and UNC paths alike.
+export function parentDir(path: string): string {
+  const crumbs = pathCrumbs(path);
+  return crumbs.length >= 2 ? crumbs[crumbs.length - 2].path : path;
+}
+
 export async function listDir(path: string, showHidden = false): Promise<FsListing> {
   const res = await apiFetch(
     `/api/files/list?path=${encodeURIComponent(path)}&show_hidden=${showHidden ? '1' : '0'}`,
@@ -135,6 +142,27 @@ export async function fileMeta(path: string): Promise<FsMeta> {
 
 export function contentUrl(path: string, download = false): string {
   return `/api/files/content?path=${encodeURIComponent(path)}${download ? '&download=1' : ''}`;
+}
+
+// Trigger a file download via a programmatic anchor click rather than window.open. An anchor
+// download is not a popup, so — unlike window.open('_blank') — it isn't popup-blocked and survives
+// an awaited metadata recheck without losing the click's user activation (Safari/iOS). The backend's
+// Content-Disposition (download=1) names the file and forces the save in-place.
+export function downloadFile(path: string): void {
+  const a = document.createElement('a');
+  a.href = contentUrl(path, true);
+  a.rel = 'noopener';
+  // target=_blank: if remote-auth expired, /content 302-redirects to the Cloud login — that
+  // cross-origin redirect would otherwise replace the SPA in this tab. Sending it to a new context
+  // keeps the app intact (a real attachment still downloads in-place, so no stray tab opens).
+  a.target = '_blank';
+  // download attr: keep this a download even if the server returns a JSON error (file removed /
+  // permission) instead of an attachment, so the SPA is never navigated to the error body.
+  a.download = '';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 export async function readText(path: string): Promise<string> {
@@ -157,11 +185,14 @@ export async function writeFile(
   path: string,
   content: string,
   expectedMtime?: number | null,
+  // create_only: backend refuses (errors.exists) if the path already exists, checked atomically
+  // under its per-path write lock — used by "New File" so a name typo can never clobber a file.
+  createOnly = false,
 ): Promise<{ ok: true; mtime: number }> {
   const res = await apiFetch('/api/files/write', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, content, expected_mtime: expectedMtime ?? undefined }),
+    body: JSON.stringify({ path, content, expected_mtime: expectedMtime ?? undefined, create_only: createOnly || undefined }),
   });
   return parse<{ ok: true; mtime: number }>(res);
 }

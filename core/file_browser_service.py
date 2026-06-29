@@ -517,7 +517,9 @@ def _write_lock_for(path: Path) -> threading.Lock:
         return lock
 
 
-def write_file(raw_path: str, content: str, *, expected_mtime: float | None = None) -> dict[str, Any]:
+def write_file(
+    raw_path: str, content: str, *, expected_mtime: float | None = None, create_only: bool = False
+) -> dict[str, Any]:
     if not isinstance(content, str):
         raise FileBrowserError("invalid_content", "Content must be UTF-8 text", 400)
     data = content.encode("utf-8")
@@ -551,6 +553,37 @@ def write_file(raw_path: str, content: str, *, expected_mtime: float | None = No
                 raise FileBrowserError("is_symlink", "Refusing to write through a symlink", 400)
             if target.exists() and not target.is_file():
                 raise FileBrowserError("not_file", "Path is not a regular file", 400)
+            # create_only ("New File"): create the final path atomically with O_EXCL — no temp +
+            # replace, so it can never overwrite a file another writer/move/external process slipped
+            # in. O_EXCL fails outright if the path already exists.
+            if create_only:
+                try:
+                    excl_fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                except FileExistsError as exc:
+                    raise ConflictError("exists", "Path already exists") from exc
+                except PermissionError as exc:
+                    raise FileBrowserError("permission_denied", "Permission denied", 403) from exc
+                except OSError as exc:
+                    raise FileBrowserError("fs_error", str(exc), 400) from exc
+                created_ino = os.fstat(excl_fd).st_ino
+                try:
+                    with os.fdopen(excl_fd, "wb") as handle:
+                        handle.write(data)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except OSError as exc:
+                    # Remove the partial file we created so a retry isn't blocked by a stale
+                    # `exists` — but ONLY if the path still resolves to OUR inode, so we never delete
+                    # a file an external writer slipped in between the failure and here (mirrors the
+                    # hard-link rollback guard).
+                    try:
+                        if os.stat(target).st_ino == created_ino:
+                            os.unlink(target)
+                    except OSError:
+                        pass
+                    raise FileBrowserError("fs_error", str(exc), 400) from exc
+                _fsync_dir(parent)
+                return {"ok": True, "mtime": _mtime_seconds(target.stat())}
             fd = -1
             temp_name = ""
             try:

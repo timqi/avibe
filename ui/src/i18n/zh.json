@@ -16,6 +16,7 @@
     "configure": "配置",
     "cancel": "取消",
     "clear": "清除",
+    "retry": "重试",
     "loading": "加载中...",
     "saving": "保存中...",
     "saved": "已保存",
@@ -163,7 +164,9 @@
       "label": "自定义链接",
       "hint": "3–64 位，可用字母、数字、短横线或下划线，需唯一。",
       "placeholder": "my-page",
-      "toast": { "saved": "自定义链接已更新" },
+      "toast": {
+        "saved": "自定义链接已更新"
+      },
       "errors": {
         "taken": "这个自定义链接已被占用，换一个。",
         "invalid": "请使用 3–64 位字母、数字、短横线或下划线，且首尾为字母或数字。",
@@ -604,6 +607,19 @@
     "editor": {
       "label": "编辑器",
       "desc": "本机文件的快速代码编辑器。",
+      "explorer": "资源管理器",
+      "noFolder": "未打开文件夹",
+      "welcomeSub": "本机文件的代码编辑器 · VS Code 内核",
+      "start": "开始",
+      "recent": "最近",
+      "noRecent": "暂无最近打开的目录",
+      "openFolder": "打开文件夹…",
+      "openFolderPrompt": "要打开的文件夹路径",
+      "browseFiles": "浏览文件…",
+      "selectFileHint": "从左侧资源管理器选择文件进行编辑",
+      "lineCol": "行 {{line}}，列 {{col}}",
+      "spaces": "空格：{{n}}",
+      "plainText": "纯文本",
       "empty": "未打开文件",
       "emptyHint": "从「文件」中打开一个文件，在这里编辑。",
       "openInWindow": "在编辑器窗口中打开",
@@ -613,7 +629,9 @@
       "copyAll": "全部复制"
     },
     "dock": {
-      "newInstanceHint": "⌘ 点击可新建窗口"
+      "newInstanceHint": "⌘ 点击可新建窗口",
+      "newWindow": "新建窗口",
+      "showAllWindows": "显示所有窗口"
     },
     "window": {
       "minimize": "最小化",
@@ -633,6 +651,15 @@
       "refresh": "刷新",
       "newFolder": "新建文件夹",
       "newFolderPrompt": "新文件夹名称",
+      "newFile": "新建文件",
+      "newFilePrompt": "新文件名称",
+      "searchPlaceholder": "搜索",
+      "colName": "名称",
+      "colSize": "大小",
+      "colModified": "修改时间",
+      "favorites": "收藏",
+      "noMatches": "无匹配项",
+      "itemCount": "{{count}} 项",
       "projects": "项目",
       "system": "系统",
       "showHidden": "显示隐藏文件",
@@ -666,6 +693,8 @@
       "placeholder": "终端将在第二阶段上线:真实 shell,配 tmux 持久化会话。",
       "tagline": "在浏览器里跑真实 shell。",
       "persistent": "持久会话",
+      "tabTitle": "终端 {{n}}",
+      "newTab": "新建标签",
       "reconnect": "重新连接",
       "exitCode": "退出码 {{code}}",
       "disabled": "终端不可用:可能在服务端被关掉(VIBE_UI_ENABLE_TERMINAL=0),或当前会话未获授权。",
@@ -692,7 +721,7 @@
   "appShell": {
     "title": "Avibe OS",
     "subtitle": "Agent操作系统 · 工作台",
-    "workspaceLabel": "工作区",
+    "workspaceLabel": "设置",
     "moreSettings": "更多设置",
     "openControlPanel": "设置",
     "backToWorkbench": "返回工作台",

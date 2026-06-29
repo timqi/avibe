@@ -16,6 +16,7 @@
     "configure": "Configure",
     "cancel": "Cancel",
     "clear": "Clear",
+    "retry": "Retry",
     "loading": "Loading...",
     "saving": "Saving...",
     "saved": "Saved",
@@ -163,7 +164,9 @@
       "label": "Custom link",
       "hint": "3–64 letters, numbers, dash, or underscore. Must be unique.",
       "placeholder": "my-page",
-      "toast": { "saved": "Custom link updated" },
+      "toast": {
+        "saved": "Custom link updated"
+      },
       "errors": {
         "taken": "That custom link is already taken. Pick another.",
         "invalid": "Use 3–64 letters, numbers, dash, or underscore, starting and ending with a letter or number.",
@@ -558,9 +561,9 @@
     "paired": "Pairing",
     "connector": "Remote access",
     "flowTitle": "Setup steps",
-    "flowStep1": "Open <console>avibe.bot</console>, sign in, click \u201CPair an Avibe\u201D, and claim your own domain.",
+    "flowStep1": "Open <console>avibe.bot</console>, sign in, click “Pair an Avibe”, and claim your own domain.",
     "flowStep2": "Copy the pairing key shown there.",
-    "flowStep3": "Paste it here to finish pairing \u2014 then reach Avibe from anywhere.",
+    "flowStep3": "Paste it here to finish pairing — then reach Avibe from anywhere.",
     "actionNeeded": "Action needed",
     "ready": "Ready",
     "stateNeedsAttention": "Needs attention"
@@ -604,6 +607,19 @@
     "editor": {
       "label": "Editor",
       "desc": "A fast code editor for files on this machine.",
+      "explorer": "Explorer",
+      "noFolder": "No folder opened",
+      "welcomeSub": "A code editor for files on this machine · VS Code engine",
+      "start": "Start",
+      "recent": "Recent",
+      "noRecent": "No recent folders",
+      "openFolder": "Open Folder…",
+      "openFolderPrompt": "Folder path to open",
+      "browseFiles": "Browse Files…",
+      "selectFileHint": "Select a file from the explorer to edit",
+      "lineCol": "Ln {{line}}, Col {{col}}",
+      "spaces": "Spaces: {{n}}",
+      "plainText": "Plain Text",
       "empty": "No file open",
       "emptyHint": "Open a file from Files to edit it here.",
       "openInWindow": "Open in editor window",
@@ -613,7 +629,9 @@
       "copyAll": "Copy all"
     },
     "dock": {
-      "newInstanceHint": "⌘-click for a new window"
+      "newInstanceHint": "⌘-click for a new window",
+      "newWindow": "New Window",
+      "showAllWindows": "Show All Windows"
     },
     "window": {
       "minimize": "Minimize",
@@ -631,8 +649,17 @@
       "download": "Download",
       "tooLarge": "This file is too large to edit in the browser. Download it to view it instead.",
       "refresh": "Refresh",
-      "newFolder": "New folder",
+      "newFolder": "New Folder",
       "newFolderPrompt": "New folder name",
+      "newFile": "New File",
+      "newFilePrompt": "New file name",
+      "searchPlaceholder": "Search",
+      "colName": "Name",
+      "colSize": "Size",
+      "colModified": "Modified",
+      "favorites": "Favorites",
+      "noMatches": "No matches",
+      "itemCount": "{{count}} items",
       "projects": "Projects",
       "system": "System",
       "showHidden": "Show hidden files",
@@ -666,6 +693,8 @@
       "placeholder": "The Terminal arrives in Phase 2: a real shell with tmux-backed persistent sessions.",
       "tagline": "A real shell, in your browser.",
       "persistent": "Persistent",
+      "tabTitle": "Shell {{n}}",
+      "newTab": "New tab",
       "reconnect": "Reconnect",
       "exitCode": "exit {{code}}",
       "disabled": "Terminal unavailable: it may be turned off on the server (VIBE_UI_ENABLE_TERMINAL=0) or this session isn't authorized.",
@@ -692,7 +721,7 @@
   "appShell": {
     "title": "Avibe OS",
     "subtitle": "Agent OS · Workbench",
-    "workspaceLabel": "Workspace",
+    "workspaceLabel": "Settings",
     "moreSettings": "More Settings",
     "openControlPanel": "Settings",
     "backToWorkbench": "Back to Workbench",

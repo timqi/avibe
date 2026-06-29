@@ -38,7 +38,7 @@ function buildWsUrl(sessionId: string): string {
   return `${proto}://${window.location.host}/api/terminal/${encodeURIComponent(sessionId)}`;
 }
 
-export const TerminalView: React.FC<{ sessionId: string }> = ({ sessionId }) => {
+export const TerminalView: React.FC<{ sessionId: string; onPersistent?: (persistent: boolean) => void }> = ({ sessionId, onPersistent }) => {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -46,8 +46,12 @@ export const TerminalView: React.FC<{ sessionId: string }> = ({ sessionId }) => 
   const ctrlStickyRef = useRef(false);
   const busyRetriesRef = useRef(0);
   const retryTimerRef = useRef<number | null>(null);
+  // Report actual session persistence (from the backend 'ready' frame) up to the tab bar, so its
+  // badge reflects reality — tmux-backed = persistent, plain-shell fallback = not. Held in a ref so
+  // the WS effect (which doesn't depend on the prop) always calls the latest callback.
+  const onPersistentRef = useRef(onPersistent);
+  onPersistentRef.current = onPersistent;
   const [status, setStatus] = useState<Status>('connecting');
-  const [persistent, setPersistent] = useState(false);
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [reconnectKey, setReconnectKey] = useState(0);
 
@@ -62,13 +66,27 @@ export const TerminalView: React.FC<{ sessionId: string }> = ({ sessionId }) => 
     const fit = new FitAddon();
     term.loadAddon(fit);
     termRef.current = term;
-    if (containerRef.current) {
-      term.open(containerRef.current);
+    const refit = () => {
+      const el = containerRef.current;
+      // Skip when the container is hidden (a background tab uses display:none → 0×0): fitting to
+      // zero would send a tiny {cols,rows} resize to the PTY and disrupt full-screen programs /
+      // shells running in inactive tabs. The ResizeObserver fires again with real dimensions when
+      // the tab is shown.
+      if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
       try {
         fit.fit();
       } catch {
         /* container not measured yet */
       }
+    };
+    if (containerRef.current) {
+      term.open(containerRef.current);
+      refit();
+      // The window opens with a scale transition (transform doesn't change layout size,
+      // so the container's height is already real) but the first fit can still land before
+      // the panel is laid out — refit on the next frame so xterm uses the FULL height
+      // instead of getting stuck a few rows tall (the "only top half / can't scroll" bug).
+      requestAnimationFrame(refit);
     }
 
     const onData = term.onData((data: string) => {
@@ -93,7 +111,7 @@ export const TerminalView: React.FC<{ sessionId: string }> = ({ sessionId }) => 
     wsRef.current = ws;
     ws.onopen = () => {
       try {
-        fit.fit();
+        refit();
       } catch {
         /* noop */
       }
@@ -105,7 +123,7 @@ export const TerminalView: React.FC<{ sessionId: string }> = ({ sessionId }) => 
           if (msg.type === 'ready') {
             busyRetriesRef.current = 0; // a successful attach resets the transient-retry budget
             setStatus('ready');
-            setPersistent(!!msg.persistent);
+            onPersistentRef.current?.(!!msg.persistent);
           } else if (msg.type === 'exit') {
             setExitCode(typeof msg.code === 'number' ? msg.code : null);
             setStatus('closed');
@@ -135,13 +153,7 @@ export const TerminalView: React.FC<{ sessionId: string }> = ({ sessionId }) => 
       );
     };
 
-    const ro = new ResizeObserver(() => {
-      try {
-        fit.fit();
-      } catch {
-        /* noop */
-      }
-    });
+    const ro = new ResizeObserver(() => refit());
     if (containerRef.current) ro.observe(containerRef.current);
 
     return () => {
@@ -191,9 +203,6 @@ export const TerminalView: React.FC<{ sessionId: string }> = ({ sessionId }) => 
           {t(`apps.terminal.status.${status}`)}
           {status === 'closed' && exitCode != null ? ` · ${t('apps.terminal.exitCode', { code: exitCode })}` : ''}
         </span>
-        {status === 'ready' && persistent && (
-          <span className="rounded-full border border-border px-1.5 text-[10px]">{t('apps.terminal.persistent')}</span>
-        )}
         {(status === 'closed' || status === 'error') && (
           <Button
             type="button"
@@ -219,7 +228,9 @@ export const TerminalView: React.FC<{ sessionId: string }> = ({ sessionId }) => 
       )}
 
       {status !== 'disabled' && (
-        <div className="flex gap-1 overflow-x-auto border-t border-border bg-surface px-2 py-1.5 md:hidden">
+        // The accessory key bar shows on desktop too (design iwYIX): quick esc/tab/ctrl/arrows
+        // without leaving the window. On phones it's essential (soft keyboards lack these keys).
+        <div className="flex gap-1 overflow-x-auto border-t border-border bg-surface px-2 py-1.5">
           {KEYS.map((k) => (
             <button
               key={k.labelKey}

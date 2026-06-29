@@ -5359,6 +5359,7 @@ async def files_write(starlette_request: FastAPIRequest):
                     payload.get("path") or "",
                     payload.get("content"),
                     expected_mtime=payload.get("expected_mtime"),
+                    create_only=_parse_explicit_bool(payload.get("create_only")),
                 )
             )
         except Exception as exc:

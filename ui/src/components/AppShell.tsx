@@ -13,7 +13,7 @@ import { ThemeToggle } from './ThemeToggle';
 import { VersionBadge } from './VersionBadge';
 import { WorkbenchSidebar } from './workbench/WorkbenchSidebar';
 import { AppsLauncher } from './AppsLauncher';
-import { WindowManagerProvider } from '../context/WindowManagerContext';
+import { WindowManagerProvider, useWindowManager } from '../context/WindowManagerContext';
 import { WindowLayer } from './apps/WindowLayer';
 import { NewSessionSheet } from './workbench/NewSessionSheet';
 import { SearchPalette } from './workbench/search/SearchPalette';
@@ -207,6 +207,30 @@ const MobileTabBar: React.FC<{ items: ShellNavItem[]; center?: CenterButton }> =
   );
 };
 
+// When a window is MAXIMIZED it covers the sidebar (design If1Tt), so the in-sidebar Apps
+// launcher is hidden behind it. This floats a second Apps launcher at the bottom-left, ABOVE the
+// window layer, so the Dock stays reachable in full-screen — exactly the "Apps button floats on
+// top" of If1Tt. It must live OUTSIDE the aside: the aside is `position: fixed`, which always
+// forms a stacking context, so anything inside it can't rise above the window layer. Desktop-only
+// (windows are md+). Only one Apps launcher is ever visible — the sidebar's is covered when this shows.
+const FloatingApps: React.FC = () => {
+  const { windows } = useWindowManager();
+  const anyMaximized = windows.some((w) => w.maximized && !w.minimized);
+  if (!anyMaximized) return null;
+  return (
+    // data-theme="dark" so the floating Dock popover matches the always-dark windows it sits over.
+    // A solid rounded backing + shadow makes it read as a clean floating Dock launcher (design
+    // If1Tt shows the pill clean) so the maximized app's content behind it — the editor activity
+    // bar, the file-browser rail — doesn't bleed through the translucent pill.
+    <div
+      data-theme="dark"
+      className="fixed bottom-5 left-4 z-30 hidden w-[184px] rounded-full bg-surface-3 shadow-[0_10px_34px_-8px_rgba(0,0,0,0.7)] md:flex"
+    >
+      <AppsLauncher />
+    </div>
+  );
+};
+
 export const AppShell: React.FC = () => {
   const { t } = useTranslation();
   const { status } = useStatus();
@@ -374,7 +398,11 @@ export const AppShell: React.FC = () => {
     // Desktop: normal document flow.
     <WindowManagerProvider>
     <div className="flex h-[var(--app-shell-h)] flex-col overflow-hidden bg-background text-foreground md:block md:h-auto md:min-h-screen md:overflow-visible">
-      <aside className="fixed inset-y-0 left-0 z-30 hidden w-[240px] flex-col border-r border-border bg-surface md:flex">
+      {/* No z-index on the aside itself: a maximized window (window layer, z-20) must be able to
+          cover the sidebar nav (design If1Tt). Keeping it un-stacked (z-auto, no stacking context)
+          lets the Apps launcher inside escape to its own z-30 and float on top while the rest of the
+          sidebar stays below the window layer. */}
+      <aside className="fixed inset-y-0 left-0 hidden w-[240px] flex-col border-r border-border bg-surface md:flex">
         <div className="flex h-full flex-col justify-between gap-6 px-4 py-5">
           {/* Top: Brand + Workspace label + Nav list */}
           {/* Workbench mounts a search field right under the brand, so use the
@@ -408,8 +436,10 @@ export const AppShell: React.FC = () => {
 
           {/* Bottom (design.pen NbPMq): row 1 = [Apps | Settings] two equal
               buttons; row 2 = [version … run-dot]. Admin keeps its quick-toggles
-              + hostname between the rows. */}
-          <div className="flex flex-col gap-3">
+              + hostname between the rows. Only the Apps launcher floats above a
+              maximized window (it carries its own z-30); Settings / version / run-dot
+              stay at the sidebar's level and are covered by a maximized window (If1Tt). */}
+          <div className="relative flex flex-col gap-3">
             {/* Row 1 — Apps (Dock trigger, left) paired with the mode switch
                 (right). The Dock rises ABOVE the Apps button, clear of the
                 centered Chat composer. Workbench → Settings (control panel);
@@ -419,10 +449,11 @@ export const AppShell: React.FC = () => {
               {shellMode === 'workbench' ? (
                 <Link
                   to="/admin/dashboard"
-                  className="group flex flex-1 items-center justify-center gap-2 rounded-lg border border-border-strong px-3 py-2.5 text-[13px] font-medium text-foreground transition-colors hover:bg-foreground/[0.04]"
+                  title={t('appShell.openControlPanel')}
+                  aria-label={t('appShell.openControlPanel')}
+                  className="group flex w-11 shrink-0 items-center justify-center rounded-lg border border-border-strong text-foreground transition-colors hover:bg-foreground/[0.04]"
                 >
-                  <Settings className="size-4 text-muted group-hover:text-foreground" />
-                  <span>{t('appShell.openControlPanel')}</span>
+                  <Settings className="size-[18px] text-muted group-hover:text-foreground" />
                 </Link>
               ) : (
                 <Link
@@ -453,18 +484,18 @@ export const AppShell: React.FC = () => {
               </div>
             )}
 
-            {/* Row 2 — version + a compact run-state dot at the very bottom. The
-                green/grey dot conveys running vs stopped (hover shows the text). */}
-            <div className="flex items-center gap-2">
+            {/* Row 2 (design bVke5) — run-state dot + label on the LEFT, version on the RIGHT. */}
+            <div className="flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 text-[11px] font-medium text-muted">
+                <span
+                  className={clsx(
+                    'size-2 shrink-0 rounded-full',
+                    isRunning ? 'bg-mint shadow-[0_0_8px_rgba(91,255,160,0.9)]' : 'bg-muted'
+                  )}
+                />
+                {isRunning ? t('common.running') : t('common.stopped')}
+              </span>
               <VersionBadge openUpward />
-              <span
-                title={isRunning ? t('common.running') : t('common.stopped')}
-                aria-label={isRunning ? t('common.running') : t('common.stopped')}
-                className={clsx(
-                  'ml-auto size-2.5 shrink-0 rounded-full',
-                  isRunning ? 'bg-mint shadow-[0_0_8px_rgba(91,255,160,0.9)]' : 'bg-muted'
-                )}
-              />
             </div>
           </div>
         </div>
@@ -563,6 +594,8 @@ export const AppShell: React.FC = () => {
       {/* App windows float over the workbench main area (desktop). The Dock (P2)
           and the AppsLauncher bridge open windows via the WindowManager. */}
       <WindowLayer />
+      {/* The Apps launcher floats back on top when a window is maximized (If1Tt). */}
+      <FloatingApps />
     </div>
     </WindowManagerProvider>
   );
