@@ -13,7 +13,7 @@ import { ThemeToggle } from './ThemeToggle';
 import { VersionBadge } from './VersionBadge';
 import { WorkbenchSidebar } from './workbench/WorkbenchSidebar';
 import { AppsLauncher } from './AppsLauncher';
-import { WindowManagerProvider, useWindowManager } from '../context/WindowManagerContext';
+import { WindowManagerProvider } from '../context/WindowManagerContext';
 import { WindowLayer } from './apps/WindowLayer';
 import { NewSessionSheet } from './workbench/NewSessionSheet';
 import { SearchPalette } from './workbench/search/SearchPalette';
@@ -207,29 +207,6 @@ const MobileTabBar: React.FC<{ items: ShellNavItem[]; center?: CenterButton }> =
   );
 };
 
-// When a window is MAXIMIZED it covers the sidebar (design If1Tt), so the in-sidebar Apps
-// launcher is hidden behind it. This floats a second Apps launcher at the bottom-left, ABOVE the
-// window layer, so the Dock stays reachable in full-screen — exactly the "Apps button floats on
-// top" of If1Tt. It must live OUTSIDE the aside: the aside is `position: fixed`, which always
-// forms a stacking context, so anything inside it can't rise above the window layer. Desktop-only
-// (windows are md+). Only one Apps launcher is ever visible — the sidebar's is covered when this shows.
-const FloatingApps: React.FC = () => {
-  const { windows } = useWindowManager();
-  const anyMaximized = windows.some((w) => w.maximized && !w.minimized);
-  if (!anyMaximized) return null;
-  return (
-    // A solid rounded backing + shadow makes it read as a clean floating Dock launcher (design
-    // If1Tt shows the pill clean) so the maximized app's content behind it — the editor activity
-    // bar, the file-browser rail — doesn't bleed through the translucent pill. It follows the
-    // workbench theme like the windows it sits over (no longer forced dark).
-    <div
-      className="fixed bottom-5 left-4 z-30 hidden w-[184px] rounded-full bg-surface-3 shadow-[0_10px_34px_-8px_rgba(0,0,0,0.7)] md:flex"
-    >
-      <AppsLauncher />
-    </div>
-  );
-};
-
 export const AppShell: React.FC = () => {
   const { t } = useTranslation();
   const { status } = useStatus();
@@ -397,11 +374,11 @@ export const AppShell: React.FC = () => {
     // Desktop: normal document flow.
     <WindowManagerProvider>
     <div className="flex h-[var(--app-shell-h)] flex-col overflow-hidden bg-background text-foreground md:block md:h-auto md:min-h-screen md:overflow-visible">
-      {/* No z-index on the aside itself: a maximized window (window layer, z-20) must be able to
-          cover the sidebar nav (design If1Tt). Keeping it un-stacked (z-auto, no stacking context)
-          lets the Apps launcher inside escape to its own z-30 and float on top while the rest of the
-          sidebar stays below the window layer. */}
-      <aside className="fixed inset-y-0 left-0 hidden w-[240px] flex-col border-r border-border bg-surface md:flex">
+      {/* The sidebar forms its own stacking context BELOW the window layer (aside z-10 < window
+          layer z-20), so a maximized window covers the WHOLE sidebar — including the Apps launcher.
+          The Apps button no longer floats on top in full-screen (a Dock redesign comes later);
+          un-maximize to reach it. */}
+      <aside className="fixed inset-y-0 left-0 z-10 hidden w-[240px] flex-col border-r border-border bg-surface md:flex">
         <div className="flex h-full flex-col justify-between gap-6 px-4 py-5">
           {/* Top: Brand + Workspace label + Nav list */}
           {/* Workbench mounts a search field right under the brand, so use the
@@ -435,9 +412,8 @@ export const AppShell: React.FC = () => {
 
           {/* Bottom (design.pen NbPMq): row 1 = [Apps | Settings] two equal
               buttons; row 2 = [version … run-dot]. Admin keeps its quick-toggles
-              + hostname between the rows. Only the Apps launcher floats above a
-              maximized window (it carries its own z-30); Settings / version / run-dot
-              stay at the sidebar's level and are covered by a maximized window (If1Tt). */}
+              + hostname between the rows. The whole bottom cluster sits at the
+              sidebar's level (z-10) and is covered by a maximized window. */}
           <div className="relative flex flex-col gap-3">
             {/* Row 1 — Apps (Dock trigger, left) paired with the mode switch
                 (right). The Dock rises ABOVE the Apps button, clear of the
@@ -592,9 +568,11 @@ export const AppShell: React.FC = () => {
 
       {/* App windows float over the workbench main area (desktop). The Dock (P2)
           and the AppsLauncher bridge open windows via the WindowManager. */}
+      {/* A maximized window covers the sidebar Apps launcher. We intentionally do NOT float a
+          second launcher on top in full-screen anymore (product: avoid the fullscreen floating
+          button; a Dock redesign comes later). Un-maximize via the window traffic-lights to reach
+          the sidebar launcher. */}
       <WindowLayer />
-      {/* The Apps launcher floats back on top when a window is maximized (If1Tt). */}
-      <FloatingApps />
     </div>
     </WindowManagerProvider>
   );

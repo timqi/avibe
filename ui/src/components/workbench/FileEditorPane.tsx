@@ -1,12 +1,14 @@
-import { Suspense, lazy, useEffect, useId, useState } from 'react';
+import { Suspense, lazy, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Loader2, PanelRightOpen, Save } from 'lucide-react';
+import { Code2, Eye, Loader2, PanelRightOpen, Save } from 'lucide-react';
 import clsx from 'clsx';
 
 import { useTheme } from '../../context/ThemeContext';
 import { useWindowCloseGuard } from '../../context/WindowManagerContext';
 import { Button } from '../ui/button';
 import { fileBrowserErrorMessage, readText, writeFile } from '../../lib/filesApi';
+import { imageKind, previewKind } from '../../lib/filePreview';
+import { FilePreview } from './FilePreview';
 
 // Monaco (the VS Code kernel) is heavy; lazy-load it so it stays out of the main
 // bundle and only loads when a file is actually opened for editing.
@@ -103,7 +105,13 @@ export const FileEditorPane: React.FC<{
   reveal?: { line: number; column: number; endColumn: number; nonce: number } | null;
   /** Bumped to force a re-read from disk (e.g. after a cross-file replace rewrote this file). */
   reloadNonce?: number;
-}> = ({ path, filename, mtime, readOnly = false, onPopOut, windowId, onDirtyChange, chromeless = false, onCursor, onSaveAs, reveal, reloadNonce }) => {
+  /**
+   * True when this pane is the focused window's active tab. While previewing Markdown/SVG, Monaco
+   * (the usual ⌘S owner) is unmounted and the IDE has no Save button, so the pane registers a
+   * window-level ⌘S itself — scoped by this flag so only the foreground tab saves.
+   */
+  saveHotkey?: boolean;
+}> = ({ path, filename, mtime, readOnly = false, onPopOut, windowId, onDirtyChange, chromeless = false, onCursor, onSaveAs, reveal, reloadNonce, saveHotkey = false }) => {
   const { t } = useTranslation();
   const { resolvedTheme } = useTheme();
   const [text, setText] = useState<string | null>(null);
@@ -112,8 +120,40 @@ export const FileEditorPane: React.FC<{
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
+  // Markdown / SVG can be previewed (rendered) as well as edited, VS-Code-style. `mode` toggles the
+  // body between the Monaco source and the rendered FilePreview, using the LIVE buffer so the
+  // preview reflects unsaved edits.
+  const [mode, setMode] = useState<'source' | 'preview'>('source');
+  const previewable: 'markdown' | 'svg' | null = useMemo(() => {
+    if (previewKind(filename) === 'markdown') return 'markdown';
+    if (imageKind(filename) === 'svg') return 'svg';
+    return null;
+  }, [filename]);
+  // A new file may not be previewable — never strand the body in a preview mode it can't render.
   useEffect(() => {
+    if (!previewable) setMode('source');
+  }, [previewable]);
+  // While previewing, Monaco (the usual ⌘S owner) is unmounted, so the foreground tab registers a
+  // window-level ⌘S. `saveRef` holds the latest save() so the listener never saves a stale buffer.
+  const saveRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    if (!(saveHotkey && previewable && mode === 'preview')) return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        void saveRef.current();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [saveHotkey, previewable, mode]);
+
+  // Tracks the path the last read targeted, so a rename (path changing from one real file to another)
+  // can be told apart from an initial open or a forced reload.
+  const prevPathRef = useRef<string | null>(path);
+  useEffect(() => {
+    const prev = prevPathRef.current;
+    prevPathRef.current = path;
     let cancelled = false;
     setError(null);
     setSavedMtime(mtime);
@@ -122,6 +162,16 @@ export const FileEditorPane: React.FC<{
     if (path === null) {
       setText('');
       setOriginal('');
+      setLoading(false);
+      return;
+    }
+    // A tab's path only changes from one real file to another when the explorer renamed it (this tab
+    // was repointed) — the bytes on disk are unchanged. Re-reading would silently replace an unsaved
+    // buffer with the last-saved contents, so adopt the new save target WITHOUT reloading — BUT only
+    // once a buffer actually exists to preserve. If the rename lands before the initial read finished
+    // (text still null), fall through and read the new path so the pane doesn't go blank. (Initial
+    // open and reloadNonce-forced reloads — where the path is unchanged — also read below.)
+    if (prev !== null && prev !== path && text !== null) {
       setLoading(false);
       return;
     }
@@ -185,6 +235,7 @@ export const FileEditorPane: React.FC<{
       setSaving(false);
     }
   }
+  saveRef.current = save;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -230,10 +281,40 @@ export const FileEditorPane: React.FC<{
         </div>
       )}
 
+      {/* Source ⇄ Preview toggle — only for renderable text (Markdown / SVG). Renders the LIVE
+          buffer, so the preview tracks unsaved edits. */}
+      {previewable && !loading && text !== null && (
+        <div className="flex items-center justify-end border-b border-border bg-surface-2/40 px-2 py-1">
+          <div className="inline-flex overflow-hidden rounded-md border border-border">
+            {([
+              { key: 'source' as const, Icon: Code2, label: t('apps.editor.source') },
+              { key: 'preview' as const, Icon: Eye, label: t('apps.editor.preview') },
+            ]).map(({ key, Icon, label }) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setMode(key)}
+                aria-pressed={mode === key}
+                className={clsx(
+                  'flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium transition',
+                  mode === key ? 'bg-cyan-soft text-foreground' : 'text-muted hover:bg-foreground/[0.05] hover:text-foreground',
+                )}
+              >
+                <Icon className="size-3" /> {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className={clsx('min-h-0 flex-1', loading && 'grid place-items-center')}>
         {loading ? (
           <Loader2 className="size-5 animate-spin text-muted" />
-        ) : text === null ? null : (
+        ) : text === null ? null : mode === 'preview' && previewable === 'markdown' ? (
+          <FilePreview kind="markdown" content={text} />
+        ) : mode === 'preview' && previewable === 'svg' ? (
+          <FilePreview kind="image" src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(text)}`} name={filename} />
+        ) : (
           <Suspense fallback={<div className="p-4 text-[12px] text-muted">{t('common.loading')}</div>}>
             <MonacoEditor
               value={text}
