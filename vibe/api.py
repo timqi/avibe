@@ -2916,15 +2916,24 @@ async def telegram_auth_test_async(bot_token: str, proxy_url: str | None = None)
 
 
 def delete_channel_scope(platform: str, native_id: str, scope_type: str = "channel") -> dict:
-    """Permanently remove a discovered channel/chat scope and its settings."""
+    """Permanently remove a discovered channel/chat scope and its settings.
+
+    Restricted to ``channel`` scopes: this endpoint exists only to clear stale
+    discovered chats. Deleting other scope types (e.g. ``project``) would bypass
+    their dedicated lifecycle (project archival preserves the scope for sessions),
+    so any non-channel scope type is rejected.
+    """
     from core import chat_discovery
 
     platform = str(platform or "").strip()
     native_id = str(native_id or "").strip()
+    scope_type = str(scope_type or "channel").strip()
     if not platform or not native_id:
         return {"ok": False, "error": "platform and id are required"}
+    if scope_type != "channel":
+        return {"ok": False, "error": "only channel scopes can be removed here"}
     try:
-        removed = chat_discovery.delete_scope(platform, native_id, scope_type=scope_type or "channel")
+        removed = chat_discovery.delete_scope(platform, native_id, scope_type="channel")
     except Exception as exc:
         logger.warning("Failed to delete %s scope %s: %s", platform, native_id, exc, exc_info=True)
         return {"ok": False, "error": str(exc)}

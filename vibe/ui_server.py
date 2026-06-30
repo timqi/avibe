@@ -3664,11 +3664,12 @@ def channels_delete():
     from vibe import api
 
     payload = request.json or {}
+    # Channel-only by design: do not forward an arbitrary scope_type from the
+    # request body (api.delete_channel_scope also rejects non-channel types).
     return jsonify(
         api.delete_channel_scope(
             payload.get("platform", ""),
             payload.get("id", ""),
-            scope_type=payload.get("scope_type", "channel"),
         )
     )
 
