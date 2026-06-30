@@ -13,6 +13,7 @@ import { ThemeToggle } from './ThemeToggle';
 import { VersionBadge } from './VersionBadge';
 import { WorkbenchSidebar } from './workbench/WorkbenchSidebar';
 import { AppsLauncher } from './AppsLauncher';
+import { ErrorBoundary } from './ui/error-boundary';
 import { WindowManagerProvider } from '../context/WindowManagerContext';
 import { WindowLayer } from './apps/WindowLayer';
 import { NewSessionSheet } from './workbench/NewSessionSheet';
@@ -507,7 +508,12 @@ export const AppShell: React.FC = () => {
         )}
       >
         <div className="mx-auto w-full px-4 py-5 md:px-10 md:py-8">
-          <Outlet />
+          {/* A crashing page only replaces the content area — the sidebar + chrome stay usable, and
+              navigating elsewhere clears the error without a manual retry. Key on location.key (not
+              just pathname) so a query-only navigation (e.g. /search?q=…) also resets. */}
+          <ErrorBoundary variant="page" resetKeys={[location.key]}>
+            <Outlet />
+          </ErrorBoundary>
         </div>
       </main>
 

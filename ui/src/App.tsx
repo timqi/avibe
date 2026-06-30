@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { Wizard } from './components/Wizard';
 import { AppShell } from './components/AppShell';
+import { ErrorBoundary } from './components/ui/error-boundary';
 import { Workbench } from './components/Workbench';
 import { InboxPage } from './components/workbench/InboxPage';
 import { SearchPage } from './components/workbench/SearchPage';
@@ -377,6 +378,10 @@ function AppRoutes() {
 
 function App() {
   return (
+    // Outermost backstop — OUTSIDE every provider, so a crash in a provider itself is contained too
+    // (the per-page and per-window boundaries handle granular containment inside). ThemeProvider sets
+    // data-theme on <html>, so the fallback still picks up the theme even from out here.
+    <ErrorBoundary variant="page">
     <ThemeProvider>
       <StatusProvider>
         <ToastProvider>
@@ -395,6 +400,7 @@ function App() {
         </ToastProvider>
       </StatusProvider>
     </ThemeProvider>
+    </ErrorBoundary>
   );
 }
 
