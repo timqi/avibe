@@ -3619,6 +3619,7 @@ def slack_channels():
             payload.get("bot_token", ""),
             browse_all=payload.get("browse_all", False),
             force=payload.get("force", False) or request.args.get("force") == "1",
+            include_not_returned=bool(payload.get("include_not_returned", False)),
         )
     )
 
@@ -3653,6 +3654,25 @@ def discord_channels():
             payload.get("bot_token", ""),
             payload.get("guild_id", ""),
             force=payload.get("force", False) or request.args.get("force") == "1",
+            include_not_returned=bool(payload.get("include_not_returned", False)),
+        )
+    )
+
+
+@app.route("/api/channels/delete", methods=["POST"])
+def channels_delete():
+    from vibe import api
+
+    payload = request.json or {}
+    # Channel-only by design: forward the requested scope_type so a non-channel
+    # request is explicitly rejected at this boundary (api.delete_channel_scope
+    # returns an error for anything other than "channel") rather than silently
+    # deleting the channel scope that happens to share the id.
+    return jsonify(
+        api.delete_channel_scope(
+            payload.get("platform", ""),
+            payload.get("id", ""),
+            scope_type=payload.get("scope_type", "channel"),
         )
     )
 
@@ -3674,7 +3694,12 @@ def telegram_chats():
     from vibe import api
 
     payload = request.json or {}
-    return jsonify(api.telegram_list_chats(include_private=payload.get("include_private", False)))
+    return jsonify(
+        api.telegram_list_chats(
+            include_private=payload.get("include_private", False),
+            include_not_returned=bool(payload.get("include_not_returned", False)),
+        )
+    )
 
 
 @app.route("/api/lark/auth_test", methods=["POST"])
@@ -3702,6 +3727,7 @@ def lark_chats():
             payload.get("app_secret", ""),
             payload.get("domain", "feishu"),
             force=payload.get("force", False) or request.args.get("force") == "1",
+            include_not_returned=bool(payload.get("include_not_returned", False)),
         )
     )
 
