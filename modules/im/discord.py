@@ -512,6 +512,9 @@ class DiscordBot(BaseIMClient):
             target = await self._resolve_target(context)
             if target is None:
                 raise RuntimeError("Discord channel not found")
+            # suppress_embeds at creation sets the persistent SUPPRESS_EMBEDS
+            # flag, so later edit_message() content edits stay embed-free
+            # without needing edit(suppress=True) (which requires Manage Messages).
             message = await target.send(content=content, suppress_embeds=True)
             if self.settings_manager and context.thread_id:
                 try:
@@ -578,7 +581,7 @@ class DiscordBot(BaseIMClient):
                         if _PersistentStartView.is_all_static(keyboard)
                         else _DiscordButtonView(self, context, keyboard)
                     )
-                await msg.edit(content=content, view=view, suppress=True)
+                await msg.edit(content=content, view=view)
                 return True
             except Exception as err:
                 logger.debug("Failed to edit Discord message: %s", err)
