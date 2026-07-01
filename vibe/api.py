@@ -1694,6 +1694,34 @@ def _grant_ttl_seconds(grant: dict) -> int:
     return max(1, int(round(approved_lifetime)))
 
 
+def _release_one_shot_agent_grant(grant: dict | None, *, reason: str) -> None:
+    if not isinstance(grant, dict) or grant.get("one_shot") is not True:
+        return
+    release_vault_agent_scopes(_grant_scope_payload(grant), reason=reason)
+
+
+def consume_one_shot_grants(grants: list[dict] | tuple[dict, ...] | None, *, reason: str) -> None:
+    """Expire one-shot grants after the caller has committed value delivery."""
+    from storage import vault_service
+
+    if not grants:
+        return
+    seen: set[str] = set()
+    release_scopes: list[dict[str, str]] = []
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        for grant in grants:
+            if not isinstance(grant, dict) or grant.get("one_shot") is not True:
+                continue
+            grant_id = str(grant.get("id") or "")
+            if not grant_id or grant_id in seen:
+                continue
+            seen.add(grant_id)
+            with contextlib.suppress(vault_service.GrantNotActiveError, vault_service.GrantNotFoundError):
+                release_scopes.extend(vault_service.consume_one_shot_grant(conn, grant_id))
+    release_vault_agent_scopes(release_scopes, reason=reason)
+
+
 def _agent_grant_cached_all(result: dict, expected_count: int) -> bool:
     granted = result.get("granted")
     try:
@@ -1850,7 +1878,7 @@ def _cleanup_failed_agent_grant(
                     active_scope_members: set[str] = set()
                     for active in conn.execute(
                         select(vault_service.vault_grants).where(
-                            vault_service.vault_grants.c.status == "active",
+                            vault_service.vault_grants.c.status.in_(vault_service.ACTIVE_GRANT_STATES),
                             vault_service.vault_grants.c.scope_type == scope["scope_type"],
                             vault_service.vault_grants.c.scope_ref == scope["scope_ref"],
                         )
@@ -1885,14 +1913,35 @@ def create_vault_grant(payload: dict) -> dict:
         ttl_seconds = int(ttl) if ttl is not None else None
     except (TypeError, ValueError) as exc:
         raise VaultApiError("ttl_seconds must be an integer", code="invalid_grant") from exc
+    request_id = payload.get("request_id") or payload.get("created_by_request_id")
+    if not request_id:
+        raise VaultApiError("request_id is required to create a grant", code="missing_request_id")
     engine = _vault_engine()
-    try:
-        with engine.connect() as conn:
-            grantable_members = vault_service.grantable_member_metas(conn, scope_type, scope_ref)
-    except vault_service.SecretNotFoundError as exc:
-        raise VaultApiError(f"secret '{exc}' not found", code="secret_not_found", status=404) from exc
-    except vault_service.InvalidGrantError as exc:
-        raise VaultApiError(str(exc), code="invalid_grant") from exc
+    preflight_error: Exception | None = None
+    with engine.begin() as conn:
+        try:
+            grantable_members = vault_service.request_grantable_member_metas(
+                conn,
+                scope_type,
+                scope_ref,
+                str(request_id),
+            )
+        except (
+            vault_service.SecretNotFoundError,
+            vault_service.RequestNotFoundError,
+            vault_service.InvalidRequestError,
+            vault_service.InvalidGrantError,
+        ) as exc:
+            preflight_error = exc
+            grantable_members = []
+    if isinstance(preflight_error, vault_service.SecretNotFoundError):
+        raise VaultApiError(f"secret '{preflight_error}' not found", code="secret_not_found", status=404) from preflight_error
+    if isinstance(preflight_error, vault_service.RequestNotFoundError):
+        raise VaultApiError(f"request '{preflight_error}' not found", code="request_not_found", status=404) from preflight_error
+    if isinstance(preflight_error, vault_service.InvalidRequestError):
+        raise VaultApiError(str(preflight_error), code="invalid_request", status=409) from preflight_error
+    if isinstance(preflight_error, vault_service.InvalidGrantError):
+        raise VaultApiError(str(preflight_error), code="invalid_grant") from preflight_error
     if not grantable_members:
         raise VaultApiError(f"{scope_type}:{scope_ref} has no grantable static secrets", code="not_grantable", status=409)
     protected_member_names = {str(member["name"]) for member in grantable_members if member.get("protection") == "protected"}
@@ -1903,9 +1952,6 @@ def create_vault_grant(payload: dict) -> dict:
     if needs_agent_deks and provided_names != protected_member_names:
         raise VaultApiError("resident agent DEKs must match the protected grant members", code="invalid_grant")
     expected_member_names = {str(member["name"]) for member in grantable_members} if needs_agent_deks else None
-    request_id = payload.get("request_id") or payload.get("created_by_request_id")
-    if not request_id:
-        raise VaultApiError("request_id is required to create a grant", code="missing_request_id")
     expected_pubkey = payload.get("agent_pubkey") if isinstance(payload.get("agent_pubkey"), dict) else None
     if needs_agent_deks:
         try:
@@ -2742,7 +2788,12 @@ def slack_auth_test(bot_token: str, proxy_url: str | None = None) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-def list_channels(bot_token: str, browse_all: bool = False, force: bool = False) -> dict:
+def list_channels(
+    bot_token: str,
+    browse_all: bool = False,
+    force: bool = False,
+    include_not_returned: bool = False,
+) -> dict:
     from core import chat_discovery
 
     bot_token = bot_token or _stored_platform_secret("slack", "bot_token")
@@ -2752,6 +2803,7 @@ def list_channels(bot_token: str, browse_all: bool = False, force: bool = False)
         browse_all=browse_all,
         require_member=not browse_all,
         force=force,
+        include_not_returned=include_not_returned,
     )
 
 
@@ -2863,12 +2915,40 @@ async def telegram_auth_test_async(bot_token: str, proxy_url: str | None = None)
         return {"ok": False, "error": str(exc)}
 
 
-def telegram_list_chats(include_private: bool = False) -> dict:
+def delete_channel_scope(platform: str, native_id: str, scope_type: str = "channel") -> dict:
+    """Permanently remove a discovered channel/chat scope and its settings.
+
+    Restricted to ``channel`` scopes: this endpoint exists only to clear stale
+    discovered chats. Deleting other scope types (e.g. ``project``) would bypass
+    their dedicated lifecycle (project archival preserves the scope for sessions),
+    so any non-channel scope type is rejected.
+    """
+    from core import chat_discovery
+
+    platform = str(platform or "").strip()
+    native_id = str(native_id or "").strip()
+    scope_type = str(scope_type or "channel").strip()
+    if not platform or not native_id:
+        return {"ok": False, "error": "platform and id are required"}
+    if scope_type != "channel":
+        return {"ok": False, "error": "only channel scopes can be removed here"}
+    try:
+        outcome = chat_discovery.delete_scope(platform, native_id, scope_type="channel")
+    except Exception as exc:
+        logger.warning("Failed to delete %s scope %s: %s", platform, native_id, exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+    # ``dismissed`` means history was preserved and the entry was hidden instead
+    # of physically deleted; ``removed`` means the scope row was deleted outright.
+    return {"ok": True, **outcome}
+
+
+def telegram_list_chats(include_private: bool = False, include_not_returned: bool = False) -> dict:
     from core import chat_discovery
 
     return chat_discovery.channels_response(
         "telegram",
         include_private=include_private,
+        include_not_returned=include_not_returned,
     )
 
 
@@ -2887,7 +2967,9 @@ async def discord_list_guilds_async(bot_token: str) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-def discord_list_channels(bot_token: str, guild_id: str, force: bool = False) -> dict:
+def discord_list_channels(
+    bot_token: str, guild_id: str, force: bool = False, include_not_returned: bool = False
+) -> dict:
     guild_id = str(guild_id or "").strip()
     if not guild_id:
         return {
@@ -2913,6 +2995,7 @@ def discord_list_channels(bot_token: str, guild_id: str, force: bool = False) ->
         guild_id=guild_id,
         parent_scope_id=parent_scope_id,
         force=force,
+        include_not_returned=include_not_returned,
     )
 
 
@@ -2945,7 +3028,16 @@ def opencode_options(cwd: str) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def _discord_retry_wait(exc: "urllib.error.HTTPError", attempt: int) -> float:
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    try:
+        return max(float(retry_after), float(2**attempt)) if retry_after else float(2**attempt)
+    except (TypeError, ValueError):
+        return float(2**attempt)
+
+
 def _discord_api_get(bot_token: str, path: str, proxy_url: str | None = None) -> dict:
+    import urllib.error
     import urllib.request
 
     from vibe.proxy import is_socks_proxy, resolve_proxy
@@ -2956,22 +3048,43 @@ def _discord_api_get(bot_token: str, path: str, proxy_url: str | None = None) ->
     headers = {"Authorization": f"Bot {bot_token}", "User-Agent": "avibe"}
 
     proxy = resolve_proxy(proxy_url)
-    if proxy and is_socks_proxy(proxy):
-        return _https_json_request_via_socks(proxy, url, headers=headers)
 
-    if proxy:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-        )
-    else:
-        opener = urllib.request.build_opener()
-    req = urllib.request.Request(url, headers=headers)
-    with opener.open(req, timeout=10) as resp:
-        payload = resp.read().decode("utf-8")
-        return json.loads(payload)
+    def _request() -> dict:
+        if proxy and is_socks_proxy(proxy):
+            return _https_json_request_via_socks(proxy, url, headers=headers)
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+        else:
+            opener = urllib.request.build_opener()
+        req = urllib.request.Request(url, headers=headers)
+        with opener.open(req, timeout=10) as resp:
+            payload = resp.read().decode("utf-8")
+            return json.loads(payload)
+
+    attempts = 5
+    for attempt in range(attempts):
+        try:
+            return _request()
+        except urllib.error.HTTPError as http_exc:
+            if http_exc.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                wait = _discord_retry_wait(http_exc, attempt)
+                logger.warning(
+                    "Discord rate-limited/transient (%d), retrying after %ss (attempt %d/%d)",
+                    http_exc.code,
+                    wait,
+                    attempt + 1,
+                    attempts,
+                )
+                time.sleep(wait)
+                continue
+            raise
+    raise RuntimeError("Discord request exhausted retries")  # pragma: no cover
 
 
 async def _discord_api_get_async(bot_token: str, path: str, proxy_url: str | None = None) -> dict:
+    import urllib.error
     import urllib.request
 
     from vibe.proxy import is_socks_proxy, resolve_proxy
@@ -2982,23 +3095,57 @@ async def _discord_api_get_async(bot_token: str, path: str, proxy_url: str | Non
     headers = {"Authorization": f"Bot {bot_token}", "User-Agent": "avibe"}
 
     proxy = resolve_proxy(proxy_url)
-    if proxy and is_socks_proxy(proxy):
-        # urllib has no native SOCKS support; route via aiohttp + aiohttp_socks.
-        return await _discord_api_get_via_aiohttp(url, headers, proxy)
+    use_socks = bool(proxy and is_socks_proxy(proxy))
 
-    if proxy:
+    if proxy and not use_socks:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         )
     else:
         opener = urllib.request.build_opener()
+
     def _request() -> dict:
         req = urllib.request.Request(url, headers=headers)
         with opener.open(req, timeout=10) as resp:
             payload = resp.read().decode("utf-8")
             return json.loads(payload)
 
-    return await asyncio.to_thread(_request)
+    attempts = 5
+    for attempt in range(attempts):
+        try:
+            if use_socks:
+                # urllib has no native SOCKS support; route via aiohttp + aiohttp_socks.
+                return await _discord_api_get_via_aiohttp(url, headers, proxy)
+            return await asyncio.to_thread(_request)
+        except urllib.error.HTTPError as http_exc:
+            if http_exc.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                wait = _discord_retry_wait(http_exc, attempt)
+                logger.warning(
+                    "Discord rate-limited/transient (%d), retrying after %ss (attempt %d/%d)",
+                    http_exc.code,
+                    wait,
+                    attempt + 1,
+                    attempts,
+                )
+                await asyncio.sleep(wait)
+                continue
+            raise
+        except Exception as exc:
+            # aiohttp (SOCKS path) raises ClientResponseError with a `.status`.
+            status = getattr(exc, "status", None)
+            if status in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                wait = float(2**attempt)
+                logger.warning(
+                    "Discord rate-limited/transient (%s) via proxy, retrying after %ss (attempt %d/%d)",
+                    status,
+                    wait,
+                    attempt + 1,
+                    attempts,
+                )
+                await asyncio.sleep(wait)
+                continue
+            raise
+    raise RuntimeError("Discord request exhausted retries")  # pragma: no cover
 
 
 def _https_json_request_via_socks(
@@ -4838,13 +4985,13 @@ def _version_at_least(current: str | None, minimum: str) -> bool:
 def _require_avault_p2_surface(feature: str) -> None:
     status = avault_status()
     if not status.get("installed"):
-        raise AvaultError(f"avault is required for {feature}")
+        raise AvaultPreHandoffError(f"avault is required for {feature}")
     version = status.get("version")
     if not _version_at_least(version, AVAULT_P2_MIN_VERSION):
         detail = f"{feature} requires avault >= {AVAULT_P2_MIN_VERSION}; installed {version or 'unknown'}"
         if not _managed_avault_release_satisfies_p2():
             detail = f"{detail}; managed avault install is pinned to {AVAULT_VERSION}"
-        raise AvaultError(detail)
+        raise AvaultPreHandoffError(detail)
 
 
 # ---------------------------------------------------------------------------
@@ -4860,14 +5007,13 @@ def _require_avault_p2_surface(feature: str) -> None:
 # avibe's wait must outlast avault's own fetch timeout (10s connect + 30s total).
 _AVAULT_TIMEOUT_SECONDS = 20.0
 _AVAULT_FETCH_TIMEOUT_SECONDS = 60.0
-# avault exits 70 for an internal failure (bad envelope, decrypt error, store error)
-# before any delivery side effect — distinct from a delivered child's own exit code.
-_AVAULT_INTERNAL_ERROR_CODE = 70
-
-
 class AvaultError(Exception):
     """An ``avault`` invocation failed. Messages never carry secret material —
     avault is designed to keep secrets out of its stdout/stderr and errors."""
+
+
+class AvaultPreHandoffError(AvaultError):
+    """avault failed before receiving an envelope or performing delivery."""
 
 
 def _avault_detail(proc: "subprocess.CompletedProcess") -> str:
@@ -4881,7 +5027,7 @@ def _avault_detail(proc: "subprocess.CompletedProcess") -> str:
 def _require_avault_path() -> str:
     path = _resolve_avault_cli_path()
     if not path:
-        raise AvaultError(backend_t("dependencies.avault.missing"))
+        raise AvaultPreHandoffError(backend_t("dependencies.avault.missing"))
     return path
 
 
@@ -4921,7 +5067,7 @@ def _run_avault(
             **isolated_subprocess_kwargs(),
         )
     except FileNotFoundError as exc:
-        raise AvaultError("avault binary not found") from exc
+        raise AvaultPreHandoffError("avault binary not found") from exc
     except subprocess.TimeoutExpired as exc:
         raise AvaultError("avault timed out") from exc
 
@@ -5054,7 +5200,7 @@ def avault_sign(
     return {"signature": signature, "recovery_id": payload.get("recovery_id")}
 
 
-def avault_deliver_run(secrets: list[dict], command: list[str]) -> int:
+def avault_deliver_run(secrets: list[dict], command: list[str]) -> dict:
     """Run ``command`` with the secrets injected as env vars, inside avault.
 
     ``secrets`` is ``[{"name": <secret name>, "env": <env var>, "envelope": <Sealed>}]``.
@@ -5062,8 +5208,9 @@ def avault_deliver_run(secrets: list[dict], command: list[str]) -> int:
     plaintext never returns here. The child inherits this process's stdio so its
     output passes through; the run-secrets JSON (envelopes only, no plaintext)
     goes on avault's stdin to stay out of ``ps``. Returns the child's exit code
-    (``128 + signal`` if signalled), or raises :class:`AvaultError` if avault could
-    not start the child.
+    (``128 + signal`` if signalled). Delivery is fail-closed: once avault returns
+    an exit code, callers must treat the secret as handed to the child unless a
+    future avault protocol provides a distinct pre-handoff failure signal.
     """
     path = _require_avault_path()
     payload = json.dumps(
@@ -5089,7 +5236,8 @@ def avault_deliver_run(secrets: list[dict], command: list[str]) -> int:
         # avault exited before reading stdin (e.g. bad request); fall through to wait()
         # which surfaces its exit code.
         pass
-    return proc.wait()
+    exit_code = proc.wait()
+    return {"exit_code": exit_code, "delivered": True}
 
 
 def _agent_secret_payload(secret: dict, *, target_field: str) -> dict:
@@ -5150,14 +5298,19 @@ def avault_agent_release(*, scope_type: str, scope_ref: str) -> dict:
 
 def _agent_release_failure_is_absent(exc: AvaultError) -> bool:
     detail = str(exc).lower()
+    return _avault_agent_error_is_absent(detail)
+
+
+def _avault_agent_error_is_absent(detail: str) -> bool:
+    text = detail.lower()
     return (
-        "failed to connect to avault agent" in detail
+        "failed to connect to avault agent" in text
         and (
-            "no such file" in detail
-            or "connection refused" in detail
-            or "errno 2" in detail
-            or "errno 61" in detail
-            or "errno 111" in detail
+            "no such file" in text
+            or "connection refused" in text
+            or "errno 2" in text
+            or "errno 61" in text
+            or "errno 111" in text
         )
     )
 
@@ -5245,6 +5398,8 @@ def avault_agent_deliver_run(
             secrets=[_agent_secret_payload(secret, target_field="env") for secret in secrets],
         )
     except AvaultAgentError as exc:
+        if _avault_agent_error_is_absent(str(exc)):
+            raise AvaultPreHandoffError(str(exc)) from exc
         raise AvaultError(str(exc)) from exc
     try:
         exit_code = int(result["exit_code"])
@@ -5274,6 +5429,8 @@ def avault_agent_deliver_fetch(
             request=request,
         )
     except AvaultAgentError as exc:
+        if _avault_agent_error_is_absent(str(exc)):
+            raise AvaultPreHandoffError(str(exc)) from exc
         raise AvaultError(str(exc)) from exc
 
 
@@ -5298,6 +5455,8 @@ def avault_agent_deliver_inject(
             secrets=[_agent_secret_payload(secret, target_field="key") for secret in secrets],
         )
     except AvaultAgentError as exc:
+        if _avault_agent_error_is_absent(str(exc)):
+            raise AvaultPreHandoffError(str(exc)) from exc
         raise AvaultError(str(exc)) from exc
     if result.get("ok") is not True:
         raise AvaultError("avault agent inject returned malformed output")
@@ -9029,7 +9188,13 @@ async def lark_auth_test_async(
         return {"ok": False, "error": str(exc)}
 
 
-def lark_list_chats(app_id: str, app_secret: str, domain: str = "feishu", force: bool = False) -> dict:
+def lark_list_chats(
+    app_id: str,
+    app_secret: str,
+    domain: str = "feishu",
+    force: bool = False,
+    include_not_returned: bool = False,
+) -> dict:
     from core import chat_discovery
 
     app_id = app_id or _stored_platform_field("lark", "app_id")
@@ -9041,12 +9206,40 @@ def lark_list_chats(app_id: str, app_secret: str, domain: str = "feishu", force:
         app_secret=app_secret,
         domain=domain,
         force=force,
+        include_not_returned=include_not_returned,
     )
 
 
 def lark_list_chats_live(app_id: str, app_secret: str, domain: str = "feishu") -> dict:
     """List Lark/Feishu group chats the bot has joined (with pagination)."""
+    import time
+    import urllib.error
     import urllib.request
+
+    def _get_with_retry(req: "urllib.request.Request", *, attempts: int = 5) -> dict:
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.HTTPError as http_exc:
+                # Retry on rate-limit / transient server errors with backoff.
+                if http_exc.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                    retry_after = http_exc.headers.get("Retry-After") if http_exc.headers else None
+                    try:
+                        wait = max(int(retry_after), 2**attempt) if retry_after else 2**attempt
+                    except (TypeError, ValueError):
+                        wait = 2**attempt
+                    logger.warning(
+                        "Lark rate-limited/transient (%d), retrying after %ds (attempt %d/%d)",
+                        http_exc.code,
+                        wait,
+                        attempt + 1,
+                        attempts,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError("Lark request exhausted retries")
 
     try:
         token = _lark_tenant_token(app_id, app_secret, domain)
@@ -9059,13 +9252,19 @@ def lark_list_chats_live(app_id: str, app_secret: str, domain: str = "feishu") -
         seen_page_tokens: set = set()
         max_pages = 50  # safety cap to prevent infinite loop
         page = 0
-        while page < max_pages:
+        # `truncated` marks an INCOMPLETE inventory. Any early/abnormal exit while
+        # the server still reports more pages must set it, so the caller never
+        # marks the unseen chats not_returned from a partial list.
+        truncated = False
+        while True:
+            if page >= max_pages:
+                truncated = True
+                break
             url = f"{base}/open-apis/im/v1/chats?page_size=100"
             if page_token:
                 url = f"{url}&page_token={page_token}"
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read().decode())
+            result = _get_with_retry(req)
             if result.get("code") != 0:
                 return {"ok": False, "error": result.get("msg", "Unknown error")}
             data = result.get("data", {})
@@ -9080,14 +9279,21 @@ def lark_list_chats_live(app_id: str, app_secret: str, domain: str = "feishu") -
                 }
                 for c in items
             )
+            has_more = bool(data.get("has_more"))
             page_token = data.get("page_token") or ""
-            if not data.get("has_more") or not page_token:
+            if not has_more:
+                break
+            if not page_token:
+                # Server claims more pages but gave no cursor — cannot continue.
+                truncated = True
                 break
             if page_token in seen_page_tokens:
-                break  # server returned the same token — avoid loop
+                # Server returned a repeated cursor — avoid an infinite loop, but
+                # the remaining pages are unreachable, so the list is incomplete.
+                truncated = True
+                break
             seen_page_tokens.add(page_token)
             page += 1
-        truncated = page >= max_pages
         return {"ok": True, "channels": channels, "truncated": truncated}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}

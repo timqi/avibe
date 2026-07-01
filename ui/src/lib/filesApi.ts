@@ -20,6 +20,18 @@ export type FsListing = {
   limit?: number;
 };
 
+// A recursive name-search hit (`/api/files/search_names`): an entry plus its absolute `path` and
+// `rel` (path relative to the search root) so the UI can show where it lives and open/navigate to it.
+export type NameHit = FsEntry & { path: string; rel: string };
+export type NameSearchResponse = {
+  ok: true;
+  root: string;
+  query: string;
+  results: NameHit[];
+  truncated: boolean;
+  limit: number | null;
+};
+
 export type FsMeta = {
   ok: true;
   name: string;
@@ -28,6 +40,9 @@ export type FsMeta = {
   size: number | null;
   mtime: number | null;
   mime: string | null;
+  /** Content sniff: true when the file decodes as text, so an extensionless / unknown-type file
+   *  still opens in the editor instead of downloading. Absent on older backends → treated as unknown. */
+  text?: boolean;
 };
 
 export type Favorite = { key: string; path: string };
@@ -54,10 +69,26 @@ export function fileBrowserErrorMessage(error: unknown, t: (key: string) => stri
 }
 
 async function parse<T>(res: Response): Promise<T> {
-  const data = await res.json().catch(() => ({}) as Record<string, unknown>);
-  if (!res.ok || (data as { ok?: boolean }).ok === false) {
-    const err = (data as { error?: { code?: string; message?: string } }).error || {};
+  // Read the body as text first so a non-JSON response (an upstream HTML/error page, a truncated
+  // body, an empty 2xx) is distinguishable from a real payload — rather than silently collapsing to
+  // `{}` that callers would treat as valid data and then crash dereferencing (e.g. `data.results.map`).
+  const raw = await res.text();
+  let data: unknown;
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = undefined;
+    }
+  }
+  if (!res.ok || (data as { ok?: boolean } | undefined)?.ok === false) {
+    const err = (data as { error?: { code?: string; message?: string } } | undefined)?.error || {};
     throw new FilesApiError(err.code || String(res.status), err.message || 'Request failed');
+  }
+  if (data === undefined) {
+    // 2xx but the body was empty or not valid JSON (truncated / upstream error page). Surface it as
+    // a failure so the caller shows an error state instead of feeding a malformed object to the UI.
+    throw new FilesApiError('invalid_response', 'The server returned an unexpected response.');
   }
   return data as T;
 }
@@ -229,6 +260,19 @@ export async function renamePath(path: string, newName: string): Promise<{ ok: t
   );
 }
 
+// Move an entry from `src` to the absolute `dst` (used by drag-and-drop into a folder). The backend
+// is symlink-safe, refuses to move a folder into itself, and — with overwrite=false (the default) —
+// refuses to clobber an existing destination (errors.exists), which the UI surfaces to the user.
+export async function movePath(src: string, dst: string, overwrite = false): Promise<{ ok: true }> {
+  return parse(
+    await apiFetch('/api/files/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ src, dst, overwrite: overwrite || undefined }),
+    }),
+  );
+}
+
 // Cross-file search + replace (backend: file_browser_service.search/replace/undo_replace).
 // col/end are full-line UTF-16 offsets (the editor jump target); preview_col/preview_end index
 // into `text` (the possibly windowed preview) for the row highlight.
@@ -262,6 +306,14 @@ export async function searchFiles(root: string, query: string, opts: SearchOptio
   if (opts.include) params.set('include', opts.include);
   if (opts.exclude) params.set('exclude', opts.exclude);
   return parse<SearchResponse>(await apiFetch(`/api/files/search?${params.toString()}`, { signal }));
+}
+
+// Recursive file/folder NAME search under `root` (backend: file_browser_service.search_names).
+// Distinct from searchFiles, which greps file contents. `signal` lets the caller abort a stale
+// in-flight search as the user keeps typing.
+export async function searchNames(root: string, query: string, showHidden = false, signal?: AbortSignal): Promise<NameSearchResponse> {
+  const params = new URLSearchParams({ root, query, show_hidden: showHidden ? '1' : '0' });
+  return parse<NameSearchResponse>(await apiFetch(`/api/files/search_names?${params.toString()}`, { signal }));
 }
 
 export async function replaceInFiles(
