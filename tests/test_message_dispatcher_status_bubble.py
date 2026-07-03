@@ -339,6 +339,24 @@ class StatusBubbleResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result_id, "msg-3")  # result is its own new message
         self.assertEqual(controller.im_client.deletes, ["msg-2"])  # only the bubble retired, log kept
 
+    async def test_concise_to_verbose_flip_keeps_reused_log(self):
+        # Turn starts concise (bubble posted + marked), then the Web UI flips to
+        # verbose mid-turn. The verbose path reuses the bubble message as the log;
+        # the concise marker must be cleared so the result path keeps the log
+        # instead of retiring it as a bubble.
+        controller = _StubController(platform="slack", progress_style="concise")
+        d = _dispatcher(controller)
+        ctx = _ctx()
+        with mock.patch("core.message_dispatcher.persist_agent_message"):
+            await d.emit_agent_message(
+                ctx, "toolcall", "🔧 `Bash` `{}`", status_label="🔧 Bash"
+            )  # concise bubble msg-1
+            controller._progress_style_value = "verbose"  # Web UI flip mid-turn
+            await d.emit_agent_message(ctx, "toolcall", "🔧 `Read` `{}`")  # verbose reuses msg-1 as log
+            result_id = await d.emit_agent_message(ctx, "result", "Final answer")
+        self.assertEqual(controller.im_client.deletes, [])  # reused log NOT retired
+        self.assertEqual(result_id, "msg-2")  # result is its own new message
+
     async def test_result_done_footer_keeps_session_tokens(self):
         # A backend that reports session tokens before the result → the fresh
         # result message's done footer carries "✅ done · {n} tok".

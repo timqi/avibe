@@ -1648,6 +1648,12 @@ class ConsolidatedMessageDispatcher:
         lock = self._get_consolidated_message_lock(consolidated_key)
 
         async with lock:
+            # Entering the verbose consolidation path. If this turn had a concise
+            # bubble (style flipped concise->verbose mid-turn), its message id is
+            # now reused as the verbose consolidated log. Drop the concise marker
+            # so terminal cleanup treats it as a log to KEEP, not a bubble to
+            # retire (sync discard under the same lock as the marker add).
+            self._concise_bubble_keys.discard(consolidated_key)
             max_bytes = self._get_consolidated_max_bytes(context)
             split_threshold = self._get_consolidated_split_threshold(context)
             existing = self._consolidated_message_buffers.get(consolidated_key, "")
