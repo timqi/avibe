@@ -907,6 +907,7 @@ class Controller:
         Currently a global config setting; per-channel overrides can layer on top
         here later without touching the dispatcher.
         """
+        self._refresh_status_bubble_config()
         value = getattr(self.config, "agent_progress_style", DEFAULT_AGENT_PROGRESS_STYLE)
         return value if value in ("concise", "verbose", "off") else DEFAULT_AGENT_PROGRESS_STYLE
 
@@ -929,11 +930,24 @@ class Controller:
             return False
         return self.get_progress_style_for_context(context) == "concise"
 
+    def _refresh_status_bubble_config(self) -> None:
+        """Best-effort, mtime-guarded reload so Web UI changes to the status-bubble
+        settings (progress style + heartbeat/no-output thresholds) take effect for
+        turns that never pass through an IM inbound handler first (e.g. scheduled /
+        background agent runs), where nothing else calls ``_refresh_config_from_disk``
+        before these getters read ``self.config``. Guarded via ``getattr`` so callers
+        with a lightweight ``self`` (unit tests) simply skip the refresh."""
+        refresh = getattr(self, "_refresh_config_from_disk", None)
+        if callable(refresh):
+            refresh()
+
     def get_heartbeat_interval_ms_for_context(self, context: MessageContext) -> int:
+        self._refresh_status_bubble_config()
         value = getattr(self.config, "agent_status_heartbeat_ms", 15000)
         return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 15000
 
     def get_no_output_hint_after_ms_for_context(self, context: MessageContext) -> int:
+        self._refresh_status_bubble_config()
         value = getattr(self.config, "agent_status_no_output_ms", 180000)
         return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 180000
 
