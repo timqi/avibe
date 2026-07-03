@@ -157,6 +157,13 @@ class ConsolidatedMessageDispatcher:
         # per-key consolidated lock so finalize and a concurrent process render
         # can't interleave (C1).
         self._status_finalized: set[str] = set()
+        # Turn-keys whose tracked ``_consolidated_message_ids`` entry is a CONCISE
+        # status bubble (as opposed to a verbose consolidated process-log message,
+        # which shares the same dict). Cleanup keys on this — not the current
+        # progress style — so a mid-turn concise->off/verbose flip still retires
+        # the bubble, while a genuine verbose log is never mistaken for a bubble
+        # and deleted. Dropped per turn in ``_drop_status_keys``.
+        self._concise_bubble_keys: set[str] = set()
         # Injectable monotonic-ish clock (wall time) so tests get deterministic
         # elapsed/stale values without sleeping.
         self._now = time.time
@@ -286,6 +293,7 @@ class ConsolidatedMessageDispatcher:
             self._status_last_activity_at.pop(key, None)
             self._status_render_tick.pop(key, None)
             self._status_step_count.pop(key, None)
+            self._concise_bubble_keys.discard(key)
             # NOTE: the finalized marker is intentionally NOT discarded here. The
             # runtime gate is released only AFTER this teardown (in the agent
             # service's finally), so a late same-token process emit during that
@@ -414,6 +422,12 @@ class ConsolidatedMessageDispatcher:
                 except Exception as err:
                     logger.error(f"Failed to send status bubble: {err}", exc_info=True)
                     return None
+
+            # Mark this turn-key as a concise bubble so terminal cleanup retires it
+            # by identity even after a mid-turn style flip, without mistaking a
+            # verbose process-log id (same dict) for a bubble.
+            if message_id:
+                self._concise_bubble_keys.add(consolidated_key)
 
         # Keep the elapsed timer alive even when the agent goes quiet (long tool).
         if message_id:
@@ -750,11 +764,17 @@ class ConsolidatedMessageDispatcher:
     def _concise_status_bubble_id(self, context: MessageContext) -> Optional[str]:
         """The live concise status-bubble id for this turn, if any (else None).
 
-        Keyed on the bubble ACTUALLY posted for this turn, not the current
-        progress style: a Web UI ``concise`` -> ``off``/``verbose`` change mid-turn
-        (now visible immediately via the getter self-refresh) must still let the
-        result path retire an already-posted bubble instead of orphaning it."""
-        return self._consolidated_message_ids.get(self._get_consolidated_message_key(context))
+        Keyed on whether a CONCISE bubble was actually posted for this turn, not
+        the current progress style: a Web UI ``concise`` -> ``off``/``verbose``
+        change mid-turn (now visible immediately via the getter self-refresh) must
+        still let the result path retire an already-posted bubble. Gating on the
+        concise-bubble key set (rather than plain ``_consolidated_message_ids``
+        membership) avoids mistaking a verbose consolidated process-log id — which
+        lives in the same dict — for a status bubble and deleting it."""
+        key = self._get_consolidated_message_key(context)
+        if key not in self._concise_bubble_keys:
+            return None
+        return self._consolidated_message_ids.get(key)
 
     async def _finalize_status_key(self, consolidated_key: str) -> Optional[str]:
         """Atomically mark a turn-key finalized and capture its current bubble id.
@@ -796,11 +816,12 @@ class ConsolidatedMessageDispatcher:
         (✅ for ``done`` else ⏹, time only when ``show_duration``) is owned by
         ``_status_footer_text``. ``reason`` ∈ {"done","stopped","failed"}."""
         key = self._get_consolidated_message_key(context)
-        # Gate on the bubble ACTUALLY posted for this turn, not the current style:
-        # a Web UI concise -> off/verbose change mid-turn must still collapse an
-        # already-posted bubble instead of orphaning it. Turns that never posted a
-        # bubble (off/verbose from the start) have no entry here and no-op cheaply.
-        if not self._consolidated_message_ids.get(key):
+        # Gate on whether a CONCISE bubble was posted for this turn, not the current
+        # style: a Web UI concise -> off/verbose change mid-turn must still collapse
+        # an already-posted bubble. Keying on the concise-bubble set (not plain
+        # _consolidated_message_ids membership) avoids collapsing a verbose
+        # consolidated process-log message, which shares that dict.
+        if key not in self._concise_bubble_keys:
             return
         # Heartbeat first: the render also takes the per-key lock, so stopping it
         # before _finalize_status_key avoids contending with a live tick.

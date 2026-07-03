@@ -306,6 +306,19 @@ class StatusBubbleResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result_id, "msg-2")  # fresh result message
         self.assertEqual(controller.im_client.deletes, ["msg-1"])  # bubble retired, not stuck
 
+    async def test_verbose_result_does_not_delete_process_log(self):
+        # Verbose mode stores its consolidated process-log id in the SAME dict as
+        # concise bubbles. The result path must NOT mistake that log for a status
+        # bubble and delete/collapse it — verbose users keep their process log.
+        controller = _StubController(platform="slack", progress_style="verbose")
+        d = _dispatcher(controller)
+        ctx = _ctx()
+        with mock.patch("core.message_dispatcher.persist_agent_message"):
+            await d.emit_agent_message(ctx, "toolcall", "🔧 `Bash` `{}`")  # verbose log msg-1
+            await d.emit_agent_message(ctx, "result", "Final answer")
+        self.assertEqual(controller.im_client.deletes, [])  # process log NOT deleted
+        self.assertIn("msg-1", [m for m, _, _ in controller.im_client.sent])  # log still present
+
     async def test_result_done_footer_keeps_session_tokens(self):
         # A backend that reports session tokens before the result → the fresh
         # result message's done footer carries "✅ done · {n} tok".
