@@ -748,9 +748,12 @@ class ConsolidatedMessageDispatcher:
             pass
 
     def _concise_status_bubble_id(self, context: MessageContext) -> Optional[str]:
-        """The live concise status-bubble id for this turn, if any (else None)."""
-        if self._concise_progress_style(context) != "concise":
-            return None
+        """The live concise status-bubble id for this turn, if any (else None).
+
+        Keyed on the bubble ACTUALLY posted for this turn, not the current
+        progress style: a Web UI ``concise`` -> ``off``/``verbose`` change mid-turn
+        (now visible immediately via the getter self-refresh) must still let the
+        result path retire an already-posted bubble instead of orphaning it."""
         return self._consolidated_message_ids.get(self._get_consolidated_message_key(context))
 
     async def _finalize_status_key(self, consolidated_key: str) -> Optional[str]:
@@ -792,9 +795,13 @@ class ConsolidatedMessageDispatcher:
         if a bubble exists — edits it to the terminal footer. The footer marker
         (✅ for ``done`` else ⏹, time only when ``show_duration``) is owned by
         ``_status_footer_text``. ``reason`` ∈ {"done","stopped","failed"}."""
-        if self._concise_progress_style(context) != "concise":
-            return
         key = self._get_consolidated_message_key(context)
+        # Gate on the bubble ACTUALLY posted for this turn, not the current style:
+        # a Web UI concise -> off/verbose change mid-turn must still collapse an
+        # already-posted bubble instead of orphaning it. Turns that never posted a
+        # bubble (off/verbose from the start) have no entry here and no-op cheaply.
+        if not self._consolidated_message_ids.get(key):
+            return
         # Heartbeat first: the render also takes the per-key lock, so stopping it
         # before _finalize_status_key avoids contending with a live tick.
         await self._stop_status_heartbeat(key)

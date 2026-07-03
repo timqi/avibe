@@ -291,6 +291,21 @@ class StatusBubbleResultTests(unittest.IsolatedAsyncioTestCase):
         result_persists = [c for c in persist.call_args_list if c.args[1] == "result"]
         self.assertEqual(result_persists[-1].args[2], "Final answer")
 
+    async def test_result_retires_bubble_after_midturn_style_flip_to_off(self):
+        # A concise bubble was posted, then the Web UI flips progress_style to off
+        # mid-turn (now visible immediately via the getter self-refresh). The result
+        # path must still retire (delete) the already-posted bubble via its tracked
+        # id instead of orphaning it because the current style is no longer concise.
+        controller = _StubController(platform="slack")
+        d = _dispatcher(controller)
+        ctx = _ctx()
+        with mock.patch("core.message_dispatcher.persist_agent_message"):
+            await d.emit_agent_message(ctx, "toolcall", "🔧 `Bash` `{}`")  # bubble msg-1
+            controller._progress_style_value = "off"  # Web UI change mid-turn
+            result_id = await d.emit_agent_message(ctx, "result", "Final answer")
+        self.assertEqual(result_id, "msg-2")  # fresh result message
+        self.assertEqual(controller.im_client.deletes, ["msg-1"])  # bubble retired, not stuck
+
     async def test_result_done_footer_keeps_session_tokens(self):
         # A backend that reports session tokens before the result → the fresh
         # result message's done footer carries "✅ done · {n} tok".
