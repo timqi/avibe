@@ -383,7 +383,17 @@ class ConsolidatedMessageDispatcher:
                 # process emit was in flight. Bailing here keeps the terminal
                 # bubble from being resurrected back to a "working" line (C1).
                 return None
-            existing_id = self._consolidated_message_ids.get(consolidated_key)
+            # Only reuse the tracked id when it was itself created as a concise
+            # bubble. If the turn started in ``verbose`` and the Web UI flipped to
+            # ``concise`` mid-turn, the tracked id is the verbose consolidated
+            # process-log message; reusing (and later retiring) it would delete the
+            # user's log. Treat that as "no bubble yet" and post a FRESH concise
+            # bubble, leaving the verbose log untracked and intact.
+            existing_id = (
+                self._consolidated_message_ids.get(consolidated_key)
+                if consolidated_key in self._concise_bubble_keys
+                else None
+            )
             # Buffer holds the latest rendered label so the heartbeat can
             # re-render it with an elapsed-time footer without a new event.
             self._consolidated_message_buffers[consolidated_key] = label

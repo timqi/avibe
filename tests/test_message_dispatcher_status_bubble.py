@@ -319,6 +319,26 @@ class StatusBubbleResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.im_client.deletes, [])  # process log NOT deleted
         self.assertIn("msg-1", [m for m, _, _ in controller.im_client.sent])  # log still present
 
+    async def test_verbose_to_concise_flip_starts_fresh_bubble_keeps_log(self):
+        # Turn starts verbose (consolidated log posted), then the Web UI flips to
+        # concise mid-turn. The next emit must post a FRESH concise bubble instead
+        # of reusing/retiring the verbose log id, so the log survives.
+        controller = _StubController(platform="slack", progress_style="verbose")
+        d = _dispatcher(controller)
+        ctx = _ctx()
+        with mock.patch("core.message_dispatcher.persist_agent_message"):
+            await d.emit_agent_message(ctx, "toolcall", "🔧 `Bash` `{}`")  # verbose log msg-1
+            controller._progress_style_value = "concise"  # Web UI flip mid-turn
+            await d.emit_agent_message(
+                ctx, "toolcall", "🔧 `Read` `{}`", status_label="🔧 Read: a.py"
+            )  # fresh concise bubble msg-2 (NOT an edit of msg-1)
+            result_id = await d.emit_agent_message(ctx, "result", "Final answer")
+        sent_ids = [m for m, _, _ in controller.im_client.sent]
+        self.assertIn("msg-1", sent_ids)  # verbose log posted
+        self.assertIn("msg-2", sent_ids)  # fresh concise bubble posted, not reusing msg-1
+        self.assertEqual(result_id, "msg-3")  # result is its own new message
+        self.assertEqual(controller.im_client.deletes, ["msg-2"])  # only the bubble retired, log kept
+
     async def test_result_done_footer_keeps_session_tokens(self):
         # A backend that reports session tokens before the result → the fresh
         # result message's done footer carries "✅ done · {n} tok".
