@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { FileText, Globe2, Play, RotateCw, Server, Square } from 'lucide-react';
+import { FileText, Globe2, Play, RotateCw, Server, Square, Tag } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import clsx from 'clsx';
 
@@ -10,6 +10,7 @@ import { apiFetch } from '@/lib/apiFetch';
 import { SettingsPageShell } from './SettingsPageShell';
 import { CompactField, SettingsPanel, SettingsRow } from './SettingsPrimitives';
 import { Button } from '@/components/ui/button';
+import { applyAppTitle } from '@/lib/documentTitle';
 
 // Mirrors design.pen mHUcm (VR/CM/Service): two cards.
 // svcSec1: header [16, 20] + value rows [12, 20] with bottom borders.
@@ -30,6 +31,8 @@ export const SettingsServicePage: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [uiSaving, setUiSaving] = useState(false);
   const [uiMessage, setUiMessage] = useState<string | null>(null);
+  const [nameSaving, setNameSaving] = useState(false);
+  const [nameMessage, setNameMessage] = useState<string | null>(null);
 
   useEffect(() => {
     api.getConfig().then(setConfig).catch(() => {});
@@ -118,6 +121,26 @@ export const SettingsServicePage: React.FC = () => {
       setUiMessage(t('common.saveFailed'));
     } finally {
       setUiSaving(false);
+    }
+  };
+
+  // The instance name only changes the browser tab title ("Avibe - <name>"),
+  // so it saves config without restarting the UI server and applies the new
+  // title immediately for live feedback.
+  const handleSaveInstanceName = async () => {
+    if (!config) return;
+    setNameSaving(true);
+    setNameMessage(null);
+    try {
+      const instanceName = (config.ui?.instance_name || '').trim();
+      const nextUi = { ...(config.ui || {}), instance_name: instanceName };
+      await api.saveConfig({ ui: nextUi });
+      applyAppTitle({ ui: nextUi });
+      setNameMessage(t('common.saved'));
+    } catch {
+      setNameMessage(t('common.saveFailed'));
+    } finally {
+      setNameSaving(false);
     }
   };
 
@@ -244,6 +267,42 @@ export const SettingsServicePage: React.FC = () => {
               >
                 <RotateCw className={clsx('size-3.5', uiSaving && 'animate-spin')} strokeWidth={2.5} />
                 {uiSaving ? t('common.saving') : t('common.saveAndRestart')}
+              </Button>
+            </div>
+          }
+        />
+        <SettingsRow
+          title={
+            <span className="inline-flex items-center gap-2">
+              <Tag className="size-3.5 text-cyan" />
+              {t('settings.instanceNameTitle')}
+            </span>
+          }
+          description={nameMessage || t('settings.instanceNameHint')}
+          control={
+            <div className="grid grid-cols-[minmax(160px,220px)_auto] items-center gap-2">
+              <CompactField
+                aria-label={t('settings.instanceNameTitle')}
+                placeholder={config?.ui?.system_hostname || ''}
+                value={config?.ui?.instance_name || ''}
+                onChange={(event) => {
+                  const instanceName = event.target.value;
+                  setNameMessage(null);
+                  setConfig((prev: any) => ({
+                    ...(prev || {}),
+                    ui: { ...((prev && prev.ui) || {}), instance_name: instanceName },
+                  }));
+                }}
+              />
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => void handleSaveInstanceName()}
+                disabled={nameSaving}
+                className="text-[12px]"
+              >
+                {nameSaving ? t('common.saving') : t('common.save')}
               </Button>
             </div>
           }
