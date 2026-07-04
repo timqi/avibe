@@ -71,6 +71,9 @@ def create_app(controller: "Controller") -> FastAPI:
     Factored out so tests can mount the same routes against a fake
     controller without spinning up uvicorn.
     """
+    from core.inbox_events import mark_controller_process
+
+    mark_controller_process()
 
     app = FastAPI(
         title="avibe internal dispatch",
@@ -429,6 +432,28 @@ def create_app(controller: "Controller") -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
+
+    @app.post("/internal/events")
+    async def _publish_event(request: Request) -> Any:
+        """Publish an allowlisted notification into the Controller event bus.
+
+        Local child processes cannot share ``core.inbox_events.bus`` directly,
+        but they can reach this permission-restricted Unix socket and reuse the
+        same Controller -> UI-server -> browser SSE path.
+        """
+        from core.inbox_events import RUNS_UPDATED_EVENT, VAULTS_UPDATED_EVENT, bus
+
+        payload = await _safe_json(request)
+        if not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_payload"})
+        event_type = str(payload.get("type") or "").strip()
+        data = payload.get("data")
+        if event_type not in {RUNS_UPDATED_EVENT, VAULTS_UPDATED_EVENT}:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "unsupported_event_type"})
+        if not isinstance(data, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_event_data"})
+        bus.publish(event_type, data)
+        return {"ok": True}
 
     @app.post("/internal/cancel/{session_id}")
     async def _cancel(session_id: str) -> Any:

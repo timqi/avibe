@@ -1314,6 +1314,41 @@ class VaultApiError(ValueError):
         self.status = status
 
 
+def _publish_vaults_updated(
+    *,
+    scope: str,
+    request_id: str | None = None,
+    request_status: str | None = None,
+    grant_id: str | None = None,
+    grant_status: str | None = None,
+    secret_name: str | None = None,
+) -> None:
+    """Publish a UI-server-local vault update event for refetch-on-event pages."""
+
+    try:
+        from core.inbox_events import VAULTS_UPDATED_EVENT, vaults_updated_payload
+        from vibe.sse_broker import broker
+
+        payload = vaults_updated_payload(
+            scope=scope,
+            request_id=request_id,
+            request_status=request_status,
+            grant_id=grant_id,
+            grant_status=grant_status,
+            secret_name=secret_name,
+        )
+        broker.publish(VAULTS_UPDATED_EVENT, payload)
+        if broker.subscriber_count() == 0:
+            try:
+                from vibe import internal_client
+
+                internal_client.publish_event_sync(VAULTS_UPDATED_EVENT, payload, timeout=1.5)
+            except Exception:
+                logger.debug("vaults.updated bridge publish failed", exc_info=True)
+    except Exception:
+        logger.debug("vaults.updated publish failed", exc_info=True)
+
+
 def _vault_api_error_from_avault(exc: "AvaultError", *, prefix: str) -> VaultApiError:
     message = str(exc)
     if "requires avault >=" in message:
@@ -1465,16 +1500,25 @@ def create_vault_secret(payload: dict) -> dict:
     except vault_service.InvalidSecretNameError as exc:
         raise VaultApiError("invalid secret name (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name") from exc
     except vault_service.SecretExistsError as exc:
+        fulfilled_count = 0
         try:
             with engine.begin() as conn:
-                vault_service.fulfill_pending_provision_requests_for_secret(conn, name)
+                fulfilled_count = vault_service.fulfill_pending_provision_requests_for_secret(conn, name)
         except Exception:
             logger.warning("failed to settle pending provision requests for existing secret %s", name, exc_info=True)
+        if fulfilled_count > 0:
+            _publish_vaults_updated(scope="secret", secret_name=name, request_status="fulfilled")
         raise VaultApiError(f"secret '{name}' already exists", code="secret_exists", status=409) from exc
     except vault_service.VaultAlreadyInitializedError as exc:
         raise VaultApiError(str(exc), code="vault_already_initialized", status=409) from exc
     except vault_service.VaultServiceError as exc:
         raise VaultApiError(str(exc), code="vault_error") from exc
+    _publish_vaults_updated(
+        scope="secret",
+        secret_name=meta.get("name") or name,
+        request_id=str(payload.get("provision_request_id") or "") or None,
+        request_status="fulfilled" if payload.get("provision_request_id") else None,
+    )
     return {"ok": True, "secret": meta}
 
 
@@ -1491,6 +1535,7 @@ def delete_vault_secret(name: str) -> dict:
     except vault_service.SecretNotFoundError as exc:
         raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
     release_vault_agent_scopes(release_scopes, reason="delete_vault_secret")
+    _publish_vaults_updated(scope="secret", secret_name=name)
     return {"ok": True, "removed": True, "name": name}
 
 
@@ -1684,6 +1729,12 @@ def request_vault_access(payload: dict) -> dict:
         raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
     except vault_service.VaultServiceError as exc:
         raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    _publish_vaults_updated(
+        scope="request",
+        request_id=request.get("id"),
+        request_status=request.get("status"),
+        secret_name=request.get("secret_name"),
+    )
     return {"ok": True, "request": request}
 
 
@@ -1726,6 +1777,12 @@ def request_vault_sign(payload: dict) -> dict:
         raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
     except vault_service.VaultServiceError as exc:
         raise VaultApiError(str(exc), code="vault_error") from exc
+    _publish_vaults_updated(
+        scope="request",
+        request_id=request.get("id"),
+        request_status=request.get("status"),
+        secret_name=request.get("secret_name"),
+    )
     return {"ok": True, "request": request}
 
 
@@ -1746,6 +1803,12 @@ def deny_vault_request(request_id: str, payload: dict | None = None) -> dict:
         raise VaultApiError(f"request '{request_id}' not found", code="request_not_found", status=404) from exc
     except vault_service.InvalidRequestError as exc:
         raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+    _publish_vaults_updated(
+        scope="request",
+        request_id=request.get("id") or str(request_id),
+        request_status=request.get("status"),
+        secret_name=request.get("secret_name"),
+    )
     return {"ok": True, "request": request}
 
 
@@ -1795,6 +1858,7 @@ def consume_one_shot_grants(grants: list[dict] | tuple[dict, ...] | None, *, rea
         return
     seen: set[str] = set()
     release_scopes: list[dict[str, str]] = []
+    consumed_grants: list[dict[str, str | None]] = []
     engine = _vault_engine()
     with engine.begin() as conn:
         for grant in grants:
@@ -1806,7 +1870,15 @@ def consume_one_shot_grants(grants: list[dict] | tuple[dict, ...] | None, *, rea
             seen.add(grant_id)
             with contextlib.suppress(vault_service.GrantNotActiveError, vault_service.GrantNotFoundError):
                 release_scopes.extend(vault_service.consume_one_shot_grant(conn, grant_id))
+                consumed_grants.append({"id": grant_id, "request_id": str(grant.get("request_id") or "") or None})
     release_vault_agent_scopes(release_scopes, reason=reason)
+    for grant in consumed_grants:
+        _publish_vaults_updated(
+            scope="grant",
+            grant_id=grant["id"],
+            grant_status="expired",
+            request_id=grant.get("request_id"),
+        )
 
 
 def _agent_grant_cached_all(result: dict, expected_count: int) -> bool:
@@ -2108,6 +2180,13 @@ def create_vault_grant(payload: dict) -> dict:
     except vault_service.InvalidGrantError as exc:
         raise VaultApiError(str(exc), code="invalid_grant") from exc
     if not needs_agent_deks:
+        _publish_vaults_updated(
+            scope="grant",
+            request_id=request_id,
+            request_status="approved",
+            grant_id=grant.get("id"),
+            grant_status=grant.get("status"),
+        )
         return {"ok": True, "grant": grant}
     agent_relayed = False
     try:
@@ -2165,6 +2244,13 @@ def create_vault_grant(payload: dict) -> dict:
                 force_release_scope=True,
             )
         raise
+    _publish_vaults_updated(
+        scope="grant",
+        request_id=request_id,
+        request_status="approved",
+        grant_id=grant.get("id"),
+        grant_status=grant.get("status"),
+    )
     return {"ok": True, "grant": grant}
 
 
@@ -2487,6 +2573,12 @@ def revoke_vault_grant(grant_id: str) -> dict:
     except vault_service.GrantNotActiveError as exc:
         raise VaultApiError(f"grant '{grant_id}' is not active", code="grant_not_active", status=409) from exc
     release_vault_agent_scopes(release_scopes, reason=f"revoke_vault_grant:{grant_id}")
+    _publish_vaults_updated(
+        scope="grant",
+        grant_id=grant.get("id") or grant_id,
+        grant_status=grant.get("status"),
+        request_id=grant.get("request_id"),
+    )
     return {"ok": True, "grant": grant}
 
 
@@ -2508,6 +2600,8 @@ def vault_sign(payload: dict) -> dict:
     if not vault_crypto.is_valid_secret_name(name):
         raise VaultApiError("invalid secret name (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name")
     engine = _vault_engine()
+    protected_response: dict | None = None
+    protected_event: dict | None = None
     try:
         with engine.begin() as conn:
             meta = vault_service.get_secret_meta(conn, name)
@@ -2531,27 +2625,41 @@ def vault_sign(payload: dict) -> dict:
                         requester=payload.get("requester") if isinstance(payload.get("requester"), dict) else None,
                         delivery=payload.get("delivery") if isinstance(payload.get("delivery"), dict) else None,
                     )
-                    return {"ok": False, "code": "browser_signature_required", "request": request}
+                    protected_event = {
+                        "scope": "request",
+                        "request_id": request.get("id"),
+                        "request_status": request.get("status"),
+                        "secret_name": request.get("secret_name"),
+                    }
+                    protected_response = {"ok": False, "code": "browser_signature_required", "request": request}
+                else:
+                    request_id = str(payload.get("request_id") or "")
+                    if not request_id:
+                        raise VaultApiError("request_id is required to complete protected signing", code="missing_request_id")
+                    vault_service.validate_sign_request(conn, request_id, name=name, digest=digest, scheme=scheme)
+                    signature = _normalized_protected_signature(signature)
+                    _verify_protected_browser_signature(meta, digest=digest, scheme=scheme, signature=signature)
+                    request = vault_service.complete_sign_request(
+                        conn,
+                        request_id,
+                        name=name,
+                        digest=digest,
+                        scheme=scheme,
+                        signature=signature,
+                        requester=payload.get("requester") if isinstance(payload.get("requester"), dict) else None,
+                    )
+                    protected_event = {
+                        "scope": "request",
+                        "request_id": request.get("id") or request_id,
+                        "request_status": request.get("status"),
+                        "secret_name": request.get("secret_name"),
+                    }
+                    protected_response = {"ok": True, "signature": signature, "request": request}
+            else:
                 request_id = str(payload.get("request_id") or "")
-                if not request_id:
-                    raise VaultApiError("request_id is required to complete protected signing", code="missing_request_id")
-                vault_service.validate_sign_request(conn, request_id, name=name, digest=digest, scheme=scheme)
-                signature = _normalized_protected_signature(signature)
-                _verify_protected_browser_signature(meta, digest=digest, scheme=scheme, signature=signature)
-                request = vault_service.complete_sign_request(
-                    conn,
-                    request_id,
-                    name=name,
-                    digest=digest,
-                    scheme=scheme,
-                    signature=signature,
-                    requester=payload.get("requester") if isinstance(payload.get("requester"), dict) else None,
-                )
-                return {"ok": True, "signature": signature, "request": request}
-            request_id = str(payload.get("request_id") or "")
-            if request_id:
-                vault_service.claim_sign_request(conn, request_id, name=name, digest=digest, scheme=scheme)
-            key_envelope = vault_service.get_key_envelope(conn, name)
+                if request_id:
+                    vault_service.claim_sign_request(conn, request_id, name=name, digest=digest, scheme=scheme)
+                key_envelope = vault_service.get_key_envelope(conn, name)
     except vault_service.SecretNotFoundError as exc:
         raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
     except vault_service.RequestNotFoundError as exc:
@@ -2561,13 +2669,24 @@ def vault_sign(payload: dict) -> dict:
     except vault_service.VaultServiceError as exc:
         raise VaultApiError(str(exc), code="vault_error") from exc
 
+    if protected_response is not None:
+        if protected_event is not None:
+            _publish_vaults_updated(**protected_event)
+        return protected_response
+
     def _fail_claimed_request(reason: str) -> None:
         request_id = str(payload.get("request_id") or "")
         if not request_id:
             return
         with contextlib.suppress(Exception):
             with engine.begin() as conn:
-                vault_service.fail_sign_request(conn, request_id, reason=reason)
+                request = vault_service.fail_sign_request(conn, request_id, reason=reason)
+            _publish_vaults_updated(
+                scope="request",
+                request_id=request.get("id") or request_id,
+                request_status=request.get("status"),
+                secret_name=request.get("secret_name"),
+            )
 
     try:
         signature = avault_sign(key_envelope, digest, scheme, name=name)
@@ -2592,6 +2711,12 @@ def vault_sign(payload: dict) -> dict:
         except vault_service.InvalidRequestError as exc:
             _fail_claimed_request("signature_rejected")
             raise VaultApiError(str(exc), code="invalid_request", status=409) from exc
+        _publish_vaults_updated(
+            scope="request",
+            request_id=request.get("id") or request_id,
+            request_status=request.get("status"),
+            secret_name=request.get("secret_name"),
+        )
         return {"ok": True, "signature": signature, "request": request}
     try:
         with engine.begin() as conn:
@@ -2622,6 +2747,7 @@ def store_vault_pubkey_pin(payload: dict) -> dict:
             meta = vault_service.store_pubkey_pin(conn, name, pin)
     except vault_service.SecretNotFoundError as exc:
         raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
+    _publish_vaults_updated(scope="secret", secret_name=meta.get("name") or name)
     return {"ok": True, "secret": meta}
 
 

@@ -14,6 +14,10 @@ import { useToast } from '../../context/ToastContext';
 import { VaultApprovalCard, type ApprovalOutcome } from '../ui/vault-approval-card';
 import { VaultSecretForm } from '../ui/vault-secret-form';
 
+const PENDING_REQUEST_POLL_INTERVAL_MS = 5000;
+const PENDING_REQUEST_EXPIRY_GRACE_MS = 100;
+const MAX_BROWSER_TIMEOUT_MS = 2_147_483_647;
+
 const AddSecretDialog: React.FC<{
   onClose: () => void;
   onCreated: (name: string, reason?: 'created' | 'already_exists') => void;
@@ -152,6 +156,17 @@ function isExpired(expiresAt: string, now: number): boolean {
   return !Number.isNaN(end) && end <= now;
 }
 
+function earliestRequestExpiry(requests: VaultRequest[]): number | null {
+  let earliest: number | null = null;
+  for (const request of requests) {
+    if (!request.expires_at) continue;
+    const expiresAt = Date.parse(request.expires_at);
+    if (Number.isNaN(expiresAt)) continue;
+    earliest = earliest == null ? expiresAt : Math.min(earliest, expiresAt);
+  }
+  return earliest;
+}
+
 /** Compact mm:ss / h:mm:ss countdown for a grant chip (design.pen `y4rw5Q` shows `12:34`). */
 function chipCountdown(rem: { h: number; m: number; s: number }): string {
   const pad = (n: number) => n.toString().padStart(2, '0');
@@ -286,6 +301,7 @@ const PendingRequestsSection: React.FC<{ onResolved: () => void }> = ({ onResolv
   const [requests, setRequests] = useState<VaultRequest[]>([]);
   const [reviewing, setReviewing] = useState<VaultRequest | null>(null);
   const [provisioning, setProvisioning] = useState<VaultRequest | null>(null);
+  const [eventBridgeConnected, setEventBridgeConnected] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -302,12 +318,87 @@ const PendingRequestsSection: React.FC<{ onResolved: () => void }> = ({ onResolv
     }
   }, [api]);
 
-  // Poll so a request an agent raises while the hub is open appears without a manual refresh.
   useEffect(() => {
     load();
-    const id = setInterval(load, 5000);
-    return () => clearInterval(id);
   }, [load]);
+
+  useEffect(() => {
+    return api.connectWorkbenchEvents({
+      onConnected: (data) => {
+        if (data.source === 'controller') {
+          setEventBridgeConnected(true);
+          load();
+        }
+      },
+      onEventBridgeStatus: ({ connected }) => {
+        setEventBridgeConnected(connected);
+        if (connected) load();
+      },
+      onError: () => setEventBridgeConnected(false),
+      onVaultsUpdated: () => load(),
+    });
+  }, [api, load]);
+
+  useEffect(() => {
+    if (eventBridgeConnected) return;
+    let timer: number | undefined;
+    let cancelled = false;
+    let inFlight = false;
+    let pendingWake = false;
+
+    const tick = async () => {
+      if (cancelled) return;
+      if (document.visibilityState !== 'visible') {
+        timer = window.setTimeout(tick, PENDING_REQUEST_POLL_INTERVAL_MS);
+        return;
+      }
+      if (inFlight) {
+        pendingWake = true;
+        return;
+      }
+      inFlight = true;
+      window.clearTimeout(timer);
+      try {
+        await load();
+      } finally {
+        inFlight = false;
+      }
+      if (cancelled) return;
+      if (pendingWake) {
+        pendingWake = false;
+        void tick();
+        return;
+      }
+      timer = window.setTimeout(tick, PENDING_REQUEST_POLL_INTERVAL_MS);
+    };
+
+    const refreshNow = () => {
+      if (document.visibilityState === 'visible') void tick();
+    };
+
+    void tick();
+    document.addEventListener('visibilitychange', refreshNow);
+    window.addEventListener('focus', refreshNow);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', refreshNow);
+      window.removeEventListener('focus', refreshNow);
+    };
+  }, [eventBridgeConnected, load]);
+
+  useEffect(() => {
+    const expiresAt = earliestRequestExpiry(requests);
+    if (expiresAt == null) return;
+    const delay = Math.min(
+      Math.max(0, expiresAt - Date.now() + PENDING_REQUEST_EXPIRY_GRACE_MS),
+      MAX_BROWSER_TIMEOUT_MS,
+    );
+    const timer = window.setTimeout(() => {
+      void load();
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [requests, load]);
 
   const handleOutcome = useCallback(
     (outcome: ApprovalOutcome) => {
@@ -415,6 +506,7 @@ export const VaultsPage: React.FC = () => {
   const [activeTags, setActiveTags] = useState<string[]>([]);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [now, setNow] = useState(() => Date.now());
+  const [eventBridgeConnected, setEventBridgeConnected] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -441,6 +533,71 @@ export const VaultsPage: React.FC = () => {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    return api.connectWorkbenchEvents({
+      onConnected: (data) => {
+        if (data.source === 'controller') {
+          setEventBridgeConnected(true);
+          refresh();
+        }
+      },
+      onEventBridgeStatus: ({ connected }) => {
+        setEventBridgeConnected(connected);
+        if (connected) refresh();
+      },
+      onError: () => setEventBridgeConnected(false),
+      onVaultsUpdated: () => refresh(),
+    });
+  }, [api, refresh]);
+
+  useEffect(() => {
+    if (eventBridgeConnected) return;
+    let timer: number | undefined;
+    let cancelled = false;
+    let inFlight = false;
+    let pendingWake = false;
+
+    const tick = async () => {
+      if (cancelled) return;
+      if (document.visibilityState !== 'visible') {
+        timer = window.setTimeout(tick, 5000);
+        return;
+      }
+      if (inFlight) {
+        pendingWake = true;
+        return;
+      }
+      inFlight = true;
+      window.clearTimeout(timer);
+      try {
+        await refresh();
+      } finally {
+        inFlight = false;
+      }
+      if (cancelled) return;
+      if (pendingWake) {
+        pendingWake = false;
+        void tick();
+        return;
+      }
+      timer = window.setTimeout(tick, 5000);
+    };
+
+    const refreshNow = () => {
+      if (document.visibilityState === 'visible') void tick();
+    };
+
+    void tick();
+    document.addEventListener('visibilitychange', refreshNow);
+    window.addEventListener('focus', refreshNow);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', refreshNow);
+      window.removeEventListener('focus', refreshNow);
+    };
+  }, [eventBridgeConnected, refresh]);
 
   // Tick once a second while there are live grants: advance the countdown and
   // drop any grant that has reached its expiry. The backend's status=active

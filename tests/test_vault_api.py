@@ -110,6 +110,25 @@ def test_create_list_delete_roundtrip(monkeypatch):
     assert api.get_vault_secrets()["secrets"] == []
 
 
+def test_create_vault_secret_publishes_update_event(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        "vibe.sse_broker.broker.publish",
+        lambda event_type, data: published.append((event_type, data)),
+    )
+    monkeypatch.setattr("vibe.internal_client.publish_event_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+
+    api.create_vault_secret(
+        {
+            "name": "EVENT_KEY",
+            "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+        }
+    )
+
+    assert ("vaults.updated", {"scope": "secret", "secret_name": "EVENT_KEY"}) in published
+
+
 def test_standard_rest_create_rejects_plaintext_value(monkeypatch):
     from unittest.mock import Mock
 
@@ -362,6 +381,36 @@ def test_secret_exists_response_commits_stale_pending_provision_cleanup(monkeypa
     with api._vault_engine().connect() as conn:
         stale_status = conn.execute(select(vault_requests.c.status).where(vault_requests.c.id == stale["id"])).scalar_one()
     assert stale_status == "fulfilled"
+
+
+def test_secret_exists_response_publishes_when_fulfilling_stale_provisions(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        "vibe.sse_broker.broker.publish",
+        lambda event_type, data: published.append((event_type, data)),
+    )
+    monkeypatch.setattr("vibe.internal_client.publish_event_sync", lambda *args, **kwargs: None)
+    seal = Mock(side_effect=[_sealed("first"), _sealed("second")])
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    with api._vault_engine().begin() as conn:
+        req = vault_service.create_provision_request(conn, "GH_TOKEN")
+
+    payload = {
+        "name": "GH_TOKEN",
+        "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+        "provision_request_id": req["id"],
+    }
+    api.create_vault_secret(payload)
+    published.clear()
+    with api._vault_engine().begin() as conn:
+        stale = vault_service.create_provision_request(conn, "GH_TOKEN")
+        conn.execute(vault_requests.update().where(vault_requests.c.id == stale["id"]).values(status="pending"))
+
+    with pytest.raises(api.VaultApiError) as exc:
+        api.create_vault_secret({**payload, "blind_box": {**payload["blind_box"], "enc": "enc2", "ct": "ct2"}})
+
+    assert exc.value.code == "secret_exists"
+    assert ("vaults.updated", {"scope": "secret", "request_status": "fulfilled", "secret_name": "GH_TOKEN"}) in published
 
 
 def test_duplicate_name_conflict(monkeypatch):
@@ -1563,6 +1612,12 @@ def test_revoke_grant_releases_only_that_grant_id(monkeypatch):
 
 
 def test_consume_one_shot_releases_only_that_grant_id(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        "vibe.sse_broker.broker.publish",
+        lambda event_type, data: published.append((event_type, data)),
+    )
+    monkeypatch.setattr("vibe.internal_client.publish_event_sync", lambda *args, **kwargs: None)
     monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
     agent_release = Mock(return_value={"released": True})
     monkeypatch.setattr(api, "avault_agent_release", agent_release)
@@ -1590,9 +1645,19 @@ def test_consume_one_shot_releases_only_that_grant_id(monkeypatch):
         )
         grant_2 = _grant_from_request(conn, req_2)
 
+    published.clear()
     api.consume_one_shot_grants([grant_1], reason="test")
 
     agent_release.assert_called_once_with(grant_id=grant_1["id"])
+    assert (
+        "vaults.updated",
+        {
+            "scope": "grant",
+            "request_id": grant_1["request_id"],
+            "grant_id": grant_1["id"],
+            "grant_status": "expired",
+        },
+    ) in published
     with api._vault_engine().connect() as conn:
         statuses = {
             row["id"]: row["status"]
