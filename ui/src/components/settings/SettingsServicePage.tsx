@@ -133,9 +133,16 @@ export const SettingsServicePage: React.FC = () => {
     setNameMessage(null);
     try {
       const instanceName = (config.ui?.instance_name || '').trim();
-      const nextUi = { ...(config.ui || {}), instance_name: instanceName };
-      await api.saveConfig({ ui: nextUi });
-      applyAppTitle({ ui: nextUi });
+      // Persist ONLY the instance name. Spreading the shared (and possibly
+      // dirty) config.ui would also save unsaved Console server host/port
+      // edits — but without the /api/ui/reload + redirect that
+      // handleUiSaveRestart performs — so the running UI keeps the old bind
+      // while the next restart silently moves to the unsaved address. The
+      // backend deep-merges config saves, so host/port are preserved.
+      await api.saveConfig({ ui: { instance_name: instanceName } });
+      // Reflect the new title immediately. system_hostname is the read-only,
+      // server-computed fallback (unaffected by host/port edits).
+      applyAppTitle({ ui: { instance_name: instanceName, system_hostname: config.ui?.system_hostname } });
       setNameMessage(t('common.saved'));
     } catch {
       setNameMessage(t('common.saveFailed'));
