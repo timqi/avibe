@@ -4952,7 +4952,7 @@ def cmd_vault_access(args):
     name = getattr(args, "name", "")
     try:
         if not vault_crypto.is_valid_secret_name(name):
-            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name", help_command=help_command)
+            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name", help_command=help_command)
         engine = _open_vault_engine()
         with engine.begin() as conn:
             vault_service.get_secret_meta(conn, name)
@@ -5978,7 +5978,7 @@ def cmd_vault_request(args):
     try:
         name = args.name
         if not vault_crypto.is_valid_secret_name(name):
-            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name", help_command=help_command)
+            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name", help_command=help_command)
         spec = _load_vault_request_spec(args, help_command=help_command)
         engine = _open_vault_engine()
         with engine.begin() as conn:
@@ -6035,6 +6035,9 @@ def cmd_vault_request(args):
     except TaskCliError as exc:
         _print_task_error(exc)
         return 1
+    except vault_service.SecretNameCaseConflictError as exc:
+        _print_task_error(TaskCliError(str(exc), code="secret_name_case_conflict", help_command=help_command))
+        return 1
     except vault_service.VaultServiceError as exc:
         _print_task_error(TaskCliError(str(exc), code="invalid_spec", help_command=help_command))
         return 1
@@ -6050,7 +6053,7 @@ def cmd_vault_sign(args):
     name = getattr(args, "name", "")
     try:
         if not vault_crypto.is_valid_secret_name(name):
-            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name", help_command=help_command)
+            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name", help_command=help_command)
         digest = api._sign_digest_from_payload(getattr(args, "digest", None))
         scheme = getattr(args, "scheme", None) or "ecdsa-secp256k1-recoverable"
         engine = _open_vault_engine()
