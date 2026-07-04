@@ -291,17 +291,17 @@ class StatusBubbleResultTests(unittest.IsolatedAsyncioTestCase):
         result_persists = [c for c in persist.call_args_list if c.args[1] == "result"]
         self.assertEqual(result_persists[-1].args[2], "Final answer")
 
-    async def test_result_retires_bubble_after_midturn_style_flip_to_off(self):
-        # A concise bubble was posted, then the Web UI flips progress_style to off
-        # mid-turn (now visible immediately via the getter self-refresh). The result
-        # path must still retire (delete) the already-posted bubble via its tracked
-        # id instead of orphaning it because the current style is no longer concise.
+    async def test_style_snapshot_keeps_concise_when_config_flips_to_off(self):
+        # The effective progress style is snapshotted per turn: a Web UI flip to
+        # off mid-turn does NOT take effect until the next turn, so the concise
+        # bubble is rendered and retired normally (no stranded bubble).
         controller = _StubController(platform="slack")
         d = _dispatcher(controller)
         ctx = _ctx()
         with mock.patch("core.message_dispatcher.persist_agent_message"):
             await d.emit_agent_message(ctx, "toolcall", "🔧 `Bash` `{}`")  # bubble msg-1
-            controller._progress_style_value = "off"  # Web UI change mid-turn
+            controller._progress_style_value = "off"  # Web UI change mid-turn (deferred)
+            self.assertEqual(d._concise_progress_style(ctx), "concise")  # snapshot unchanged
             result_id = await d.emit_agent_message(ctx, "result", "Final answer")
         self.assertEqual(result_id, "msg-2")  # fresh result message
         self.assertEqual(controller.im_client.deletes, ["msg-1"])  # bubble retired, not stuck
@@ -319,31 +319,28 @@ class StatusBubbleResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.im_client.deletes, [])  # process log NOT deleted
         self.assertIn("msg-1", [m for m, _, _ in controller.im_client.sent])  # log still present
 
-    async def test_verbose_to_concise_flip_starts_fresh_bubble_keeps_log(self):
-        # Turn starts verbose (consolidated log posted), then the Web UI flips to
-        # concise mid-turn. The next emit must post a FRESH concise bubble instead
-        # of reusing/retiring the verbose log id, so the log survives.
+    async def test_style_snapshot_keeps_verbose_when_config_flips_to_concise(self):
+        # Turn starts verbose (log posted). A Web UI flip to concise mid-turn is
+        # deferred to the next turn by the per-turn snapshot, so the next emit keeps
+        # appending to the SAME verbose log (no fresh concise bubble) and the result
+        # never retires it.
         controller = _StubController(platform="slack", progress_style="verbose")
         d = _dispatcher(controller)
         ctx = _ctx()
         with mock.patch("core.message_dispatcher.persist_agent_message"):
             await d.emit_agent_message(ctx, "toolcall", "🔧 `Bash` `{}`")  # verbose log msg-1
-            controller._progress_style_value = "concise"  # Web UI flip mid-turn
-            await d.emit_agent_message(
-                ctx, "toolcall", "🔧 `Read` `{}`", status_label="🔧 Read: a.py"
-            )  # fresh concise bubble msg-2 (NOT an edit of msg-1)
+            controller._progress_style_value = "concise"  # Web UI flip mid-turn (deferred)
+            self.assertEqual(d._concise_progress_style(ctx), "verbose")  # snapshot unchanged
+            await d.emit_agent_message(ctx, "toolcall", "🔧 `Read` `{}`")  # appended to msg-1, no new bubble
             result_id = await d.emit_agent_message(ctx, "result", "Final answer")
-        sent_ids = [m for m, _, _ in controller.im_client.sent]
-        self.assertIn("msg-1", sent_ids)  # verbose log posted
-        self.assertIn("msg-2", sent_ids)  # fresh concise bubble posted, not reusing msg-1
-        self.assertEqual(result_id, "msg-3")  # result is its own new message
-        self.assertEqual(controller.im_client.deletes, ["msg-2"])  # only the bubble retired, log kept
+        self.assertEqual(result_id, "msg-2")  # only the log (msg-1) + result (msg-2) were sent
+        self.assertEqual([m for m, _, _ in controller.im_client.sent], ["msg-1", "msg-2"])
+        self.assertEqual(controller.im_client.deletes, [])  # verbose log NOT retired
 
-    async def test_concise_to_verbose_flip_keeps_reused_log(self):
-        # Turn starts concise (bubble posted + marked), then the Web UI flips to
-        # verbose mid-turn. The verbose path reuses the bubble message as the log;
-        # the concise marker must be cleared so the result path keeps the log
-        # instead of retiring it as a bubble.
+    async def test_style_snapshot_keeps_concise_when_config_flips_to_verbose(self):
+        # Turn starts concise (bubble posted). A Web UI flip to verbose mid-turn is
+        # deferred by the snapshot, so the next emit keeps editing the SAME concise
+        # bubble and the result retires it normally.
         controller = _StubController(platform="slack", progress_style="concise")
         d = _dispatcher(controller)
         ctx = _ctx()
@@ -351,11 +348,27 @@ class StatusBubbleResultTests(unittest.IsolatedAsyncioTestCase):
             await d.emit_agent_message(
                 ctx, "toolcall", "🔧 `Bash` `{}`", status_label="🔧 Bash"
             )  # concise bubble msg-1
-            controller._progress_style_value = "verbose"  # Web UI flip mid-turn
-            await d.emit_agent_message(ctx, "toolcall", "🔧 `Read` `{}`")  # verbose reuses msg-1 as log
+            controller._progress_style_value = "verbose"  # Web UI flip mid-turn (deferred)
+            self.assertEqual(d._concise_progress_style(ctx), "concise")  # snapshot unchanged
+            await d.emit_agent_message(
+                ctx, "toolcall", "🔧 `Read` `{}`", status_label="🔧 Read"
+            )  # edits the same bubble msg-1, no new message
             result_id = await d.emit_agent_message(ctx, "result", "Final answer")
-        self.assertEqual(controller.im_client.deletes, [])  # reused log NOT retired
         self.assertEqual(result_id, "msg-2")  # result is its own new message
+        self.assertEqual(controller.im_client.deletes, ["msg-1"])  # concise bubble retired normally
+
+    async def test_style_snapshot_cleared_after_turn(self):
+        # The per-turn snapshot is dropped in teardown so the NEXT turn re-reads
+        # config — i.e. a Web UI change still takes effect, just at turn boundaries.
+        controller = _StubController(platform="slack", progress_style="concise")
+        d = _dispatcher(controller)
+        ctx = _ctx()
+        with mock.patch("core.message_dispatcher.persist_agent_message"):
+            await d.emit_agent_message(ctx, "toolcall", "🔧 `Bash` `{}`")
+            key = d._get_consolidated_message_key(ctx)
+            self.assertEqual(d._turn_progress_style.get(key), "concise")  # snapshot taken
+            await d.emit_agent_message(ctx, "result", "Done")
+        self.assertNotIn(key, d._turn_progress_style)  # cleared at turn end
 
     async def test_result_done_footer_keeps_session_tokens(self):
         # A backend that reports session tokens before the result → the fresh

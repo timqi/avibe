@@ -164,6 +164,12 @@ class ConsolidatedMessageDispatcher:
         # the bubble, while a genuine verbose log is never mistaken for a bubble
         # and deleted. Dropped per turn in ``_drop_status_keys``.
         self._concise_bubble_keys: set[str] = set()
+        # Per-turn (consolidated_key) snapshot of the effective progress style, so
+        # a single turn cannot flip concise<->verbose<->off mid-way even if the Web
+        # UI setting changes while the backend is still emitting. Resolved lazily on
+        # first use per turn (see ``_concise_progress_style``), dropped in
+        # ``_drop_status_keys``.
+        self._turn_progress_style: dict[str, str] = {}
         # Injectable monotonic-ish clock (wall time) so tests get deterministic
         # elapsed/stale values without sleeping.
         self._now = time.time
@@ -294,6 +300,7 @@ class ConsolidatedMessageDispatcher:
             self._status_render_tick.pop(key, None)
             self._status_step_count.pop(key, None)
             self._concise_bubble_keys.discard(key)
+            self._turn_progress_style.pop(key, None)
             # NOTE: the finalized marker is intentionally NOT discarded here. The
             # runtime gate is released only AFTER this teardown (in the agent
             # service's finally), so a late same-token process emit during that
@@ -331,15 +338,36 @@ class ConsolidatedMessageDispatcher:
         return DEFAULT_AGENT_PROGRESS_STYLE
 
     def _concise_progress_style(self, context: MessageContext) -> str:
-        """Effective progress style for the process-message path.
+        """Effective progress style for the process-message path, SNAPSHOTTED per
+        turn.
 
         Only platforms with the ``supports_status_bubble`` capability (Slack/
         Discord today) opt into concise/off; every other platform keeps the
         existing ``verbose`` append path, so their output stays byte-identical.
-        """
+
+        The effective style is resolved ONCE per turn (keyed by the turn's
+        consolidated key) and cached for the rest of that turn. ``self.config`` may
+        still be hot-reloaded mid-turn (via ``_t()`` or the controller getters) so
+        the NEXT turn starts fresh — that satisfies the "scheduled/background turns
+        pick up Web UI changes at their START" requirement — but a single turn can
+        never flip style halfway. That intra-turn stability is what keeps the
+        concise-bubble vs verbose-log lifecycle self-consistent (a mid-turn flip
+        would otherwise strand a bubble, delete a verbose log, or leave a heartbeat
+        stamping a log)."""
         if not self._capabilities(context).supports_status_bubble:
             return "verbose"
-        return self._progress_style(context)
+        key = self._get_consolidated_message_key(context)
+        cached = self._turn_progress_style.get(key)
+        if cached is not None:
+            return cached
+        style = self._progress_style(context)
+        # Bound the cache: entries are dropped per turn in ``_drop_status_keys``,
+        # but clear proactively if it ever grows large so a missed teardown can't
+        # leak unboundedly (mirrors the ``_status_finalized`` guard).
+        if len(self._turn_progress_style) > 512:
+            self._turn_progress_style.clear()
+        self._turn_progress_style[key] = style
+        return style
 
     async def _render_concise_status(
         self,
@@ -1657,12 +1685,11 @@ class ConsolidatedMessageDispatcher:
         lock = self._get_consolidated_message_lock(consolidated_key)
 
         async with lock:
-            # Entering the verbose consolidation path. If this turn had a concise
-            # bubble (style flipped concise->verbose mid-turn), its message id is
-            # now reused as the verbose consolidated log. Drop the concise marker
-            # so terminal cleanup treats it as a log to KEEP, not a bubble to
-            # retire (sync discard under the same lock as the marker add).
-            self._concise_bubble_keys.discard(consolidated_key)
+            # Verbose consolidation path. Because the progress style is snapshotted
+            # per turn (see ``_concise_progress_style``), a turn that reaches here is
+            # verbose for its whole lifetime — it never posted a concise bubble — so
+            # ``_consolidated_message_ids[key]`` here is only ever a verbose log id,
+            # never a status bubble to reconcile.
             max_bytes = self._get_consolidated_max_bytes(context)
             split_threshold = self._get_consolidated_split_threshold(context)
             existing = self._consolidated_message_buffers.get(consolidated_key, "")
