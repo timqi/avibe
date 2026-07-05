@@ -533,8 +533,8 @@ class ConsolidatedMessageDispatcher:
                 if value and value > 0:
                     return float(value) / 1000.0
             except Exception:
-                logger.debug("get_heartbeat_interval_ms_for_context failed; default 15s", exc_info=True)
-        return 15.0
+                logger.debug("get_heartbeat_interval_ms_for_context failed; default 8s", exc_info=True)
+        return 8.0
 
     def _no_output_hint_after_s(self, context: MessageContext) -> float:
         getter = getattr(self.controller, "get_no_output_hint_after_ms_for_context", None)
