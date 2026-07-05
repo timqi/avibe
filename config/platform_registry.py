@@ -227,6 +227,7 @@ PLATFORM_REGISTRY: dict[str, PlatformDescriptor] = {
             quick_reply_single_column=True,
             supports_reaction_indicator=True,
             preferred_processing_indicator="reaction",
+            supports_status_bubble=True,
         ),
     ),
     "wechat": PlatformDescriptor(
