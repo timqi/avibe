@@ -110,6 +110,25 @@ def test_create_list_delete_roundtrip(monkeypatch):
     assert api.get_vault_secrets()["secrets"] == []
 
 
+def test_create_vault_secret_publishes_update_event(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        "vibe.sse_broker.broker.publish",
+        lambda event_type, data: published.append((event_type, data)),
+    )
+    monkeypatch.setattr("vibe.internal_client.publish_event_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+
+    api.create_vault_secret(
+        {
+            "name": "EVENT_KEY",
+            "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+        }
+    )
+
+    assert ("vaults.updated", {"scope": "secret", "secret_name": "EVENT_KEY"}) in published
+
+
 def test_standard_rest_create_rejects_plaintext_value(monkeypatch):
     from unittest.mock import Mock
 
@@ -259,6 +278,30 @@ def test_get_provision_request_by_name_returns_pending_spec():
     assert result["ambiguous"] is False
 
 
+def test_provision_request_card_carries_session_id():
+    # The chat surface scopes request cards by card.session_id; provision must set it from the
+    # requester like access/sign do, or its card is invisible in the originating chat.
+    with api._vault_engine().begin() as conn:
+        req = vault_service.create_provision_request(
+            conn,
+            "DEPLOY_TOKEN",
+            requester={"source": "agent-cli", "session_id": "ses_abc123"},
+        )
+    assert req["card"]["session_id"] == "ses_abc123"
+    result = api.get_vault_provision_request_by_name("DEPLOY_TOKEN")
+    assert (result["request"]["card"] or {}).get("session_id") == "ses_abc123"
+
+
+def test_list_requests_scopes_by_session():
+    # A session-scoped query returns only that session's requests (filtered before the limit).
+    with api._vault_engine().begin() as conn:
+        vault_service.create_provision_request(conn, "TOK_A", requester={"source": "cli", "session_id": "ses_A"})
+        vault_service.create_provision_request(conn, "TOK_B", requester={"source": "cli", "session_id": "ses_B"})
+    scoped = api.get_vault_requests(session="ses_A")
+    assert {r["secret_name"] for r in scoped["requests"]} == {"TOK_A"}
+    assert {r["secret_name"] for r in api.get_vault_requests()["requests"]} >= {"TOK_A", "TOK_B"}
+
+
 def test_get_provision_request_returns_request_id_match():
     with api._vault_engine().begin() as conn:
         old_req = vault_service.create_provision_request(
@@ -339,6 +382,29 @@ def test_create_secret_with_fulfilled_provision_request_returns_secret_exists(mo
     assert exc.value.status == 409
 
 
+def test_create_secret_exact_duplicate_still_returns_secret_exists(monkeypatch):
+    from unittest.mock import Mock
+
+    seal = Mock(return_value=_sealed())
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    api.create_vault_secret(
+        {
+            "name": "openAiKey",
+            "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+        }
+    )
+
+    with pytest.raises(api.VaultApiError) as exc:
+        api.create_vault_secret(
+            {
+                "name": "openAiKey",
+                "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc2", "ct": "ct2"},
+            }
+        )
+    assert exc.value.code == "secret_exists"
+    assert exc.value.status == 409
+
+
 def test_secret_exists_response_commits_stale_pending_provision_cleanup(monkeypatch):
     seal = Mock(side_effect=[_sealed("first"), _sealed("second")])
     monkeypatch.setattr(api, "avault_seal_blind_box", seal)
@@ -364,6 +430,36 @@ def test_secret_exists_response_commits_stale_pending_provision_cleanup(monkeypa
     assert stale_status == "fulfilled"
 
 
+def test_secret_exists_response_publishes_when_fulfilling_stale_provisions(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        "vibe.sse_broker.broker.publish",
+        lambda event_type, data: published.append((event_type, data)),
+    )
+    monkeypatch.setattr("vibe.internal_client.publish_event_sync", lambda *args, **kwargs: None)
+    seal = Mock(side_effect=[_sealed("first"), _sealed("second")])
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    with api._vault_engine().begin() as conn:
+        req = vault_service.create_provision_request(conn, "GH_TOKEN")
+
+    payload = {
+        "name": "GH_TOKEN",
+        "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+        "provision_request_id": req["id"],
+    }
+    api.create_vault_secret(payload)
+    published.clear()
+    with api._vault_engine().begin() as conn:
+        stale = vault_service.create_provision_request(conn, "GH_TOKEN")
+        conn.execute(vault_requests.update().where(vault_requests.c.id == stale["id"]).values(status="pending"))
+
+    with pytest.raises(api.VaultApiError) as exc:
+        api.create_vault_secret({**payload, "blind_box": {**payload["blind_box"], "enc": "enc2", "ct": "ct2"}})
+
+    assert exc.value.code == "secret_exists"
+    assert ("vaults.updated", {"scope": "secret", "request_status": "fulfilled", "secret_name": "GH_TOKEN"}) in published
+
+
 def test_duplicate_name_conflict(monkeypatch):
     from unittest.mock import Mock
 
@@ -375,13 +471,89 @@ def test_duplicate_name_conflict(monkeypatch):
     assert exc.value.status == 409
 
 
+def test_mixed_case_name_is_preserved_and_case_duplicate_rejected(monkeypatch):
+    from unittest.mock import Mock
+
+    seal = Mock(return_value=_sealed())
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    created = api.create_vault_secret(
+        {
+            "name": "openAiKey",
+            "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+        }
+    )
+    assert created["secret"]["name"] == "openAiKey"
+    seal.assert_called_once_with(
+        "openAiKey",
+        {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+    )
+
+    with pytest.raises(api.VaultApiError) as exc:
+        api.create_vault_secret(
+            {
+                "name": "OpenAIKey",
+                "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc2", "ct": "ct2"},
+            }
+        )
+    assert exc.value.code == "secret_name_case_conflict"
+    assert exc.value.status == 409
+    assert "openAiKey" in str(exc.value)
+
+
+def test_case_conflict_is_rejected_before_standard_seal(monkeypatch):
+    from unittest.mock import Mock
+
+    seal = Mock(side_effect=api.AvaultError("seal failed"))
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    with api._vault_engine().begin() as conn:
+        vault_service.create_secret(conn, name="openAiKey", sealed=_sealed("existing"))
+
+    with pytest.raises(api.VaultApiError) as exc:
+        api.create_vault_secret(
+            {
+                "name": "OpenAIKey",
+                "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+            }
+        )
+
+    assert exc.value.code == "secret_name_case_conflict"
+    assert exc.value.status == 409
+    seal.assert_not_called()
+
+
+def test_create_secret_rejects_case_only_pending_provision(monkeypatch):
+    from unittest.mock import Mock
+
+    seal = Mock(return_value=_sealed())
+    monkeypatch.setattr(api, "avault_seal_blind_box", seal)
+    with api._vault_engine().begin() as conn:
+        vault_service.create_provision_request(conn, "openAiKey")
+
+    with pytest.raises(api.VaultApiError) as exc:
+        api.create_vault_secret(
+            {
+                "name": "OpenAIKey",
+                "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+            }
+        )
+
+    assert exc.value.code == "secret_name_case_conflict"
+    assert exc.value.status == 409
+    assert "openAiKey" in str(exc.value)
+
+
 def test_invalid_name_rejected_before_avault(monkeypatch):
     from unittest.mock import Mock
 
     seal = Mock(return_value=_sealed())
     monkeypatch.setattr(api, "avault_seal_blind_box", seal)
     with pytest.raises(api.VaultApiError) as exc:
-        api.create_vault_secret({"name": "lower", "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"}})
+        api.create_vault_secret(
+            {
+                "name": "bad-name",
+                "blind_box": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+            }
+        )
     assert exc.value.code == "invalid_name"
     seal.assert_not_called()
 
@@ -572,6 +744,104 @@ def test_pubkey_wrapper_parses_avault(monkeypatch):
         Mock(return_value=SimpleNamespace(returncode=0, stdout=b'{"public_key":"pk","fingerprint":"fp"}', stderr=b"")),
     )
     assert api.avault_pubkey() == {"public_key": "pk", "fingerprint": "fp"}
+
+
+def test_avault_args_uses_file_store_only_on_linux_without_tpm(monkeypatch, tmp_path):
+    missing_tpm = tmp_path / "missing-tpm0"
+    existing_tpm = tmp_path / "tpmrm0"
+    existing_tpm.touch()
+    monkeypatch.setattr(api, "_AVAULT_LINUX_TPM_DEVICE_PATHS", (missing_tpm,))
+    monkeypatch.setattr(api.platform, "system", lambda: "Linux")
+    assert api._avault_args(["pubkey"]) == ["--store", "file", "pubkey"]
+
+    monkeypatch.setattr(api, "_AVAULT_LINUX_TPM_DEVICE_PATHS", (existing_tpm,))
+    assert api._avault_args(["pubkey"]) == ["pubkey"]
+
+    monkeypatch.setattr(api.platform, "system", lambda: "Darwin")
+    assert api._avault_args(["pubkey"]) == ["pubkey"]
+
+
+def test_one_shot_avault_uses_file_store_for_linux_without_tpm(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout=b"{}", stderr=b"")
+
+    monkeypatch.setattr(api, "_require_avault_path", lambda: "/tmp/avault")
+    monkeypatch.setattr(api, "_command_env_for", lambda path: {"AVAULT_PATH": path})
+    monkeypatch.setattr(api.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(api, "_AVAULT_LINUX_TPM_DEVICE_PATHS", (tmp_path / "missing-tpm0",))
+    monkeypatch.setattr(api.subprocess, "run", fake_run)
+
+    api._run_avault(["pubkey"], stdin=b"{}", timeout=3)
+
+    assert seen["argv"] == ["/tmp/avault", "--store", "file", "pubkey"]
+    kwargs = seen["kwargs"]
+    assert kwargs["input"] == b"{}"
+    assert kwargs["capture_output"] is True
+    assert kwargs["timeout"] == 3
+    assert kwargs["env"] == {"AVAULT_PATH": "/tmp/avault"}
+
+
+def test_deliver_run_uses_file_store_for_linux_without_tpm(monkeypatch, tmp_path):
+    seen: dict[str, object] = {}
+
+    class FakeStdin:
+        def write(self, payload):
+            seen["stdin"] = payload
+
+        def close(self):
+            seen["stdin_closed"] = True
+
+    class FakeProcess:
+        stdin = FakeStdin()
+
+        def wait(self):
+            return 7
+
+    def fake_popen(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(api, "_require_avault_path", lambda: "/tmp/avault")
+    monkeypatch.setattr(api, "_command_env_for", lambda path: {"AVAULT_PATH": path})
+    monkeypatch.setattr(api.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(api, "_AVAULT_LINUX_TPM_DEVICE_PATHS", (tmp_path / "missing-tpm0",))
+    monkeypatch.setattr(api.subprocess, "Popen", fake_popen)
+
+    result = api.avault_deliver_run(
+        [{"name": "API_KEY", "env": "API_KEY", "envelope": _sealed("api")}],
+        ["python3", "-c", "pass"],
+    )
+
+    assert result == {"exit_code": 7, "delivered": True}
+    assert seen["argv"] == [
+        "/tmp/avault",
+        "--store",
+        "file",
+        "deliver",
+        "run",
+        "--",
+        "python3",
+        "-c",
+        "pass",
+    ]
+    kwargs = seen["kwargs"]
+    assert kwargs["stdin"] == api.subprocess.PIPE
+    assert kwargs["env"] == {"AVAULT_PATH": "/tmp/avault"}
+    assert seen["stdin_closed"] is True
+    assert json.loads(seen["stdin"]) == [
+        {
+            "name": "API_KEY",
+            "env": "API_KEY",
+            "envelope": {"ciphertext": "ct-api", "nonce": "n-api", "wrap_meta": "wm-api"},
+        }
+    ]
 
 
 def test_blind_box_wrapper_relays_json_to_avault(monkeypatch):
@@ -1563,6 +1833,12 @@ def test_revoke_grant_releases_only_that_grant_id(monkeypatch):
 
 
 def test_consume_one_shot_releases_only_that_grant_id(monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        "vibe.sse_broker.broker.publish",
+        lambda event_type, data: published.append((event_type, data)),
+    )
+    monkeypatch.setattr("vibe.internal_client.publish_event_sync", lambda *args, **kwargs: None)
     monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
     agent_release = Mock(return_value={"released": True})
     monkeypatch.setattr(api, "avault_agent_release", agent_release)
@@ -1590,9 +1866,19 @@ def test_consume_one_shot_releases_only_that_grant_id(monkeypatch):
         )
         grant_2 = _grant_from_request(conn, req_2)
 
+    published.clear()
     api.consume_one_shot_grants([grant_1], reason="test")
 
     agent_release.assert_called_once_with(grant_id=grant_1["id"])
+    assert (
+        "vaults.updated",
+        {
+            "scope": "grant",
+            "request_id": grant_1["request_id"],
+            "grant_id": grant_1["id"],
+            "grant_status": "expired",
+        },
+    ) in published
     with api._vault_engine().connect() as conn:
         statuses = {
             row["id"]: row["status"]
@@ -2056,7 +2342,8 @@ def test_create_grant_api_rejects_stale_agent_pubkey_before_claiming_request(mon
 
 def test_create_grant_api_expires_grant_when_agent_grant_fails(monkeypatch, avault_p2):
     monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
-    monkeypatch.setattr(api, "avault_agent_grant", Mock(side_effect=api.AvaultError("grant is missing")))
+    agent_grant = Mock(side_effect=api.AvaultError("grant is missing"))
+    monkeypatch.setattr(api, "avault_agent_grant", agent_grant)
     agent_release = Mock(return_value={"released": True})
     monkeypatch.setattr(api, "avault_agent_release", agent_release)
     api.create_vault_secret({"name": "GRANT_KEY", "protection": "protected", "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"}})
@@ -2186,6 +2473,48 @@ def test_create_grant_api_releases_scope_when_mark_ready_fails(monkeypatch, avau
     assert grants[0]["status"] == "expired"
     assert grants[0]["delivery_ready"] is False
     agent_release.assert_called_once_with(grant_id=grants[0]["id"])
+
+
+def test_create_grant_retry_reuses_expired_failed_grant_id(monkeypatch, avault_p2):
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    agent_grant = Mock(side_effect=[api.AvaultError("DEK blind-box open failed"), {"granted": 1, "ttl_secs": 300}])
+    monkeypatch.setattr(api, "avault_agent_grant", agent_grant)
+    monkeypatch.setattr(api, "avault_agent_release", Mock(return_value={"released": True}))
+    api.create_vault_secret({"name": "GRANT_KEY", "protection": "protected", "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"}})
+    with api._vault_engine().begin() as conn:
+        req = vault_service.create_access_request(
+            conn,
+            "GRANT_KEY",
+            requester={"session_id": "ses_1"},
+            delivery={"session_id": "ses_1"},
+        )
+    payload = {
+        "session_id": "ses_1",
+        "request_id": req["id"],
+        "deks": [
+            {
+                "name": "GRANT_KEY",
+                "dek_blindbox": {"scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1", "enc": "enc", "ct": "ct"},
+                "approval": {"nonce": "bm9uY2UtMTIzNDU2", "expires_at_unix": 4102444800},
+            }
+        ],
+    }
+
+    with pytest.raises(api.VaultApiError) as exc:
+        api.create_vault_grant(payload)
+    assert exc.value.code == "avault_failed"
+
+    created = api.create_vault_grant(payload)
+
+    with api._vault_engine().connect() as conn:
+        grants = vault_service.list_grants(conn, status=None)
+        status = conn.execute(select(vault_service.vault_requests.c.status).where(vault_service.vault_requests.c.id == req["id"])).scalar_one()
+    assert status == "approved"
+    assert len(grants) == 1
+    assert grants[0]["id"] == created["grant"]["id"]
+    assert grants[0]["status"] == "active"
+    assert grants[0]["delivery_ready"] is True
+    assert agent_grant.call_count == 2
 
 
 def test_create_grant_api_releases_failed_grant_id_without_touching_existing_grant(monkeypatch, avault_p2):
@@ -2591,6 +2920,38 @@ def test_protected_sign_completion_verifies_schnorr_browser_signature(monkeypatc
 
     assert result["ok"] is True
     assert result["request"]["status"] == "approved"
+
+
+def test_signing_key_meta_exposes_addresses_not_public_key(monkeypatch):
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(api, "avault_seal_blind_box", Mock(return_value=_sealed()))
+    # privkey = 1 → generator point G, compressed. Reference addresses are pinned in
+    # tests/test_vault_addresses.py.
+    created = api.create_vault_secret(
+        {
+            "name": "ETH_KEY",
+            "protection": "protected",
+            "kind": "keypair",
+            "signer_kind": "local",
+            "sealed": {"ciphertext": "ct", "nonce": "n", "wrap_meta": "wm"},
+            "public_meta": {
+                "signing_public_key": {
+                    "curve": "secp256k1",
+                    "public_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                }
+            },
+        }
+    )
+    secret = created["secret"]
+    # Decision: agents and the UI see derived addresses, never the raw public key.
+    assert "signing_public_key" not in secret
+    assert "signing_public_key" not in json.dumps(secret)
+    addresses = secret["signing_addresses"]
+    assert set(addresses) == {"eth", "btc_legacy", "btc_segwit", "btc_taproot"}
+    assert addresses["eth"] == "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+    assert addresses["btc_segwit"] == "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    assert addresses["btc_taproot"].startswith("bc1p")
 
 
 def test_vault_sign_rejects_malformed_digest_before_request_or_avault(monkeypatch):

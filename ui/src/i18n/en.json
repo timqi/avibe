@@ -220,6 +220,8 @@
     "statusNow": "Current state",
     "consoleServerTitle": "Console server",
     "consoleServerHint": "Saving these values restarts only the Web UI server.",
+    "instanceNameTitle": "Instance name",
+    "instanceNameHint": "Shown in the browser tab title (\"Avibe - name\"). Leave blank to use the system hostname.",
     "consoleServerRedirecting": "UI server moved. Redirecting to {{origin}}...",
     "consoleServerRelocated": "UI server now listens on {{origin}}. Open this URL to continue.",
     "serviceNotesTitle": "Operational notes",
@@ -605,6 +607,10 @@
     "remote_access_unknown": "The operation did not finish. Refresh the status and try again; if it still fails, check the remote access runtime logs.",
     "invalid_pairing_key": "This pairing key is invalid or expired. Create a new key at avibe.bot, then paste it here.",
     "missing_pairing_key": "Paste the pairing key first.",
+    "invalid_pairing_backend_url": "The Avibe Cloud URL must be a valid HTTPS address.",
+    "pairing_backend_url_not_allowed": "That Avibe Cloud URL is not allowed. Use a public HTTPS avibe.bot address.",
+    "pairing_backend_unresolvable": "Avibe could not resolve that Avibe Cloud URL. Check the address and try again.",
+    "backend_http_redirect_blocked": "Avibe Cloud redirected the pairing request, so Avibe stopped before sending the pairing key.",
     "pairing_request_failed": "Could not connect to avibe.bot. Check the network connection and make sure the Avibe Cloud URL is correct.",
     "backend_http_error": "avibe.bot rejected this request. Try again later, or create a new pairing key.",
     "invalid_pairing_response": "avibe.bot returned incomplete pairing data. Refresh the page, create a new pairing key, and try again.",
@@ -614,7 +620,8 @@
     "cloudflared_spawn_failed": "Connector startup failed. Check that cloudflared is executable, or inspect the runtime logs.",
     "cloudflared_exited": "The connector exited immediately after startup. This usually means the Tunnel credential is invalid or the Cloudflare config is not ready. Pair again and retry.",
     "cloudflared_stop_failed": "The connector could not be stopped. Try again later, or manually stop the cloudflared process.",
-    "cloudflared_process_unknown": "Avibe found a connector-like process but could not verify ownership. To avoid killing the wrong process, it did not change it. Check the cloudflared process manually and retry."
+    "cloudflared_process_unknown": "Avibe found a connector-like process but could not verify ownership. To avoid killing the wrong process, it did not change it. Check the cloudflared process manually and retry.",
+    "bind_code_limit_reached": "Too many active bind codes. Revoke an unused code before creating another."
   },
   "apps": {
     "title": "Apps",
@@ -2189,6 +2196,16 @@
     "neverUsed": "never used",
     "standard": "Standard",
     "signing": "Signing",
+    "addresses": {
+      "eth": "ETH",
+      "btcSegwit": "BTC SegWit",
+      "btcTaproot": "BTC Taproot",
+      "btcLegacy": "BTC Legacy",
+      "copy": "Copy {{label}} address"
+    },
+    "chat": {
+      "floatApprovals": "Waiting for your approval · {{count}}"
+    },
     "filter": {
       "clear": "Clear filters",
       "empty": "No secrets match the selected tags."
@@ -2264,6 +2281,7 @@
     },
     "dialog": {
       "title": "Add a secret",
+      "subtitle": "Stored encrypted; the value never reaches the chat or the model.",
       "name": "Name",
       "value": "Value",
       "valuePlaceholder": "Paste the secret value",
@@ -2283,16 +2301,17 @@
       "kindStaticHelp": "A token, password, or any text value.",
       "kindKeypair": "Signing key",
       "kindKeypairHelp": "A signing key generated in your browser.",
-      "nameHint": "Uppercase A–Z 0–9 _ · globally unique",
+      "nameHint": "Start with a letter or underscore; then use letters, numbers, or underscore · case preserved",
       "signingKeyHelp": "A new secp256k1 signing key is created in your browser. The private key is sealed in your browser — standard keys are signed by avault locally, protected keys are signed in your browser — and only the public key is stored in the clear.",
       "signingGenerate": "Generate",
       "signingImport": "Import",
       "signingGenerateCta": "Generate signing key",
       "signingRegenerate": "Generate a different key",
       "signingImportPlaceholder": "Paste a 32-byte hex private key (64 hex chars)",
-      "signingPublicKey": "Public key",
-      "copyPublicKey": "Copy public key",
-      "signingPublicKeyHint": "Share this public key freely. The private key never leaves your vault, and the chain and signature scheme are chosen at signing time.",
+      "signingAddresses": "Addresses",
+      "signingAddressesLoading": "Deriving addresses…",
+      "signingAddressesUnavailable": "Couldn't derive addresses for this key.",
+      "signingAddressesHint": "Derived from the key. Share an address to receive funds; the private key never leaves your vault, and the chain and signature scheme are chosen at signing time.",
       "signingNeedsAvault": "Signing keys need avault {{version}} or newer installed.",
       "checkingAvault": "Checking avault…",
       "p2Unavailable": "Browser-side vault create requires avault {{version}} or newer. Installed: {{installed}}. Install a compatible avault release before saving standard secrets.",
@@ -2310,11 +2329,8 @@
       "fetchAuthNamePlaceholder": "X-Api-Key or api_key",
       "fetchAuthHelp": "Defaults to Authorization: Bearer <value>. Use Header or Query for APIs that expect another credential placement.",
       "tags": "Tags",
-      "tagsPlaceholder": "tag, then Enter",
-      "tagsHelp": "Labels to find secrets and to select them by tag in runs and grants. Add skills in the Skills field.",
-      "skills": "Skills",
-      "skillsPlaceholder": "skill name, then Enter",
-      "skillsHelp": "Stored as skill:<name> tags. A run or grant that selects the skill includes this secret.",
+      "tagsPlaceholder": "Type or pick a tag",
+      "tagsHelp": "Labels to find secrets and select them by tag in runs and grants.",
       "removeChip": "Remove {{value}}",
       "protection": "Protection",
       "protectedProtection": "Protected",
@@ -2338,7 +2354,8 @@
         "fileEmpty": "Choose a non-empty file.",
         "fileTooLarge": "Choose a file up to {{size}}.",
         "fileReadFailed": "Couldn't read that file.",
-        "secretExists": "A secret with this name already exists."
+        "secretExists": "A secret with this name already exists.",
+        "secretNameCaseConflict": "A secret already uses this name with different letter casing."
       }
     },
     "requests": {
@@ -2365,7 +2382,9 @@
       "session": "Session",
       "command": "Command",
       "egress": "Egress",
+      "signingAs": "Signing as",
       "digest": "Digest",
+      "copyDigest": "Copy digest",
       "source": "Source",
       "sourceTag": "Tag · {{name}}",
       "sourceSkill": "Skill · {{name}}",

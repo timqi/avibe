@@ -15,6 +15,7 @@ the resident avault agent, not by Python.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -22,13 +23,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
 from storage import vault_crypto
 from storage.models import vault_audit, vault_grants, vault_requests, vault_secrets
+from storage.vault_addresses import derive_addresses
 from storage.vault_crypto import Sealed
+
+logger = logging.getLogger(__name__)
 
 SKILL_TAG_PREFIX = "skill:"
 DEFAULT_ENV_GRANT_TTL_SECONDS = 300
@@ -118,6 +122,13 @@ class InvalidSecretNameError(VaultServiceError):
 
 class SecretExistsError(VaultServiceError):
     pass
+
+
+class SecretNameCaseConflictError(VaultServiceError):
+    def __init__(self, name: str, existing_name: str):
+        self.name = name
+        self.existing_name = existing_name
+        super().__init__(f"secret name {name!r} conflicts with existing name {existing_name!r}")
 
 
 class SecretNotFoundError(VaultServiceError):
@@ -251,6 +262,78 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
 
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _secret_name_case_key(name: str) -> str:
+    # Secret names are ASCII shell identifiers, so SQL lower() and Python lower()
+    # have the same case-folding behavior for the enforced domain.
+    return name.lower()
+
+
+def _find_secret_name_case_insensitive(conn: Connection, name: str) -> str | None:
+    return conn.execute(
+        select(vault_secrets.c.name)
+        .where(func.lower(vault_secrets.c.name) == _secret_name_case_key(name))
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _find_pending_provision_name_case_insensitive(conn: Connection, name: str) -> str | None:
+    return conn.execute(
+        select(vault_requests.c.secret_name)
+        .where(
+            vault_requests.c.request_type == "provision",
+            vault_requests.c.status == "pending",
+            func.lower(vault_requests.c.secret_name) == _secret_name_case_key(name),
+        )
+        .order_by(vault_requests.c.created_at.desc(), vault_requests.c.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _preflight_secret_create_name(
+    conn: Connection,
+    *,
+    name: str,
+    provision_request_id: str | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    existing_name = _find_secret_name_case_insensitive(conn, name)
+    existing_secret = existing_name == name
+    if existing_name is not None and existing_name != name:
+        raise SecretNameCaseConflictError(name, existing_name)
+    provision_row: dict[str, Any] | None = None
+    if provision_request_id:
+        _expire_pending_requests(conn)
+        provision_row = _load_request_row(conn, provision_request_id)
+        if provision_row.get("request_type") != "provision":
+            raise InvalidRequestError("secret create must complete a provision request")
+        if provision_row.get("secret_name") != name:
+            raise InvalidRequestError("provision request secret name does not match")
+        if provision_row.get("status") == "expired":
+            raise InvalidRequestError("provision request has expired")
+        if provision_row.get("status") == "fulfilled" and existing_secret:
+            raise SecretExistsError(name)
+        if provision_row.get("status") != "pending":
+            raise InvalidRequestError("provision request is not pending")
+    pending_name = _find_pending_provision_name_case_insensitive(conn, name)
+    if pending_name is not None and pending_name != name:
+        raise SecretNameCaseConflictError(name, pending_name)
+    if existing_secret:
+        raise SecretExistsError(name)
+    return provision_row, bool(existing_secret)
+
+
+def preflight_secret_create(
+    conn: Connection,
+    *,
+    name: str,
+    provision_request_id: str | None = None,
+) -> None:
+    """Validate name/request conflicts before a caller performs expensive sealing."""
+
+    if not vault_crypto.is_valid_secret_name(name):
+        raise InvalidSecretNameError(name)
+    _preflight_secret_create_name(conn, name=name, provision_request_id=provision_request_id)
 
 
 def _loads(raw: str | None) -> Any:
@@ -479,11 +562,15 @@ def _meta_payload(row: dict[str, Any]) -> dict[str, Any]:
         }
     signing_public_key = public_meta.get("signing_public_key")
     if isinstance(signing_public_key, dict):
-        payload["signing_public_key"] = {
-            key: value
-            for key, value in signing_public_key.items()
-            if key in {"curve", "public_key"}
-        }
+        # Surface derived receive addresses instead of the raw public key: agents and the
+        # UI identify a signing key by address, not hex. Derivation is a pure function of the
+        # (public) key; a malformed/legacy key degrades to no addresses, never a hard error.
+        public_key = signing_public_key.get("public_key")
+        if isinstance(public_key, str) and signing_public_key.get("curve") == "secp256k1":
+            try:
+                payload["signing_addresses"] = derive_addresses(public_key)
+            except Exception:
+                logger.warning("failed to derive signing addresses for secret %r", row.get("name"))
     return payload
 
 
@@ -765,7 +852,7 @@ def _expire_pending_request_rows(
         result = conn.execute(
             vault_requests.update()
             .where(vault_requests.c.id == row["id"], vault_requests.c.status == "pending")
-            .values(status="expired", decided_at=now)
+            .values(status="expired", decided_at=now, callback_status="pending")
         )
         if result.rowcount != 1:
             continue
@@ -829,6 +916,167 @@ def _payload_session_id(payload: Any) -> str | None:
     if isinstance(payload, dict) and payload.get("session_id"):
         return str(payload["session_id"])
     return None
+
+
+# --- Auto-resume callbacks (P4) -------------------------------------------------------------
+#
+# When a request reaches a terminal state its transition also sets ``callback_status="pending"``.
+# The daemon sweep (``core.scheduled_tasks``) drains these: for each it resolves a callback plan
+# and enqueues exactly one callback turn to the requesting session — the same entry Agent Run /
+# watch / scheduled tasks use — then marks the row ``sent`` / ``skipped``. The atomic
+# ``WHERE status='pending'`` claim on every transition makes this exactly-once (a re-resolve
+# updates zero rows, so ``callback_status`` is never re-armed).
+
+
+@dataclass(frozen=True)
+class PendingRequestCallback:
+    """A resolved request's auto-resume plan: wake ``session_id`` with ``message``."""
+
+    request_id: str
+    session_id: str
+    message: str
+
+
+def _request_callback_disabled(row: dict[str, Any]) -> bool:
+    requester, _ = _request_json_payloads(row)
+    return bool(isinstance(requester, dict) and requester.get("callback_disabled"))
+
+
+def _build_request_callback_message(row: dict[str, Any]) -> str:
+    """Agent-facing text delivered to the requesting session when a request resolves."""
+    request_type = str(row.get("request_type") or "")
+    status = str(row.get("status") or "")
+    request_id = str(row.get("id") or "").strip()
+    name = str(row.get("secret_name") or "").strip()
+    label = f" '{name}'" if name else ""
+    subject = {
+        "provision": f"vault request for the secret{label}",
+        "access": f"vault access request{label}",
+        "sign": f"signature request{label}",
+    }.get(request_type, f"vault request{label}")
+
+    if status in {"approved", "fulfilled"}:
+        if request_type == "provision":
+            usage = f" You can use it, e.g. `vibe vault run --env {name} -- <command>`." if name else ""
+            return f"The user provided your {subject}; the secret is now available.{usage} Continue the task."
+        if request_type == "access":
+            return f"The user approved your {subject}; the grant is ready. Continue the task."
+        if request_type == "sign":
+            # The public signature is the deliverable — the agent needs it to continue. It's stored
+            # in the request; retrieving it by id returns immediately (the request is already done).
+            retrieve = f" Retrieve the signature with: vibe vault await {request_id}." if request_id else ""
+            return f"The user approved and completed your {subject}.{retrieve} Then continue the task."
+        return f"The user approved your {subject}. Continue the task."
+    if status == "denied":
+        return f"The user declined your {subject}. Do not retry — adjust your approach or ask the user how to proceed."
+    if status == "failed":
+        # 'failed' is a signing error (transient/crypto/browser), NOT a user decision — retry is fine.
+        return f"Your {subject} could not be completed due to a signing error (not a user decision). You may retry if it still makes sense."
+    if status == "expired":
+        return f"Your {subject} expired without a decision. Re-request it if you still need it, or continue without."
+    return ""
+
+
+def resolve_request_callback(row: dict[str, Any]) -> PendingRequestCallback | None:
+    """Plan the auto-resume callback for a resolved request, or ``None`` to skip.
+
+    Skipped when the requester opted out (``--no-callback``), the request has no originating
+    session, or the terminal state maps to no message.
+    """
+    request_id = str(row.get("id") or "").strip()
+    if not request_id or _request_callback_disabled(row):
+        return None
+    session_id = _request_session_id(row)
+    if not session_id:
+        return None
+    message = _build_request_callback_message(row)
+    if not message.strip():
+        return None
+    return PendingRequestCallback(request_id=request_id, session_id=session_id, message=message)
+
+
+def _request_covering_grant_payloads(
+    conn: Connection,
+    row: dict[str, Any],
+    *,
+    cache: VaultGrantRuntimeCache = GRANT_RUNTIME_CACHE,
+) -> list[dict[str, Any]]:
+    request_members = set(_request_member_names(row))
+    session_id = _request_session_id(row)
+    if not request_members or not session_id:
+        return []
+    try:
+        purpose = _request_grant_option(row).purpose
+    except InvalidRequestError:
+        return []
+
+    expire_grants(conn, cache=cache)
+    rows = conn.execute(
+        select(vault_grants)
+        .where(
+            vault_grants.c.status.in_(ACTIVE_GRANT_STATES),
+            vault_grants.c.session_id == session_id,
+            vault_grants.c.purpose == purpose,
+        )
+        .order_by(vault_grants.c.created_at.desc(), vault_grants.c.id.desc())
+    ).mappings()
+    grants: list[dict[str, Any]] = []
+    for grant_row in rows:
+        grant = dict(grant_row)
+        grant_members = {str(name) for name in (_loads(grant.get("member_snapshot")) or []) if str(name)}
+        if request_members.issubset(grant_members):
+            grants.append(_grant_payload(conn, grant, cache=cache))
+    return grants
+
+
+def request_callback_ready(conn: Connection, row: dict[str, Any]) -> bool:
+    """Whether a resolved request's callback may be delivered yet (vs. deferred to a later sweep).
+
+    An approved *access* request is only usable once a covering grant is delivery-ready: for a
+    protected secret the DEKs are relayed to the resident agent AFTER approval, so resuming the
+    agent before then would hand it a grant whose ``delivery_ready`` is still false. Sibling access
+    requests approved by the same grant do not own ``vault_grants.request_id``, so readiness follows
+    the active grant for the request's session/purpose whose member snapshot covers the request's
+    members. Every other terminal state (provision/sign/deny/expire, and standard grants which are
+    ready on approval) is deliverable immediately; no active covering grant does not block forever.
+    """
+    if str(row.get("request_type") or "") == "access" and str(row.get("status") or "") == "approved":
+        grants = _request_covering_grant_payloads(conn, row)
+        if grants and not any(grant.get("delivery_ready") for grant in grants):
+            return False
+    return True
+
+
+def expire_overdue_requests(conn: Connection) -> None:
+    """Flip any overdue pending requests to ``expired`` (arming their callback) proactively.
+
+    Expiry is otherwise lazy (only on request reads), so an unattended timed-out request would
+    never auto-resume its session until some unrelated read happened to touch it. The callback
+    sweep calls this first so overdue requests are expired and picked up in the same pass.
+    """
+    _expire_pending_requests(conn)
+
+
+def list_pending_request_callbacks(conn: Connection, *, limit: int | None = None) -> list[dict[str, Any]]:
+    """Terminal requests owed an auto-resume callback (``callback_status='pending'``)."""
+    query = (
+        select(vault_requests)
+        .where(vault_requests.c.callback_status == "pending")
+        .order_by(vault_requests.c.decided_at, vault_requests.c.id)
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    rows = conn.execute(query).mappings()
+    return [dict(row) for row in rows]
+
+
+def mark_request_callback(conn: Connection, request_id: str, *, status: str) -> None:
+    """Record the outcome of an auto-resume callback (``sent`` / ``skipped`` / ``failed``)."""
+    conn.execute(
+        vault_requests.update()
+        .where(vault_requests.c.id == request_id)
+        .values(callback_status=status)
+    )
 
 
 def _request_card(row: dict[str, Any]) -> dict[str, Any]:
@@ -996,16 +1244,17 @@ def fulfill_pending_provision_requests_for_secret(
     name: str,
     *,
     decided_at: str | None = None,
-) -> None:
-    conn.execute(
+) -> int:
+    result = conn.execute(
         vault_requests.update()
         .where(
             vault_requests.c.request_type == "provision",
             vault_requests.c.secret_name == name,
             vault_requests.c.status == "pending",
         )
-        .values(status="fulfilled", decided_at=decided_at or _now())
+        .values(status="fulfilled", decided_at=decided_at or _now(), callback_status="pending")
     )
+    return int(result.rowcount or 0)
 
 
 def create_secret(
@@ -1042,23 +1291,11 @@ def create_secret(
         raise VaultServiceError(f"invalid vault secret kind: {kind!r}")
     if kind != "keypair" and signer_kind is not None:
         raise VaultServiceError("signer_kind is only valid for keypair secrets")
-    provision_row: dict[str, Any] | None = None
-    existing_secret = conn.execute(select(vault_secrets.c.id).where(vault_secrets.c.name == name)).first() is not None
-    if provision_request_id:
-        _expire_pending_requests(conn)
-        provision_row = _load_request_row(conn, provision_request_id)
-        if provision_row.get("request_type") != "provision":
-            raise InvalidRequestError("secret create must complete a provision request")
-        if provision_row.get("secret_name") != name:
-            raise InvalidRequestError("provision request secret name does not match")
-        if provision_row.get("status") == "expired":
-            raise InvalidRequestError("provision request has expired")
-        if provision_row.get("status") == "fulfilled" and existing_secret:
-            raise SecretExistsError(name)
-        if provision_row.get("status") != "pending":
-            raise InvalidRequestError("provision request is not pending")
-    if existing_secret:
-        raise SecretExistsError(name)
+    provision_row, _existing_secret = _preflight_secret_create_name(
+        conn,
+        name=name,
+        provision_request_id=provision_request_id,
+    )
 
     if establishing_vmk and protection == "protected":
         # Atomic single-init guard: this runs inside the write transaction (SQLite
@@ -1097,9 +1334,13 @@ def create_secret(
             )
         )
     except IntegrityError as exc:
-        # Two concurrent creates (e.g. Web dialog + inline card) can both pass the existence
-        # check above; the loser hits the UNIQUE(name) constraint here. Surface it as the same
-        # SecretExistsError → 409 so the racing already-fulfilled ask is handled, not a 500.
+        # Two concurrent creates (e.g. Web dialog + inline card) can both pass the
+        # existence check above; the loser hits the exact UNIQUE(name) or the
+        # folded-name unique index here. Re-read the winning name so callers keep
+        # the same exact-duplicate vs case-conflict semantics instead of seeing a 500.
+        existing_name = _find_secret_name_case_insensitive(conn, name)
+        if existing_name is not None and existing_name != name:
+            raise SecretNameCaseConflictError(name, existing_name) from exc
         raise SecretExistsError(name) from exc
     audit(conn, "created", secret_name=name)
     decided_at = _now()
@@ -1107,7 +1348,7 @@ def create_secret(
         result = conn.execute(
             vault_requests.update()
             .where(vault_requests.c.id == provision_row["id"], vault_requests.c.status == "pending")
-            .values(status="fulfilled", decided_at=decided_at)
+            .values(status="fulfilled", decided_at=decided_at, callback_status="pending")
         )
         if result.rowcount != 1:
             raise InvalidRequestError("provision request is not pending")
@@ -1179,6 +1420,18 @@ def update_secret_classification(
 
 def get_secret_meta(conn: Connection, name: str) -> dict[str, Any]:
     return _meta_payload(_require_row(conn, name))
+
+
+def get_signing_public_key(conn: Connection, name: str) -> dict[str, Any] | None:
+    """Raw pinned signing public key ({curve, public_key}) from storage.
+
+    The masked meta payload exposes only derived addresses (not the raw key), so
+    server-side signature verification reads the pinned key from here instead.
+    Returns ``None`` when the secret has no pinned signing key.
+    """
+    public_meta = _public_meta(_require_row(conn, name).get("public_meta"))
+    signing_public_key = public_meta.get("signing_public_key")
+    return signing_public_key if isinstance(signing_public_key, dict) else None
 
 
 def store_pubkey_pin(conn: Connection, name: str, pin: dict[str, Any]) -> dict[str, Any]:
@@ -1390,30 +1643,45 @@ def create_provision_request(
     ``request --wait`` would block forever (a create for an existing name is rejected,
     so nothing would ever flip a pending row).
     """
+    if not vault_crypto.is_valid_secret_name(name):
+        raise InvalidSecretNameError(name)
     request_id = _id("vrq")
     now = _now()
-    already = conn.execute(select(vault_secrets.c.id).where(vault_secrets.c.name == name)).first() is not None
+    existing_name = _find_secret_name_case_insensitive(conn, name)
+    if existing_name is not None and existing_name != name:
+        raise SecretNameCaseConflictError(name, existing_name)
+    already = existing_name == name
+    pending_name = _find_pending_provision_name_case_insensitive(conn, name)
+    if pending_name is not None and pending_name != name:
+        raise SecretNameCaseConflictError(name, pending_name)
     status = "fulfilled" if already else "pending"
     normalized_spec = normalize_provision_spec(spec)
-    card = _secure_input_card(name, request_id=request_id, reason=reason, spec=normalized_spec)
+    session_id = requester.get("session_id") if isinstance(requester, dict) else None
+    card = _secure_input_card(name, request_id=request_id, reason=reason, spec=normalized_spec, session_id=session_id)
     delivery_payload: dict[str, Any] = {"card": card}
     if reason:
         delivery_payload["reason"] = reason
     if normalized_spec:
         delivery_payload["spec"] = normalized_spec
-    conn.execute(
-        vault_requests.insert().values(
-            id=request_id,
-            request_type="provision",
-            secret_name=name,
-            requester=json.dumps(requester) if requester is not None else None,
-            delivery=json.dumps(delivery_payload),
-            status=status,
-            message_id=message_id,
-            created_at=now,
-            decided_at=now if already else None,
+    try:
+        conn.execute(
+            vault_requests.insert().values(
+                id=request_id,
+                request_type="provision",
+                secret_name=name,
+                requester=json.dumps(requester) if requester is not None else None,
+                delivery=json.dumps(delivery_payload),
+                status=status,
+                message_id=message_id,
+                created_at=now,
+                decided_at=now if already else None,
+            )
         )
-    )
+    except IntegrityError as exc:
+        pending_name = _find_pending_provision_name_case_insensitive(conn, name)
+        if pending_name is not None and pending_name != name:
+            raise SecretNameCaseConflictError(name, pending_name) from exc
+        raise VaultServiceError("failed to create provision request") from exc
     audit(conn, "provision_requested", secret_name=name, requester=requester, request_id=request_id)
     return {
         "id": request_id,
@@ -1451,12 +1719,16 @@ def _secure_input_card(
     request_id: str,
     reason: str | None = None,
     spec: dict[str, Any] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_spec = normalize_provision_spec(spec)
     card = {
         "card_type": "secure_input",
         "request_id": request_id,
         "secret_name": name,
+        # Carry the requesting session so surfaces can scope the card to its chat
+        # (mirrors approval_card); the Vaults page ignores it.
+        "session_id": session_id,
         "reason": reason,
         "protection_options": ["standard", "protected"],
         "default_protection": normalized_spec.get("protection") or "protected",
@@ -1895,7 +2167,7 @@ def complete_sign_request(
     claim = conn.execute(
         vault_requests.update()
         .where(vault_requests.c.id == request_id, vault_requests.c.request_type == "sign", vault_requests.c.status == row_dict["status"])
-        .values(status="approved", decided_at=_now(), delivery=json.dumps(completed_delivery))
+        .values(status="approved", decided_at=_now(), delivery=json.dumps(completed_delivery), callback_status="pending")
     )
     if claim.rowcount != 1:
         raise InvalidRequestError("sign request is not pending")
@@ -1968,7 +2240,7 @@ def fail_sign_request(conn: Connection, request_id: str, *, reason: str | None =
     result = conn.execute(
         vault_requests.update()
         .where(vault_requests.c.id == request_id, vault_requests.c.status == "signing")
-        .values(status="failed", decided_at=_now(), delivery=json.dumps(delivery_payload))
+        .values(status="failed", decided_at=_now(), delivery=json.dumps(delivery_payload), callback_status="pending")
     )
     if result.rowcount != 1:
         raise InvalidRequestError("sign request is not signing")
@@ -2029,7 +2301,7 @@ def deny_request(
     result = conn.execute(
         vault_requests.update()
         .where(vault_requests.c.id == request_id, vault_requests.c.status == "pending")
-        .values(status="denied", decided_at=decided_at)
+        .values(status="denied", decided_at=decided_at, callback_status="pending")
     )
     if result.rowcount != 1:
         raise InvalidRequestError("request is not pending")
@@ -2054,17 +2326,22 @@ def list_requests(
     status: str | None = "pending",
     request_type: str | None = None,
     limit: int = 100,
+    session: str | None = None,
 ) -> list[dict[str, Any]]:
     _expire_pending_requests(conn)
-    query = select(vault_requests).order_by(vault_requests.c.created_at.desc(), vault_requests.c.id.desc()).limit(limit)
+    query = select(vault_requests).order_by(vault_requests.c.created_at.desc(), vault_requests.c.id.desc())
     if status is not None:
         query = query.where(vault_requests.c.status == status)
     if request_type is not None:
         query = query.where(vault_requests.c.request_type == request_type)
-    return [
-        _request_row_payload(dict(row), conn=conn, audience=REQUEST_AUDIENCE_UI)
-        for row in conn.execute(query).mappings()
-    ]
+    # session_id lives in the request JSON (not a column), so a session-scoped query must filter
+    # in Python BEFORE limiting — else a global page could truncate this session's older rows.
+    if session is None:
+        query = query.limit(limit)
+    rows = [dict(row) for row in conn.execute(query).mappings()]
+    if session is not None:
+        rows = [row for row in rows if _request_session_id(row) == session][:limit]
+    return [_request_row_payload(row, conn=conn, audience=REQUEST_AUDIENCE_UI) for row in rows]
 
 
 def resolve_pending_provision_request_by_name(conn: Connection, name: str) -> tuple[dict[str, Any] | None, bool]:
@@ -2380,7 +2657,7 @@ def _approve_sibling_access_requests_for_grant(
         result = conn.execute(
             vault_requests.update()
             .where(vault_requests.c.id == row["id"], vault_requests.c.status == "pending")
-            .values(status="approved", decided_at=decided_at)
+            .values(status="approved", decided_at=decided_at, callback_status="pending")
         )
         if result.rowcount != 1:
             continue
@@ -2433,7 +2710,7 @@ def restore_access_request_after_failed_grant(
         result = conn.execute(
             vault_requests.update()
             .where(vault_requests.c.id == row["id"], vault_requests.c.status == "approved")
-            .values(status="pending", decided_at=None)
+            .values(status="pending", decided_at=None, callback_status=None)
         )
         if result.rowcount != 1:
             continue
@@ -2497,7 +2774,7 @@ def create_grant(
             vault_requests.c.request_type == "access",
             vault_requests.c.status == "pending",
         )
-        .values(status="approved", decided_at=decided_at)
+        .values(status="approved", decided_at=decided_at, callback_status="pending")
     )
     if claim.rowcount != 1:
         raise InvalidRequestError("grant approval request is not pending")
@@ -2506,28 +2783,53 @@ def create_grant(
     now_dt = datetime.now(timezone.utc)
     expires_at = (now_dt + timedelta(seconds=ttl)).isoformat()
     grant_id = approval.grant_id
+    grant_values = {
+        "member_snapshot": json.dumps(members),
+        "source_selector": json.dumps(selector),
+        "session_id": session_id,
+        "purpose": purpose,
+        "status": "active",
+        "request_id": request_id,
+        "one_shot": 1 if one_shot_grant else 0,
+        "created_at": now_dt.isoformat(),
+        "expires_at": expires_at,
+        "agent_ready": 1 if resident_cache_ready else 0,
+        "agent_ready_at": now_dt.isoformat() if resident_cache_ready else None,
+    }
     try:
-        conn.execute(
-            vault_grants.insert().values(
-                id=grant_id,
-                member_snapshot=json.dumps(members),
-                source_selector=json.dumps(selector),
-                session_id=session_id,
-                purpose=purpose,
-                status="active",
-                request_id=request_id,
-                one_shot=1 if one_shot_grant else 0,
-                created_at=now_dt.isoformat(),
-                expires_at=expires_at,
-                agent_ready=1 if resident_cache_ready else 0,
-                agent_ready_at=now_dt.isoformat() if resident_cache_ready else None,
-            )
+        existing_grant = (
+            conn.execute(select(vault_grants).where(vault_grants.c.id == grant_id))
+            .mappings()
+            .first()
         )
+        if existing_grant is not None:
+            existing = dict(existing_grant)
+            existing_selector = _loads(existing.get("source_selector")) or {}
+            existing_one_shot = bool(int(existing.get("one_shot") or 0))
+            if (
+                existing.get("status") != "expired"
+                or existing.get("request_id") != request_id
+                or set(_grant_member_names(existing)) != set(members)
+                or _source_selector_payload(existing_selector) != selector
+                or existing.get("session_id") != session_id
+                or existing.get("purpose") != purpose
+                or existing_one_shot != one_shot_grant
+            ):
+                raise InvalidGrantError("grant id already exists")
+            reused = conn.execute(
+                vault_grants.update()
+                .where(vault_grants.c.id == grant_id, vault_grants.c.status == "expired")
+                .values(**grant_values)
+            )
+            if reused.rowcount != 1:
+                raise InvalidGrantError("grant id already exists")
+        else:
+            conn.execute(vault_grants.insert().values(id=grant_id, **grant_values))
     except Exception:
         conn.execute(
             vault_requests.update()
             .where(vault_requests.c.id == request_id)
-            .values(status="pending", decided_at=None)
+            .values(status="pending", decided_at=None, callback_status=None)
         )
         raise
     audit(

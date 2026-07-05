@@ -184,6 +184,69 @@ async def stream_events(
         raise InternalServerUnavailable(str(exc)) from exc
 
 
+async def publish_event(
+    event_type: str,
+    data: dict[str, Any],
+    *,
+    socket_path: Optional[Path] = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Ask the Controller process to publish an allowlisted SSE notification."""
+
+    target = (socket_path or default_socket_path()).expanduser().resolve()
+    if not target.exists():
+        raise InternalServerUnavailable(f"dispatch socket missing at {target}")
+
+    transport = httpx.AsyncHTTPTransport(uds=str(target))
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://localhost",
+            timeout=httpx.Timeout(timeout, connect=2.0),
+        ) as client:
+            resp = await client.post("/internal/events", json={"type": event_type, "data": data})
+            if resp.status_code >= 400:
+                detail = await resp.aread()
+                raise InternalServerUnavailable(f"events publish returned {resp.status_code}: {detail!r}")
+            return resp.json()
+    except InternalServerUnavailable:
+        raise
+    except _SOCKET_ERRORS as exc:
+        raise InternalServerUnavailable(str(exc)) from exc
+
+
+def publish_event_sync(
+    event_type: str,
+    data: dict[str, Any],
+    *,
+    socket_path: Optional[Path] = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Synchronous wrapper for CLI/child-process notification publishers."""
+
+    target = (socket_path or default_socket_path()).expanduser().resolve()
+    if not target.exists():
+        raise InternalServerUnavailable(f"dispatch socket missing at {target}")
+
+    transport = httpx.HTTPTransport(uds=str(target))
+    try:
+        with httpx.Client(
+            transport=transport,
+            base_url="http://localhost",
+            timeout=httpx.Timeout(timeout, connect=2.0),
+        ) as client:
+            resp = client.post("/internal/events", json={"type": event_type, "data": data})
+            if resp.status_code >= 400:
+                raise InternalServerUnavailable(
+                    f"events publish returned {resp.status_code}: {resp.content!r}"
+                )
+            return resp.json()
+    except InternalServerUnavailable:
+        raise
+    except _SOCKET_ERRORS as exc:
+        raise InternalServerUnavailable(str(exc)) from exc
+
+
 async def dispatch_async(
     payload: dict[str, Any],
     *,
@@ -234,6 +297,68 @@ async def reconcile_platforms(
             timeout=httpx.Timeout(timeout, connect=5.0),
         ) as client:
             resp = await client.post("/internal/reconcile-platforms")
+    except _SOCKET_ERRORS as exc:
+        raise InternalServerUnavailable(str(exc)) from exc
+    return {"status_code": resp.status_code, "body": resp.json() if resp.content else {}}
+
+
+async def notify_vault_request_created(
+    request_payload: dict[str, Any],
+    *,
+    socket_path: Optional[Path] = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Ask the controller to send the IM degradation notice for a Vault request."""
+
+    target = (socket_path or default_socket_path()).expanduser().resolve()
+    if not target.exists():
+        raise InternalServerUnavailable(f"dispatch socket missing at {target}")
+    transport = httpx.AsyncHTTPTransport(uds=str(target))
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://localhost",
+            timeout=httpx.Timeout(timeout, connect=2.0),
+        ) as client:
+            resp = await client.post("/internal/vault/request-created", json={"request": request_payload})
+            if resp.status_code >= 400:
+                detail = await resp.aread()
+                raise InternalServerUnavailable(
+                    f"vault request notification returned {resp.status_code}: {detail!r}"
+                )
+    except InternalServerUnavailable:
+        raise
+    except _SOCKET_ERRORS as exc:
+        raise InternalServerUnavailable(str(exc)) from exc
+    return {"status_code": resp.status_code, "body": resp.json() if resp.content else {}}
+
+
+def notify_vault_request_created_sync(
+    request_payload: dict[str, Any],
+    *,
+    socket_path: Optional[Path] = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Synchronous wrapper for CLI/UI-server Vault request notifications."""
+
+    target = (socket_path or default_socket_path()).expanduser().resolve()
+    if not target.exists():
+        raise InternalServerUnavailable(f"dispatch socket missing at {target}")
+
+    transport = httpx.HTTPTransport(uds=str(target))
+    try:
+        with httpx.Client(
+            transport=transport,
+            base_url="http://localhost",
+            timeout=httpx.Timeout(timeout, connect=2.0),
+        ) as client:
+            resp = client.post("/internal/vault/request-created", json={"request": request_payload})
+            if resp.status_code >= 400:
+                raise InternalServerUnavailable(
+                    f"vault request notification returned {resp.status_code}: {resp.content!r}"
+                )
+    except InternalServerUnavailable:
+        raise
     except _SOCKET_ERRORS as exc:
         raise InternalServerUnavailable(str(exc)) from exc
     return {"status_code": resp.status_code, "body": resp.json() if resp.content else {}}

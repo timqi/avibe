@@ -16,6 +16,14 @@ export type GlobalPromptFile = {
   read_error: boolean;
 };
 
+/** Receive addresses derived from a keypair secret's secp256k1 public key. */
+export type SigningAddresses = {
+  eth?: string;
+  btc_legacy?: string;
+  btc_segwit?: string;
+  btc_taproot?: string;
+};
+
 export type VaultSecret = {
   name: string;
   /** Flat tag list; skill association is a reserved `skill:<name>` tag (see lib/vaultTags). */
@@ -23,9 +31,9 @@ export type VaultSecret = {
   kind: string;
   protection: string;
   signer_kind: string | null;
-  /** Pinned public key for keypair secrets (non-secret); surfaced so the saved
-   *  signing key's public key is recoverable after the create dialog closes. */
-  signing_public_key?: { curve?: string; public_key: string } | null;
+  /** Receive addresses derived from a keypair secret's public key. Agents and the UI
+   *  identify a signing key by address; the raw public key is never surfaced here. */
+  signing_addresses?: SigningAddresses | null;
   source: string;
   description?: string | null;
   policy: Record<string, unknown>;
@@ -364,6 +372,7 @@ export type ApiContextType = {
   getVaultVmk: () => Promise<VaultVmkResult>;
   getVaultPubkey: () => Promise<{ ok: boolean; public_key: string; fingerprint: string }>;
   getVaultAgentPubkey: () => Promise<{ ok: boolean; public_key: string; fingerprint: string }>;
+  deriveSigningAddresses: (publicKey: string) => Promise<{ ok: boolean; addresses?: SigningAddresses; code?: string; message?: string }>;
   createVaultSecret: (payload: VaultCreatePayload, opts?: { handleError?: boolean }) => Promise<{ ok: boolean; secret?: VaultSecret; code?: string; message?: string }>;
   deleteVaultSecret: (name: string) => Promise<{ ok: boolean; removed?: boolean; code?: string; message?: string }>;
   getVaultProvisionRequest: (
@@ -371,7 +380,7 @@ export type ApiContextType = {
     opts?: { handleError?: boolean },
   ) => Promise<{ ok: boolean; request: VaultRequest | null; ambiguous?: boolean }>;
   getVaultProvisionRequestById: (requestId: string, opts?: { handleError?: boolean }) => Promise<{ ok: boolean; request: VaultRequest | null }>;
-  getVaultRequests: (params?: { status?: string; type?: string; limit?: number }, opts?: { handleError?: boolean }) => Promise<{ ok: boolean; requests: VaultRequest[] }>;
+  getVaultRequests: (params?: { status?: string; type?: string; limit?: number; session?: string }, opts?: { handleError?: boolean }) => Promise<{ ok: boolean; requests: VaultRequest[] }>;
   denyVaultRequest: (requestId: string) => Promise<{ ok: boolean; request?: VaultRequest; code?: string; message?: string }>;
   fulfillVaultAccessRequest: (requestId: string, payload: VaultAccessFulfillmentPayload) => Promise<{ ok: boolean; request_id?: string; grant?: VaultGrant; result?: { type: string; grant?: VaultGrant }; code?: string; message?: string }>;
   getVaultGrants: (params?: { status?: string; sessionId?: string }, opts?: { handleError?: boolean }) => Promise<{ ok: boolean; grants: VaultGrant[] }>;
@@ -641,7 +650,8 @@ export type WorkbenchEventEnvelope<T = unknown> = {
 };
 
 export type WorkbenchEventHandlers = {
-  onConnected?: (data: { sub_id: number }) => void;
+  onConnected?: (data: { sub_id: number; source?: 'browser' | 'controller' }) => void;
+  onEventBridgeStatus?: (data: { connected: boolean }) => void;
   onMessageNew?: (data: WorkbenchMessage) => void;
   onSessionActivity?: (data: { session_id: string; scope_id: string | null; event: string; title?: string | null }) => void;
   onInboxUnreadChanged?: (data: {
@@ -666,6 +676,23 @@ export type WorkbenchEventHandlers = {
   onSessionStatus?: (data: { session_id: string; agent_status: 'idle' | 'running' | 'failed' }) => void;
   // The send-while-busy queue for a session changed (enqueue / flush / remove).
   onQueueUpdated?: (data: { session_id: string }) => void;
+  onRunsUpdated?: (data: {
+    run_id: string;
+    status: HarnessRunStatus;
+    run_type?: string;
+    session_id?: string;
+    definition_id?: string;
+    updated_at?: string;
+    cancel_requested?: boolean;
+  }) => void;
+  onVaultsUpdated?: (data: {
+    scope: string;
+    request_id?: string;
+    request_status?: string;
+    grant_id?: string;
+    grant_status?: string;
+    secret_name?: string;
+  }) => void;
   onAny?: (event: WorkbenchEventEnvelope) => void;
   onError?: (err: Event) => void;
 };
@@ -1418,7 +1445,8 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const readCacheRef = useRef(new Map<string, { expiresAt: number; promise: Promise<any> }>());
   const eventSourceRef = useRef<EventSource | null>(null);
   const eventHandlersRef = useRef(new Set<WorkbenchEventHandlers>());
-  const eventConnectionRef = useRef<{ sub_id: number } | null>(null);
+  const eventConnectionRef = useRef<{ sub_id: number; source?: 'browser' | 'controller' } | null>(null);
+  const eventBridgeConnectedRef = useRef(false);
 
   const handleApiError = async (res: Response, path: string) => {
     let errorMessage = `Request failed: ${path} (${res.status})`;
@@ -1531,6 +1559,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
     eventConnectionRef.current = null;
+    eventBridgeConnectedRef.current = false;
   };
 
   const ensureWorkbenchEventSource = (options?: { reconnect?: boolean }) => {
@@ -1543,7 +1572,16 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     eventSourceRef.current = source;
     source.addEventListener('connected', (e: MessageEvent) => {
       try {
-        eventConnectionRef.current = JSON.parse(e.data) as { sub_id: number };
+        const parsed = JSON.parse(e.data) as { sub_id?: number; type?: string; data?: unknown };
+        const sourceKind = typeof parsed.sub_id === 'number' ? 'browser' : 'controller';
+        eventConnectionRef.current = {
+          sub_id: typeof parsed.sub_id === 'number' ? parsed.sub_id : -1,
+          source: sourceKind,
+        };
+        if (sourceKind === 'controller') {
+          eventBridgeConnectedRef.current = true;
+          dispatchToWorkbenchHandlers((handlers) => handlers.onEventBridgeStatus?.({ connected: true }));
+        }
       } catch (err) {
         console.error('[workbench-events] connected parse failed', err, e.data);
         eventConnectionRef.current = null;
@@ -1636,7 +1674,52 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         handlers.onQueueUpdated?.(envelope.data);
       });
     });
+    source.addEventListener('runs.updated', (e: MessageEvent) => {
+      const envelope = parseWorkbenchEnvelope<{
+        run_id: string;
+        status: HarnessRunStatus;
+        run_type?: string;
+        session_id?: string;
+        definition_id?: string;
+        updated_at?: string;
+        cancel_requested?: boolean;
+      }>(e.data);
+      if (!envelope) return;
+      clearReadCacheMatching((path) => path.startsWith('/api/harness'));
+      dispatchToWorkbenchHandlers((handlers) => {
+        handlers.onAny?.(envelope);
+        handlers.onRunsUpdated?.(envelope.data);
+      });
+    });
+    source.addEventListener('vaults.updated', (e: MessageEvent) => {
+      const envelope = parseWorkbenchEnvelope<{
+        scope: string;
+        request_id?: string;
+        request_status?: string;
+        grant_id?: string;
+        grant_status?: string;
+        secret_name?: string;
+      }>(e.data);
+      if (!envelope) return;
+      clearReadCacheMatching((path) => path.startsWith('/api/vault/'));
+      dispatchToWorkbenchHandlers((handlers) => {
+        handlers.onAny?.(envelope);
+        handlers.onVaultsUpdated?.(envelope.data);
+      });
+    });
+    source.addEventListener('workbench.events.bridge.status', (e: MessageEvent) => {
+      const envelope = parseWorkbenchEnvelope<{ connected: boolean }>(e.data);
+      if (!envelope) return;
+      eventBridgeConnectedRef.current = envelope.data.connected;
+      dispatchToWorkbenchHandlers((handlers) => {
+        handlers.onAny?.(envelope);
+        handlers.onEventBridgeStatus?.(envelope.data);
+      });
+    });
     source.onerror = (err) => {
+      eventConnectionRef.current = null;
+      eventBridgeConnectedRef.current = false;
+      dispatchToWorkbenchHandlers((handlers) => handlers.onEventBridgeStatus?.({ connected: false }));
       dispatchToWorkbenchHandlers((handlers) => handlers.onError?.(err));
     };
   };
@@ -2077,6 +2160,8 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     listVaultSecrets: () => getCachedJson('/api/vault/secrets', 1500),
     getVaultPubkey: () => getCachedJson('/api/vault/pubkey', 1500),
     getVaultAgentPubkey: () => getCachedJson('/api/vault/agent/pubkey', 1500),
+    deriveSigningAddresses: (publicKey) =>
+      postJson('/api/vault/signing-addresses', { public_key: publicKey }, { handleError: false }),
     createVaultSecret: (payload, opts) => postJson('/api/vault/secrets', payload, opts),
     deleteVaultSecret: (name) => deleteJson(`/api/vault/secrets/${encodeURIComponent(name)}`),
     getVaultProvisionRequest: (name, opts) =>
@@ -2088,6 +2173,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (params?.status) search.set('status', params.status);
       if (params?.type) search.set('type', params.type);
       if (params?.limit) search.set('limit', String(params.limit));
+      if (params?.session) search.set('session', params.session);
       const qs = search.toString();
       return getCachedJson(qs ? `/api/vault/requests?${qs}` : '/api/vault/requests', 1500, opts);
     },
@@ -2218,10 +2304,24 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     connectWorkbenchEvents: (handlers, options) => {
       eventHandlersRef.current.add(handlers);
       ensureWorkbenchEventSource(options);
-      if (eventConnectionRef.current) {
+      if (
+        eventConnectionRef.current &&
+        (eventConnectionRef.current.source !== 'controller' || eventBridgeConnectedRef.current)
+      ) {
         queueMicrotask(() => {
-          if (eventHandlersRef.current.has(handlers) && eventConnectionRef.current) {
+          if (
+            eventHandlersRef.current.has(handlers) &&
+            eventConnectionRef.current &&
+            (eventConnectionRef.current.source !== 'controller' || eventBridgeConnectedRef.current)
+          ) {
             handlers.onConnected?.(eventConnectionRef.current);
+          }
+        });
+      }
+      if (eventBridgeConnectedRef.current) {
+        queueMicrotask(() => {
+          if (eventHandlersRef.current.has(handlers)) {
+            handlers.onEventBridgeStatus?.({ connected: true });
           }
         });
       }

@@ -4658,7 +4658,21 @@ def _vault_cli_requester(args) -> dict:
     skill = (getattr(args, "skill", None) or "").strip()
     if skill:
         requester["skill"] = skill
+    if _vault_callback_disabled(args):
+        # Opt out of auto-resume: the daemon sweep marks this request's callback "skipped".
+        requester["callback_disabled"] = True
     return requester
+
+
+def _vault_callback_disabled(args) -> bool:
+    """Whether this request opts out of the auto-resume callback at creation time.
+
+    Only explicit ``--no-callback``. ``--wait`` must NOT pre-disable it: a finite wait can time
+    out with the request still pending, and the agent must then still be auto-resumed when it
+    later resolves. The redundant callback for a wait that DOES observe fulfillment is suppressed
+    at that point instead (see ``cmd_vault_request``).
+    """
+    return bool(getattr(args, "no_callback", False))
 
 
 def _vault_cli_delivery(args, **fields) -> dict:
@@ -4669,13 +4683,61 @@ def _vault_cli_delivery(args, **fields) -> dict:
     skill = (getattr(args, "skill", None) or "").strip()
     if skill:
         delivery["skill"] = skill
-    command = getattr(args, "command", None)
+    command = getattr(args, "operation_command", None)
+    if command is None:
+        command = getattr(args, "command", None)
+        if command == "vault":
+            command = None
     if command:
         delivery["command"] = command
     egress = getattr(args, "egress", None)
     if egress:
         delivery["egress"] = egress
     return delivery
+
+
+def _publish_cli_vaults_updated(
+    *,
+    scope: str,
+    request: dict | None = None,
+    grant: dict | None = None,
+    secret_name: str | None = None,
+) -> None:
+    """Best-effort bridge for CLI/agent vault writes into browser SSE."""
+
+    if request is None and grant is None and not secret_name:
+        return
+    if scope == "request" and isinstance(request, dict):
+        _publish_cli_vault_request_notification(request)
+    try:
+        from core.inbox_events import VAULTS_UPDATED_EVENT, vaults_updated_payload
+        from vibe import internal_client
+
+        internal_client.publish_event_sync(
+            VAULTS_UPDATED_EVENT,
+            vaults_updated_payload(
+                scope=scope,
+                request_id=str(request.get("id") or "") if request else None,
+                request_status=str(request.get("status") or "") if request else None,
+                grant_id=str(grant.get("id") or "") if grant else None,
+                grant_status=str(grant.get("status") or "") if grant else None,
+                secret_name=secret_name or (str(request.get("secret_name") or "") if request else None),
+            ),
+            timeout=1.5,
+        )
+    except Exception:
+        logger.debug("failed to publish CLI vault update event", exc_info=True)
+
+
+def _publish_cli_vault_request_notification(request: dict) -> None:
+    """Best-effort bridge for CLI-created Vault requests into IM notification delivery."""
+
+    try:
+        from vibe import internal_client
+
+        internal_client.notify_vault_request_created_sync(request, timeout=2.0)
+    except Exception:
+        logger.debug("failed to publish CLI vault request notification", exc_info=True)
 
 
 def _is_env_name(name: str) -> bool:
@@ -4899,6 +4961,7 @@ def cmd_vault_rm(args):
             vault_service.delete_secret(conn, args.name)
             release_scopes = vault_service.agent_release_scopes_after_rows(conn, grant_rows)
         api.release_vault_agent_scopes(release_scopes, reason="vault_rm")
+        _publish_cli_vaults_updated(scope="secret", secret_name=args.name)
         _print_cli_payload("vault_secret", removed=True, name=args.name)
         return 0
     except vault_service.SecretNotFoundError:
@@ -4916,7 +4979,7 @@ def cmd_vault_access(args):
     name = getattr(args, "name", "")
     try:
         if not vault_crypto.is_valid_secret_name(name):
-            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name", help_command=help_command)
+            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name", help_command=help_command)
         engine = _open_vault_engine()
         with engine.begin() as conn:
             vault_service.get_secret_meta(conn, name)
@@ -4926,11 +4989,12 @@ def cmd_vault_access(args):
                 requester=_vault_cli_requester(args),
                 delivery=_vault_cli_delivery(args, mode="access"),
             )
+        _publish_cli_vaults_updated(scope="request", request=request)
         _print_cli_payload(
             "vault_access_request",
             request_id=request["id"],
             request=request,
-            message="Request recorded. Wait for approval with: vibe vault await " + request["id"],
+            message=_vault_request_followup_message(args, request["id"], resolved_verb="approves or denies it"),
         )
         return 0
     except vault_service.SecretNotFoundError:
@@ -4966,7 +5030,7 @@ def _expire_agent_grant_after_missing(
             source_selector = delivery_payload.get("source_selector")
             if isinstance(source_selector, dict):
                 try:
-                    return vault_service.create_access_request(
+                    first_request = vault_service.create_access_request(
                         conn,
                         source_selector=source_selector,
                         requester=requester or {"source": "cli", "pid": os.getpid()},
@@ -4975,19 +5039,23 @@ def _expire_agent_grant_after_missing(
                     )
                 except vault_service.NotGrantableError:
                     pass
-            for name in names:
-                resolved = vault_service.resolve_secret_access(
-                    conn,
-                    name,
-                    requester=requester or {"source": "cli", "pid": os.getpid()},
-                    delivery=delivery or {},
-                    purpose=purpose,
-                )
-                if first_request is None and isinstance(resolved.get("request"), dict):
-                    first_request = resolved["request"]
-                    break
+            if first_request is None:
+                for name in names:
+                    resolved = vault_service.resolve_secret_access(
+                        conn,
+                        name,
+                        requester=requester or {"source": "cli", "pid": os.getpid()},
+                        delivery=delivery or {},
+                        purpose=purpose,
+                    )
+                    if first_request is None and isinstance(resolved.get("request"), dict):
+                        first_request = resolved["request"]
+                        break
     except Exception:
         pass
+    else:
+        _publish_cli_vaults_updated(scope="grant", grant={"id": grant_id, "status": "expired"})
+        _publish_cli_vaults_updated(scope="request", request=first_request)
     return first_request
 
 
@@ -5426,6 +5494,7 @@ def _resolve_vault_run_delivery(
         if str(metas[name].get("protection") or "standard") == "protected"
     ]
     standard_approval_error: TaskCliError | None = None
+    approval_request_to_publish: dict | None = None
     if metas and not protected_names:
         with engine.begin() as conn:
             standard_names = list(dict.fromkeys(mapping.values()))
@@ -5451,12 +5520,14 @@ def _resolve_vault_run_delivery(
                     delivery=delivery,
                     purpose="run",
                 )
+                approval_request_to_publish = req
                 standard_approval_error = TaskCliError(
                     "standard always_ask secrets need approval before vault run delivery",
                     code="approval_required",
                     details={"request_id": req.get("id"), "secret_names": approval_names},
                 )
         if standard_approval_error is not None:
+            _publish_cli_vaults_updated(scope="request", request=approval_request_to_publish)
             raise standard_approval_error
     secrets = []
     grant: dict | None = None
@@ -5527,6 +5598,7 @@ def _resolve_vault_run_delivery(
                             delivery=request_delivery,
                             purpose="run",
                         )
+                        approval_request_to_publish = req
                         approval_error = TaskCliError(
                             "protected secrets need approval before vault run delivery",
                             code="approval_required",
@@ -5560,6 +5632,8 @@ def _resolve_vault_run_delivery(
                     resolved_by_name[vault_name] = resolved
                 if resolved["status"] == "approval_required":
                     req = resolved.get("request") or {}
+                    if isinstance(req, dict):
+                        approval_request_to_publish = req
                     approval_error = TaskCliError(
                         f"secret '{vault_name}' needs approval before protected delivery",
                         code="approval_required",
@@ -5581,6 +5655,7 @@ def _resolve_vault_run_delivery(
     except Exception as exc:
         _raise_after_releasing_one_shot_reservations(engine, one_shot_grants, exc)
     if approval_error is not None:
+        _publish_cli_vaults_updated(scope="request", request=approval_request_to_publish)
         _release_one_shot_reservations(engine, one_shot_grants)
         raise approval_error
     return grant, one_shot_grants, secrets
@@ -5607,6 +5682,8 @@ def _resolve_single_vault_delivery(
         )
     if resolved["status"] == "approval_required":
         req = resolved.get("request") or {}
+        if isinstance(req, dict):
+            _publish_cli_vaults_updated(scope="request", request=req)
         raise TaskCliError(
             f"secret '{name}' needs approval before protected delivery",
             code="approval_required",
@@ -5660,6 +5737,7 @@ def _resolve_vault_inject_delivery(engine, names: list[str], *, path: str, fmt: 
     grant: dict | None = None
     one_shot_grants: list[dict] = []
     approval_error: TaskCliError | None = None
+    approval_request_to_publish: dict | None = None
     pre_delivery_error: TaskCliError | None = None
     resolved_by_name: dict[str, dict] = {}
     try:
@@ -5678,6 +5756,8 @@ def _resolve_vault_inject_delivery(engine, names: list[str], *, path: str, fmt: 
                     resolved_by_name[name] = resolved
                 if resolved["status"] == "approval_required":
                     req = resolved.get("request") or {}
+                    if isinstance(req, dict):
+                        approval_request_to_publish = req
                     approval_error = TaskCliError(
                         f"secret '{name}' needs approval before protected delivery",
                         code="approval_required",
@@ -5709,6 +5789,7 @@ def _resolve_vault_inject_delivery(engine, names: list[str], *, path: str, fmt: 
     except Exception as exc:
         _raise_after_releasing_one_shot_reservations(engine, one_shot_grants, exc)
     if approval_error is not None:
+        _publish_cli_vaults_updated(scope="request", request=approval_request_to_publish)
         _release_one_shot_reservations(engine, one_shot_grants)
         raise approval_error
     if pre_delivery_error is not None:
@@ -5885,7 +5966,7 @@ def _wait_for_provision(request_id: str, *, timeout: float, poll_interval: float
                 request = vault_service.get_request(conn, request_id, audience=vault_service.REQUEST_AUDIENCE_AGENT)
             except vault_service.RequestNotFoundError:
                 raise
-        if request.get("status") == "fulfilled":
+        if request.get("status") in {"fulfilled", "denied", "expired", "failed"}:
             return request
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -5924,7 +6005,7 @@ def cmd_vault_request(args):
     try:
         name = args.name
         if not vault_crypto.is_valid_secret_name(name):
-            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name", help_command=help_command)
+            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name", help_command=help_command)
         spec = _load_vault_request_spec(args, help_command=help_command)
         engine = _open_vault_engine()
         with engine.begin() as conn:
@@ -5933,8 +6014,11 @@ def cmd_vault_request(args):
                 name,
                 reason=getattr(args, "reason", None),
                 spec=spec,
-                requester={"source": "cli", "pid": os.getpid()},
+                # Carry the caller session (AVIBE_SESSION_ID) so the provision card can be
+                # scoped to the originating chat, like access/sign requests.
+                requester=_vault_cli_requester(args),
             )
+        _publish_cli_vaults_updated(scope="request", request=req, secret_name=name)
         if req.get("status") == "fulfilled":
             # Secret already existed — no point waiting.
             _print_cli_payload(
@@ -5950,6 +6034,46 @@ def cmd_vault_request(args):
         if wait_seconds:
             waited = _wait_for_provision(req["id"], timeout=float(wait_seconds))
             if waited:
+                # The wait delivered a terminal outcome synchronously, so suppress the
+                # now-redundant async auto-resume callback for this request (best-effort — a
+                # race with the ~2s sweep risks at most one benign duplicate resume). A wait
+                # that TIMES OUT skips this and leaves the callback armed, so a later resolution
+                # still wakes the agent.
+                try:
+                    with _open_vault_engine().begin() as conn:
+                        vault_service.mark_request_callback(conn, str(req["id"]), status="skipped")
+                except Exception:
+                    pass
+                if waited.get("status") == "denied":
+                    _print_task_error(
+                        TaskCliError(
+                            f"request for '{name}' was denied",
+                            code="request_denied",
+                            help_command=help_command,
+                            details={"request_id": req["id"]},
+                        )
+                    )
+                    return 1
+                if waited.get("status") == "expired":
+                    _print_task_error(
+                        TaskCliError(
+                            f"request for '{name}' expired",
+                            code="request_expired",
+                            help_command=help_command,
+                            details={"request_id": req["id"]},
+                        )
+                    )
+                    return 1
+                if waited.get("status") == "failed":
+                    _print_task_error(
+                        TaskCliError(
+                            f"request for '{name}' failed",
+                            code="request_failed",
+                            help_command=help_command,
+                            details={"request_id": req["id"]},
+                        )
+                    )
+                    return 1
                 _print_cli_payload(
                     "vault_request",
                     request_id=req["id"],
@@ -5974,11 +6098,19 @@ def cmd_vault_request(args):
             secret_name=name,
             status="pending",
             request=req,
-            message=_vault_request_pending_message(name, req, has_spec=bool(spec)),
+            message=_vault_request_pending_message(
+                name,
+                req,
+                has_spec=bool(spec),
+                callback_enabled=not _vault_callback_disabled(args) and bool(_vault_cli_session_id(args)),
+            ),
         )
         return 0
     except TaskCliError as exc:
         _print_task_error(exc)
+        return 1
+    except vault_service.SecretNameCaseConflictError as exc:
+        _print_task_error(TaskCliError(str(exc), code="secret_name_case_conflict", help_command=help_command))
         return 1
     except vault_service.VaultServiceError as exc:
         _print_task_error(TaskCliError(str(exc), code="invalid_spec", help_command=help_command))
@@ -5995,7 +6127,7 @@ def cmd_vault_sign(args):
     name = getattr(args, "name", "")
     try:
         if not vault_crypto.is_valid_secret_name(name):
-            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Z][A-Z0-9_]*$)", code="invalid_name", help_command=help_command)
+            raise TaskCliError(f"invalid secret name: {name!r} (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name", help_command=help_command)
         digest = api._sign_digest_from_payload(getattr(args, "digest", None))
         scheme = getattr(args, "scheme", None) or "ecdsa-secp256k1-recoverable"
         engine = _open_vault_engine()
@@ -6017,11 +6149,12 @@ def cmd_vault_sign(args):
                 requester=_vault_cli_requester(args),
                 delivery=_vault_cli_delivery(args, mode="sign"),
             )
+        _publish_cli_vaults_updated(scope="request", request=request)
         _print_cli_payload(
             "vault_sign_request",
             request_id=request["id"],
             request=request,
-            message="Request recorded. Wait for approval with: vibe vault await " + request["id"],
+            message=_vault_request_followup_message(args, request["id"], resolved_verb="approves or denies the signature"),
         )
         return 0
     except vault_service.SecretNotFoundError:
@@ -6106,17 +6239,45 @@ def cmd_vault_await(args):
         return 1
 
 
-def _vault_request_pending_message(name: str, request: dict[str, object], *, has_spec: bool) -> str:
+def _vault_request_followup_message(args, request_id: str, *, resolved_verb: str) -> str:
+    """Agent-facing follow-up for an access/sign request.
+
+    By default this Session auto-resumes when the request resolves, so the agent should just end
+    its turn. We deliberately do NOT suggest ``vault await`` here: with the callback armed, awaiting
+    would return the synchronous result AND still leave the callback to fire a second turn. To
+    block synchronously the agent must opt out at creation with ``--no-callback`` (then this points
+    at ``vault await``).
+    """
+    if _vault_callback_disabled(args) or not _vault_cli_session_id(args):
+        return f"Request recorded. Check the result yourself with: vibe vault await {request_id}"
+    return (
+        f"Request recorded. This Session resumes automatically once the user {resolved_verb} — "
+        f"end your turn now; you'll be woken with the outcome. (To block synchronously instead, "
+        f"re-issue the request with --no-callback.)"
+    )
+
+
+def _vault_request_pending_message(
+    name: str,
+    request: dict[str, object],
+    *,
+    has_spec: bool,
+    callback_enabled: bool = True,
+) -> str:
+    resume = (
+        " This Session resumes automatically once it is provided — you can end your turn now."
+        if callback_enabled
+        else f" Check back with: vibe vault await {request['id']}."
+    )
     if has_spec:
         return (
-            f"Recorded a request for '{name}'. The user fulfills request {request['id']} from the Vaults page pending "
-            f"requests list by opening its Provide secret row; that request-specific form preserves the requested "
-            f"tags, policy, and skill links. Then use: vibe vault run --env {name} -- <command>"
+            f"Recorded a request for '{name}'. The user provides it from the chat request card or the Vaults "
+            f"page 'Provide secret' row, whose request-specific form preserves the requested tags, policy, and "
+            f"skill links.{resume} Then use: vibe vault run --env {name} -- <command>"
         )
     return (
-        f"Recorded a request for '{name}'. The user fulfills it from the Vaults page pending requests list "
-        f"(Provide secret) or by adding a secret named {name}; saving it marks this request fulfilled. "
-        f"Then use: vibe vault run --env {name} -- <command>"
+        f"Recorded a request for '{name}'. The user provides it from the chat request card, the Vaults page "
+        f"'Provide secret' row, or by adding a secret named {name}.{resume} Then use: vibe vault run --env {name} -- <command>"
     )
 
 
@@ -7802,6 +7963,11 @@ def _start_service_after_repair(target: str, success_message: str, failure_messa
     )
 
 
+def _runtime_home_exists_for_repair() -> bool:
+    runtime_home = paths.get_vibe_remote_dir()
+    return runtime_home.is_dir()
+
+
 def _repair_home_migration(*, dry_run: bool = False) -> dict:
     target = "home-migration"
     if os.environ.get(paths.AVIBE_HOME_ENV):
@@ -7881,6 +8047,8 @@ def _repair_duplicate_service_processes(*, dry_run: bool = False) -> dict:
     target = "duplicate-service-processes"
     if runtime.service_instance_lock_attached_to_process():
         return _doctor_repair_result(target, "failed", "Run this repair from the CLI, not from inside the service process.")
+    if not _runtime_home_exists_for_repair():
+        return _doctor_repair_result(target, "skipped", "No runtime home exists yet; no service process state needs repair.")
 
     owner_pid = runtime.resolve_service_owner_pid(include_starting=False)
     extra_pids = runtime.extra_service_process_pids(owner_pid=owner_pid)
@@ -7926,6 +8094,8 @@ def _repair_stale_install_runtime(*, dry_run: bool = False) -> dict:
     target = "stale-install-runtime"
     if runtime.service_instance_lock_attached_to_process():
         return _doctor_repair_result(target, "failed", "Run this repair from the CLI, not from inside the service process.")
+    if not _runtime_home_exists_for_repair():
+        return _doctor_repair_result(target, "skipped", "No runtime home exists yet; no service process state needs repair.")
 
     current_family = _current_cli_install_family()
     owner_pid = runtime.resolve_service_owner_pid(include_starting=False)
@@ -8030,7 +8200,7 @@ def _repair_doctor_targets(targets: list[str], *, dry_run: bool = False) -> dict
         "dry_run": dry_run,
         "results": results,
     }
-    if not dry_run:
+    if not dry_run and any(result["status"] != "skipped" for result in results):
         payload["doctor"] = _doctor()
     return payload
 
@@ -10055,8 +10225,13 @@ def build_parser():
     vault_access_parser.add_argument("name", help="Static secret name to request")
     vault_access_parser.add_argument("--session-id", help="Agent Session ID. Defaults from AVIBE_SESSION_ID inside an Agent shell.")
     vault_access_parser.add_argument("--skill", help="Skill requesting the secret")
-    vault_access_parser.add_argument("--command", help="Command or operation shown to the user")
+    vault_access_parser.add_argument("--command", dest="operation_command", help="Command or operation shown to the user")
     vault_access_parser.add_argument("--egress", help="Egress description shown to the user")
+    vault_access_parser.add_argument(
+        "--no-callback",
+        action="store_true",
+        help="Don't auto-resume this Session when the request resolves (you'll re-check it yourself)",
+    )
     _add_json_noop(vault_access_parser)
 
     vault_sign_parser = vault_subparsers.add_parser(
@@ -10080,8 +10255,13 @@ def build_parser():
     )
     vault_sign_parser.add_argument("--session-id", help="Agent Session ID. Defaults from AVIBE_SESSION_ID inside an Agent shell.")
     vault_sign_parser.add_argument("--skill", help="Skill requesting the signature")
-    vault_sign_parser.add_argument("--command", help="Operation shown to the user")
+    vault_sign_parser.add_argument("--command", dest="operation_command", help="Operation shown to the user")
     vault_sign_parser.add_argument("--egress", help="Egress description shown to the user")
+    vault_sign_parser.add_argument(
+        "--no-callback",
+        action="store_true",
+        help="Don't auto-resume this Session when the signature resolves (you'll re-check it yourself)",
+    )
     _add_json_noop(vault_sign_parser)
 
     vault_await_parser = vault_subparsers.add_parser(
@@ -10171,6 +10351,11 @@ def build_parser():
     vault_request_parser.add_argument("--spec-json", help="Inline JSON object with non-secret creation hints")
     vault_request_parser.add_argument("--wait", type=float, metavar="SECONDS", help="Block until fulfilled, up to SECONDS")
     vault_request_parser.add_argument("--no-wait", action="store_true", help="Return immediately (default)")
+    vault_request_parser.add_argument(
+        "--no-callback",
+        action="store_true",
+        help="Don't auto-resume this Session when the secret is provided (you'll re-check it yourself)",
+    )
     _add_json_noop(vault_request_parser)
 
     show_parser = subparsers.add_parser(

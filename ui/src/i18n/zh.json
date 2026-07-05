@@ -220,6 +220,8 @@
     "statusNow": "当前状态",
     "consoleServerTitle": "控制台服务",
     "consoleServerHint": "保存这些值只会重启 Web UI 服务，不会重启主服务。",
+    "instanceNameTitle": "实例名称",
+    "instanceNameHint": "显示在浏览器标签标题中（“Avibe - 名称”）。留空则使用系统 hostname。",
     "consoleServerRedirecting": "UI 服务地址已变更，正在跳转到 {{origin}}...",
     "consoleServerRelocated": "UI 服务现在监听 {{origin}}，请打开该地址继续。",
     "serviceNotesTitle": "运维说明",
@@ -605,6 +607,10 @@
     "remote_access_unknown": "操作没有完成。请刷新状态后再试一次；如果仍然失败，请查看远程访问运行日志。",
     "invalid_pairing_key": "这个 pairing key 无效或已过期。请回到 avibe.bot 重新生成一个 key，然后粘贴到这里。",
     "missing_pairing_key": "请先粘贴 pairing key。",
+    "invalid_pairing_backend_url": "Avibe Cloud 地址必须是有效的 HTTPS 地址。",
+    "pairing_backend_url_not_allowed": "这个 Avibe Cloud 地址不允许使用。请使用公开的 HTTPS avibe.bot 地址。",
+    "pairing_backend_unresolvable": "Avibe 无法解析这个 Avibe Cloud 地址。请检查地址后重试。",
+    "backend_http_redirect_blocked": "Avibe Cloud 重定向了配对请求，Avibe 已在发送 pairing key 前停止。",
     "pairing_request_failed": "无法连接到 avibe.bot。请检查网络连接，或确认 Avibe Cloud 地址填写正确。",
     "backend_http_error": "avibe.bot 暂时拒绝了这次请求。请稍后重试，或重新生成 pairing key。",
     "invalid_pairing_response": "avibe.bot 返回的信息不完整。请刷新页面后重新生成 pairing key 再试。",
@@ -614,7 +620,8 @@
     "cloudflared_spawn_failed": "连接器启动失败。请检查 cloudflared 是否可执行，或查看运行日志。",
     "cloudflared_exited": "连接器启动后立即退出。通常是 Tunnel 凭证无效或 Cloudflare 配置未生效，请重新配对后再试。",
     "cloudflared_stop_failed": "连接器暂时无法停止。请稍后重试，或在系统进程里手动结束 cloudflared。",
-    "cloudflared_process_unknown": "检测到一个无法确认归属的连接器进程。为避免误杀其它进程，Avibe 没有自动处理。请手动检查 cloudflared 进程后再启动。"
+    "cloudflared_process_unknown": "检测到一个无法确认归属的连接器进程。为避免误杀其它进程，Avibe 没有自动处理。请手动检查 cloudflared 进程后再启动。",
+    "bind_code_limit_reached": "可用绑定码过多，请先撤销一个未使用的绑定码，再创建新的绑定码。"
   },
   "apps": {
     "title": "应用",
@@ -2188,6 +2195,16 @@
     "neverUsed": "从未使用",
     "standard": "标准档",
     "signing": "签名",
+    "addresses": {
+      "eth": "ETH",
+      "btcSegwit": "BTC SegWit",
+      "btcTaproot": "BTC Taproot",
+      "btcLegacy": "BTC Legacy",
+      "copy": "复制 {{label}} 地址"
+    },
+    "chat": {
+      "floatApprovals": "等你授权 · {{count}}"
+    },
     "filter": {
       "clear": "清除筛选",
       "empty": "没有匹配所选标签的密钥。"
@@ -2263,6 +2280,7 @@
     },
     "dialog": {
       "title": "添加密钥",
+      "subtitle": "加密存储;值不会进入聊天或模型。",
       "name": "名称",
       "value": "值",
       "valuePlaceholder": "粘贴密钥值",
@@ -2282,16 +2300,17 @@
       "kindStaticHelp": "令牌、密码,或任意文本值。",
       "kindKeypair": "签名密钥",
       "kindKeypairHelp": "在你浏览器里生成的签名私钥。",
-      "nameHint": "大写 A–Z 0–9 _ · 全局唯一",
+      "nameHint": "首字符必须是字母或下划线；后续可用字母、数字、下划线 · 保留大小写",
       "signingKeyHelp": "会在你的浏览器里新生成一把 secp256k1 签名密钥。私钥在浏览器中封存——标准密钥由本机 avault 签名,保护层密钥在浏览器中签名——只有公钥明文保存。",
       "signingGenerate": "生成",
       "signingImport": "导入",
       "signingGenerateCta": "生成签名密钥",
       "signingRegenerate": "换一把新密钥",
       "signingImportPlaceholder": "粘贴 32 字节十六进制私钥(64 个字符)",
-      "signingPublicKey": "公钥",
-      "copyPublicKey": "复制公钥",
-      "signingPublicKeyHint": "公钥可以放心分享。私钥始终留在你的保险库里;用哪条链、哪种签名方案,在签名时再定。",
+      "signingAddresses": "地址",
+      "signingAddressesLoading": "正在推导地址…",
+      "signingAddressesUnavailable": "无法为该密钥推导地址。",
+      "signingAddressesHint": "由密钥推导得到。收款时把地址发给对方即可;私钥始终留在你的保险库里,用哪条链、哪种签名方案在签名时再定。",
       "signingNeedsAvault": "签名密钥需要安装 avault {{version}} 或更新版本。",
       "checkingAvault": "正在检查 avault…",
       "p2Unavailable": "浏览器侧保险库创建需要 avault {{version}} 或更新版本。当前安装：{{installed}}。请先安装兼容的 avault 发布版，再保存标准密钥。",
@@ -2309,11 +2328,8 @@
       "fetchAuthNamePlaceholder": "X-Api-Key 或 api_key",
       "fetchAuthHelp": "默认使用 Authorization: Bearer <value>。如果目标 API 要求其他位置,可改用 Header 或 Query。",
       "tags": "标签",
-      "tagsPlaceholder": "输入标签后回车",
-      "tagsHelp": "用于查找密钥，也可在运行和授权中按标签选择密钥。技能请在“技能”栏添加。",
-      "skills": "技能",
-      "skillsPlaceholder": "输入技能名称后回车",
-      "skillsHelp": "以 skill:<名称> 标签存储。按该技能选择的运行或授权会包含这条密钥。",
+      "tagsPlaceholder": "输入或选择标签",
+      "tagsHelp": "用于查找密钥，也可在运行和授权中按标签选择。",
       "removeChip": "移除 {{value}}",
       "protection": "保护级别",
       "protectedProtection": "受保护",
@@ -2337,7 +2353,8 @@
         "fileEmpty": "请选择非空文件。",
         "fileTooLarge": "请选择不超过 {{size}} 的文件。",
         "fileReadFailed": "读取文件失败。",
-        "secretExists": "同名密钥已存在。"
+        "secretExists": "同名密钥已存在。",
+        "secretNameCaseConflict": "已有密钥使用了仅大小写不同的名称。"
       }
     },
     "requests": {
@@ -2364,7 +2381,9 @@
       "session": "会话",
       "command": "命令",
       "egress": "出网",
+      "signingAs": "签名地址",
       "digest": "摘要",
+      "copyDigest": "复制摘要",
       "source": "来源",
       "sourceTag": "标签 · {{name}}",
       "sourceSkill": "技能 · {{name}}",

@@ -162,8 +162,7 @@ async function blindBoxContextFromVector(vector: (typeof p2.blind_box_aad_exampl
     case 'agent-deliver':
       return await protectedDekReleaseBlindBoxContext(vector.name, {
         kind: 'agent-deliver',
-        scopeType: vector.scope_type,
-        scopeRef: vector.scope_ref,
+        grantId: vector.grant_id,
         ttlSecs: vector.ttl_secs,
         approval: approvalFromVector(vector),
         operationHash: vector.operation_hash_hex,
@@ -171,8 +170,7 @@ async function blindBoxContextFromVector(vector: (typeof p2.blind_box_aad_exampl
     case 'agent-sign':
       return await protectedDekReleaseBlindBoxContext(vector.name, {
         kind: 'agent-sign',
-        scopeType: vector.scope_type,
-        scopeRef: vector.scope_ref,
+        grantId: vector.grant_id,
         signatureScheme: vector.sign_scheme as SignatureScheme,
         digest: vector.digest_hex,
         ttlSecs: vector.ttl_secs,
@@ -297,14 +295,13 @@ describe('vaultCrypto blind boxes', () => {
 
   it('enforces the daemon vault secret-name syntax before producing AAD', async () => {
     expect(() => standardCreateBlindBoxContext('OPENAI_API_KEY')).not.toThrow();
+    expect(() => standardCreateBlindBoxContext('openAi_key')).not.toThrow();
     expect(() => standardCreateBlindBoxContext(' OPENAI_API_KEY ')).toThrow(/secret name/);
-    expect(() => standardCreateBlindBoxContext('openai_key')).toThrow(/secret name/);
     expect(() => standardCreateBlindBoxContext('1OPENAI_KEY')).toThrow(/secret name/);
     await expect(
-      protectedDekReleaseBlindBoxContext('openai_key', {
+      protectedDekReleaseBlindBoxContext('1OPENAI_KEY', {
         kind: 'agent-deliver',
-        scopeType: 'session',
-        scopeRef: 'sess-1',
+        grantId: 'gr_123',
         ttlSecs: 60,
         approval: { nonce: new Uint8Array(16).fill(1), expiresAtUnix: 1 },
         operationHash: '00'.repeat(32),
@@ -384,8 +381,7 @@ describe('vaultCrypto protected hierarchy', () => {
     }
     const context = await protectedDekReleaseBlindBoxContext('OPENAI_API_KEY', {
       kind: 'agent-deliver',
-      scopeType: agentDeliver.scope_type,
-      scopeRef: agentDeliver.scope_ref,
+      grantId: agentDeliver.grant_id,
       ttlSecs: agentDeliver.ttl_secs,
       approval: approvalFromVector(agentDeliver),
       operationHash: agentDeliver.operation_hash_hex,
@@ -433,8 +429,7 @@ describe('vaultCrypto protected hierarchy', () => {
     await expect(
       protectedDekReleaseBlindBoxContext('OPENAI_API_KEY', {
         kind: 'agent-deliver',
-        scopeType: agentDeliver.scope_type,
-        scopeRef: agentDeliver.scope_ref,
+        grantId: agentDeliver.grant_id,
         ttlSecs: 999,
         approval: approvalFromVector(agentDeliver),
         operationHash: agentDeliver.operation_hash_hex,
@@ -451,8 +446,7 @@ describe('vaultCrypto protected hierarchy', () => {
     ).rejects.toThrow(/operation hash/);
     const signContext = await protectedDekReleaseBlindBoxContext('OPENAI_API_KEY', {
       kind: 'agent-sign',
-      scopeType: agentSign.scope_type,
-      scopeRef: agentSign.scope_ref,
+      grantId: agentSign.grant_id,
       digest: agentSign.digest_hex,
       ttlSecs: agentSign.ttl_secs,
       signatureScheme: agentSign.sign_scheme as SignatureScheme,
@@ -468,8 +462,7 @@ describe('vaultCrypto protected hierarchy', () => {
         blindBoxAad(
           await protectedDekReleaseBlindBoxContext('OPENAI_API_KEY', {
             kind: 'agent-deliver',
-            scopeType: agentDeliver.scope_type,
-            scopeRef: 'other-scope',
+            grantId: 'other-grant',
             ttlSecs: agentDeliver.ttl_secs,
             approval: approvalFromVector(agentDeliver),
             operationHash: agentDeliver.operation_hash_hex,

@@ -1,58 +1,26 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Check, Clock, Copy, Globe, History, Inbox, KeyRound, Link2, Loader2, Plus, Puzzle, RefreshCw, ShieldCheck, Tag, Trash2, Wallet, X } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
+import { Clock, Globe, History, Inbox, KeyRound, Link2, Loader2, Plus, Puzzle, RefreshCw, ShieldCheck, Tag, Trash2, Wallet, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { CapabilityTabs } from './CapabilityTabs';
 import { WorkbenchPageHeader } from './WorkbenchPageHeader';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../ui/dialog';
 import { cn } from '../../lib/utils';
 import { partitionTags } from '../../lib/vaultTags';
-import { useApi, type VaultAuditEvent, type VaultGrant, type VaultRequest, type VaultRequestSpec, type VaultSecret } from '../../context/ApiContext';
+import { useApi, type VaultAuditEvent, type VaultGrant, type VaultRequest, type VaultSecret } from '../../context/ApiContext';
 import { useToast } from '../../context/ToastContext';
-import { VaultApprovalCard, type ApprovalOutcome } from '../ui/vault-approval-card';
-import { VaultSecretForm } from '../ui/vault-secret-form';
+import type { ApprovalOutcome } from '../ui/vault-approval-card';
+import { SigningAddressList } from '../ui/signing-address-list';
+import { VaultApprovalDialog } from '../ui/vault-approval-dialog';
+import { VaultSecretDialog } from '../ui/vault-secret-dialog';
 
-const AddSecretDialog: React.FC<{
-  onClose: () => void;
-  onCreated: (name: string, reason?: 'created' | 'already_exists') => void;
-  request?: VaultRequest | null;
-}> = ({ onClose, onCreated, request }) => {
-  const { t } = useTranslation();
-  const requestCard = (request?.card ?? null) as { default_protection?: unknown; spec?: VaultRequestSpec } | null;
-  const requestSpec = (requestCard?.spec ?? null) as VaultRequestSpec | null;
-  const defaultProtection =
-    requestCard?.default_protection === 'standard' || requestCard?.default_protection === 'protected'
-      ? requestCard.default_protection
-      : undefined;
-  const fixedName = request?.secret_name ?? undefined;
+const PENDING_REQUEST_POLL_INTERVAL_MS = 5000;
+const PENDING_REQUEST_EXPIRY_GRACE_MS = 100;
+const MAX_BROWSER_TIMEOUT_MS = 2_147_483_647;
 
-  return (
-    <Dialog
-      open
-      onOpenChange={(o) => {
-        if (!o) onClose();
-      }}
-    >
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{request ? t('vaults.request.title') : t('vaults.dialog.title')}</DialogTitle>
-        </DialogHeader>
-        <VaultSecretForm
-          fixedName={fixedName}
-          provisionRequestId={request?.id ?? null}
-          requestSpec={requestSpec}
-          defaultProtection={defaultProtection}
-          onCancel={onClose}
-          onCreated={onCreated}
-          treatExistingAsFulfilled={Boolean(request)}
-        />
-      </DialogContent>
-    </Dialog>
-  );
-};
-
+const messageFromError = (err: unknown) => (err instanceof Error ? err.message : String(err));
 /** All allowed proxy-fetch hosts on a secret (for the `proxy · <host> +N` badge). */
 const proxyHosts = (s: VaultSecret): string[] => {
   const hosts = (s.policy as { allowed_hosts?: string[] })?.allowed_hosts;
@@ -63,8 +31,6 @@ const SecretRow: React.FC<{ secret: VaultSecret; onDelete: (name: string) => voi
   const { t } = useTranslation();
   const isKeypair = s.kind === 'keypair';
   const isProtected = s.protection === 'protected';
-  const [copied, setCopied] = useState(false);
-  const publicKey = s.signing_public_key?.public_key;
   // Skills are stored as reserved `skill:<name>` tags; render them as their own chips.
   const { tags, skills } = useMemo(() => partitionTags(s.tags), [s.tags]);
   return (
@@ -112,23 +78,7 @@ const SecretRow: React.FC<{ secret: VaultSecret; onDelete: (name: string) => voi
           {s.description ? `${s.description} · ` : ''}
           {s.last_used_at ? t('vaults.used', { count: s.use_count }) : t('vaults.neverUsed')}
         </span>
-        {isKeypair && publicKey && (
-          <button
-            type="button"
-            onClick={() => {
-              void navigator.clipboard?.writeText(publicKey).then(() => {
-                setCopied(true);
-                window.setTimeout(() => setCopied(false), 1500);
-              });
-            }}
-            className="flex max-w-full items-center gap-1 text-xs text-muted hover:text-foreground"
-            aria-label={t('vaults.dialog.copyPublicKey')}
-            title={publicKey}
-          >
-            <span className="truncate font-mono">{publicKey}</span>
-            {copied ? <Check className="size-3 shrink-0 text-mint" /> : <Copy className="size-3 shrink-0" />}
-          </button>
-        )}
+        {isKeypair && s.signing_addresses ? <SigningAddressList addresses={s.signing_addresses} className="mt-1" /> : null}
       </div>
       <div className="ml-auto">
         <Button variant="ghost" size="icon" onClick={() => onDelete(s.name)} aria-label={t('vaults.delete')}>
@@ -150,6 +100,17 @@ function remaining(expiresAt: string, now: number): { h: number; m: number; s: n
 function isExpired(expiresAt: string, now: number): boolean {
   const end = Date.parse(expiresAt);
   return !Number.isNaN(end) && end <= now;
+}
+
+function earliestRequestExpiry(requests: VaultRequest[]): number | null {
+  let earliest: number | null = null;
+  for (const request of requests) {
+    if (!request.expires_at) continue;
+    const expiresAt = Date.parse(request.expires_at);
+    if (Number.isNaN(expiresAt)) continue;
+    earliest = earliest == null ? expiresAt : Math.min(earliest, expiresAt);
+  }
+  return earliest;
 }
 
 /** Compact mm:ss / h:mm:ss countdown for a grant chip (design.pen `y4rw5Q` shows `12:34`). */
@@ -232,10 +193,12 @@ const GrantChip: React.FC<{ grant: VaultGrant; now: number; onRevoke: (grant: Va
 };
 
 /** A compact pending-request row: who is asking, for what, with a Review action. */
+const requestReviewType = (request: VaultRequest) => (request.card as { request_type?: string } | null)?.request_type ?? request.request_type;
+
 const RequestRow: React.FC<{ request: VaultRequest; onReview: (request: VaultRequest) => void }> = ({ request: r, onReview }) => {
   const { t } = useTranslation();
   const card = (r.card ?? {}) as { request_type?: string; kind?: string; protection?: string; session_id?: string };
-  const type = card.request_type ?? r.request_type;
+  const type = requestReviewType(r);
   const isSign = type === 'sign';
   const isProvision = type === 'provision';
   const isProtected = card.protection === 'protected';
@@ -279,7 +242,11 @@ const RequestRow: React.FC<{ request: VaultRequest; onReview: (request: VaultReq
  * Best-effort — a requests fetch failure (e.g. an older backend without the route) must
  * not surface an error or blank the rest of the hub.
  */
-const PendingRequestsSection: React.FC<{ onResolved: () => void }> = ({ onResolved }) => {
+const PendingRequestsSection: React.FC<{
+  onResolved: () => void;
+  focusRequestId?: string | null;
+  onFocusRequestOpened?: () => void;
+}> = ({ onResolved, focusRequestId, onFocusRequestOpened }) => {
   const { t } = useTranslation();
   const api = useApi();
   const { showToast } = useToast();
@@ -293,21 +260,112 @@ const PendingRequestsSection: React.FC<{ onResolved: () => void }> = ({ onResolv
       // spam global toasts on every 5s poll.
       const res = await api.getVaultRequests({ status: 'pending' }, { handleError: false });
       const pending = (res.requests ?? []).filter((r) => {
-        const type = (r.card as { request_type?: string } | null)?.request_type ?? r.request_type;
+        const type = requestReviewType(r);
         return type === 'access' || type === 'sign' || type === 'provision';
       });
       setRequests(pending);
     } catch {
-      setRequests([]);
+      // Keep the last successful snapshot. A transient poll failure should not
+      // unmount an active approval/provision dialog for a still-pending request.
     }
   }, [api]);
 
-  // Poll so a request an agent raises while the hub is open appears without a manual refresh.
   useEffect(() => {
     load();
-    const id = setInterval(load, 5000);
-    return () => clearInterval(id);
   }, [load]);
+
+  useEffect(() => {
+    return api.connectWorkbenchEvents({
+      onConnected: (data) => {
+        if (data.source === 'controller') {
+          load();
+        }
+      },
+      onEventBridgeStatus: ({ connected }) => {
+        if (connected) load();
+      },
+      onVaultsUpdated: () => load(),
+    });
+  }, [api, load]);
+
+  useEffect(() => {
+    // CLI-created requests can arrive without a browser bridge event, so keep
+    // a light fallback poll even when SSE is connected.
+    let timer: number | undefined;
+    let cancelled = false;
+    let inFlight = false;
+    let pendingWake = false;
+
+    const tick = async () => {
+      if (cancelled) return;
+      if (document.visibilityState !== 'visible') {
+        timer = window.setTimeout(tick, PENDING_REQUEST_POLL_INTERVAL_MS);
+        return;
+      }
+      if (inFlight) {
+        pendingWake = true;
+        return;
+      }
+      inFlight = true;
+      window.clearTimeout(timer);
+      try {
+        await load();
+      } finally {
+        inFlight = false;
+      }
+      if (cancelled) return;
+      if (pendingWake) {
+        pendingWake = false;
+        void tick();
+        return;
+      }
+      timer = window.setTimeout(tick, PENDING_REQUEST_POLL_INTERVAL_MS);
+    };
+
+    const refreshNow = () => {
+      if (document.visibilityState === 'visible') void tick();
+    };
+
+    void tick();
+    document.addEventListener('visibilitychange', refreshNow);
+    window.addEventListener('focus', refreshNow);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', refreshNow);
+      window.removeEventListener('focus', refreshNow);
+    };
+  }, [load]);
+
+  useEffect(() => {
+    const expiresAt = earliestRequestExpiry(requests);
+    if (expiresAt == null) return;
+    const delay = Math.min(
+      Math.max(0, expiresAt - Date.now() + PENDING_REQUEST_EXPIRY_GRACE_MS),
+      MAX_BROWSER_TIMEOUT_MS,
+    );
+    const timer = window.setTimeout(() => {
+      void load();
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [requests, load]);
+
+  const openRequest = useCallback((request: VaultRequest) => {
+    const type = requestReviewType(request);
+    if (type === 'provision') {
+      setProvisioning(request);
+    } else {
+      setReviewing(request);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!focusRequestId) return;
+    const request = requests.find((r) => r.id === focusRequestId);
+    if (!request) return;
+    openRequest(request);
+    onFocusRequestOpened?.();
+  }, [focusRequestId, onFocusRequestOpened, openRequest, requests]);
 
   const handleOutcome = useCallback(
     (outcome: ApprovalOutcome) => {
@@ -328,6 +386,22 @@ const PendingRequestsSection: React.FC<{ onResolved: () => void }> = ({ onResolv
     [reviewing, showToast, t, load, onResolved],
   );
 
+  const denyProvisionRequest = useCallback(
+    async (request: VaultRequest) => {
+      try {
+        await api.denyVaultRequest(request.id);
+        setProvisioning(null);
+        setRequests((prev) => prev.filter((r) => r.id !== request.id));
+        showToast(t('vaults.requests.denied'), 'warning');
+        load();
+        onResolved();
+      } catch (err: unknown) {
+        showToast(messageFromError(err), 'warning');
+      }
+    },
+    [api, showToast, t, load, onResolved],
+  );
+
   if (requests.length === 0) return null;
 
   return (
@@ -342,35 +416,21 @@ const PendingRequestsSection: React.FC<{ onResolved: () => void }> = ({ onResolv
         <RequestRow
           key={r.id}
           request={r}
-          onReview={(request) => {
-            const type = (request.card as { request_type?: string } | null)?.request_type ?? request.request_type;
-            if (type === 'provision') {
-              setProvisioning(request);
-            } else {
-              setReviewing(request);
-            }
-          }}
+          onReview={openRequest}
         />
       ))}
-      <Dialog
-        open={reviewing != null}
-        onOpenChange={(o) => {
-          if (!o) setReviewing(null);
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t('vaults.requests.reviewTitle')}</DialogTitle>
-          </DialogHeader>
-          {reviewing != null ? (
-            <VaultApprovalCard key={reviewing.id} request={reviewing} onResolved={handleOutcome} onCancel={() => setReviewing(null)} />
-          ) : null}
-        </DialogContent>
-      </Dialog>
+      <VaultApprovalDialog request={reviewing} onResolved={handleOutcome} onClose={() => setReviewing(null)} />
       {provisioning != null ? (
-        <AddSecretDialog
+        <VaultSecretDialog
+          open
+          onOpenChange={(o) => {
+            if (!o) setProvisioning(null);
+          }}
           request={provisioning}
-          onClose={() => setProvisioning(null)}
+          onCancel={() => {
+            void denyProvisionRequest(provisioning);
+          }}
+          cancelLabel={t('vaults.approval.deny')}
           onCreated={(name, reason) => {
             setProvisioning(null);
             if (reason !== 'already_exists') {
@@ -405,6 +465,7 @@ export const VaultsPage: React.FC = () => {
   const { t } = useTranslation();
   const api = useApi();
   const { showToast } = useToast();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [secrets, setSecrets] = useState<VaultSecret[]>([]);
   const [grants, setGrants] = useState<VaultGrant[]>([]);
   const [loading, setLoading] = useState(false);
@@ -415,6 +476,19 @@ export const VaultsPage: React.FC = () => {
   const [activeTags, setActiveTags] = useState<string[]>([]);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [now, setNow] = useState(() => Date.now());
+  const [eventBridgeConnected, setEventBridgeConnected] = useState(false);
+  const focusRequestId = searchParams.get('request_id')?.trim() || null;
+
+  const clearFocusedRequest = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete('request_id');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -422,8 +496,8 @@ export const VaultsPage: React.FC = () => {
     try {
       const res = await api.listVaultSecrets();
       setSecrets(res.secrets ?? []);
-    } catch (err: any) {
-      setError(err?.message ?? String(err));
+    } catch (err: unknown) {
+      setError(messageFromError(err));
     } finally {
       setLoading(false);
     }
@@ -441,6 +515,71 @@ export const VaultsPage: React.FC = () => {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    return api.connectWorkbenchEvents({
+      onConnected: (data) => {
+        if (data.source === 'controller') {
+          setEventBridgeConnected(true);
+          refresh();
+        }
+      },
+      onEventBridgeStatus: ({ connected }) => {
+        setEventBridgeConnected(connected);
+        if (connected) refresh();
+      },
+      onError: () => setEventBridgeConnected(false),
+      onVaultsUpdated: () => refresh(),
+    });
+  }, [api, refresh]);
+
+  useEffect(() => {
+    if (eventBridgeConnected) return;
+    let timer: number | undefined;
+    let cancelled = false;
+    let inFlight = false;
+    let pendingWake = false;
+
+    const tick = async () => {
+      if (cancelled) return;
+      if (document.visibilityState !== 'visible') {
+        timer = window.setTimeout(tick, 5000);
+        return;
+      }
+      if (inFlight) {
+        pendingWake = true;
+        return;
+      }
+      inFlight = true;
+      window.clearTimeout(timer);
+      try {
+        await refresh();
+      } finally {
+        inFlight = false;
+      }
+      if (cancelled) return;
+      if (pendingWake) {
+        pendingWake = false;
+        void tick();
+        return;
+      }
+      timer = window.setTimeout(tick, 5000);
+    };
+
+    const refreshNow = () => {
+      if (document.visibilityState === 'visible') void tick();
+    };
+
+    void tick();
+    document.addEventListener('visibilitychange', refreshNow);
+    window.addEventListener('focus', refreshNow);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', refreshNow);
+      window.removeEventListener('focus', refreshNow);
+    };
+  }, [eventBridgeConnected, refresh]);
 
   // Tick once a second while there are live grants: advance the countdown and
   // drop any grant that has reached its expiry. The backend's status=active
@@ -494,8 +633,8 @@ export const VaultsPage: React.FC = () => {
       try {
         const res = await api.getVaultAudit({ limit: 50 });
         setAudit(res.events ?? []);
-      } catch (err: any) {
-        setError(err?.message ?? String(err));
+      } catch (err: unknown) {
+        setError(messageFromError(err));
       }
     }
   }, [api, showAudit]);
@@ -506,8 +645,8 @@ export const VaultsPage: React.FC = () => {
       await api.deleteVaultSecret(name);
       showToast(t('vaults.deleted', { name }), 'success');
       refresh();
-    } catch (err: any) {
-      setError(err?.message ?? String(err));
+    } catch (err: unknown) {
+      setError(messageFromError(err));
     }
   };
 
@@ -520,8 +659,8 @@ export const VaultsPage: React.FC = () => {
       await api.revokeVaultGrant(g.id);
       showToast(t('vaults.grants.revoked', { target: label }), 'success');
       refresh();
-    } catch (err: any) {
-      setError(err?.message ?? String(err));
+    } catch (err: unknown) {
+      setError(messageFromError(err));
     }
   };
 
@@ -550,7 +689,7 @@ export const VaultsPage: React.FC = () => {
       {error && (
         <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>
       )}
-      <PendingRequestsSection onResolved={refresh} />
+      <PendingRequestsSection onResolved={refresh} focusRequestId={focusRequestId} onFocusRequestOpened={clearFocusedRequest} />
       {grants.length > 0 && (
         <div className="flex flex-col gap-2">
           <div className="flex items-center gap-2 px-1">
@@ -632,17 +771,18 @@ export const VaultsPage: React.FC = () => {
           )}
         </div>
       )}
-      {adding && (
-        <AddSecretDialog
-          onClose={() => setAdding(false)}
-          onCreated={(name, reason) => {
-            if (reason === 'already_exists') return;
-            setAdding(false);
-            showToast(t('vaults.created', { name }), 'success');
-            refresh();
-          }}
-        />
-      )}
+      <VaultSecretDialog
+        open={adding}
+        onOpenChange={(o) => {
+          if (!o) setAdding(false);
+        }}
+        onCreated={(name, reason) => {
+          if (reason === 'already_exists') return;
+          setAdding(false);
+          showToast(t('vaults.created', { name }), 'success');
+          refresh();
+        }}
+      />
     </div>
   );
 };
