@@ -69,7 +69,6 @@ def _stub_lark_client(bot: FeishuBot) -> types.SimpleNamespace:
         acreate=AsyncMock(return_value=_FakeResponse()),
         apatch=AsyncMock(return_value=_FakeResponse()),
         areply=AsyncMock(return_value=_FakeResponse()),
-        adelete=AsyncMock(return_value=_FakeResponse()),
     )
     client = types.SimpleNamespace(im=types.SimpleNamespace(v1=types.SimpleNamespace(message=message)))
     bot._lark_client = client
@@ -199,23 +198,6 @@ class SendEditForwardsSubtextTests(unittest.IsolatedAsyncioTestCase):
         _assert_is_footer(self, content["body"]["elements"][-1], "✅ done · 248k tok")
 
 
-    async def test_delete_message_calls_adelete(self):
-        bot = _make_bot()
-        message = _stub_lark_client(bot)
-        ctx = MessageContext(user_id="U1", channel_id="oc_chat", platform="lark")
-        ok = await bot.delete_message(ctx, "om_del")
-        self.assertTrue(ok)
-        self.assertEqual(message.adelete.await_args.args[0].message_id, "om_del")
-
-    async def test_delete_message_returns_false_on_api_failure(self):
-        bot = _make_bot()
-        message = _stub_lark_client(bot)
-        message.adelete.return_value = _FakeResponse()
-        message.adelete.return_value.success = lambda: False  # type: ignore[assignment]
-        ctx = MessageContext(user_id="U1", channel_id="oc_chat", platform="lark")
-        # Falsey response → dispatcher falls back to collapsing the bubble.
-        self.assertFalse(await bot.delete_message(ctx, "om_del"))
-
 
 class LarkCapabilityTests(unittest.TestCase):
     def test_lark_advertises_status_bubble(self):
@@ -223,12 +205,13 @@ class LarkCapabilityTests(unittest.TestCase):
 
         self.assertTrue(get_platform_descriptor("lark").capabilities.supports_status_bubble)
 
-    def test_lark_advertises_deletion(self):
-        # Feishu can recall its own messages, so the concise bubble is deleted at
-        # turn end (single-message finalize, matching Slack/Discord).
+    def test_lark_does_not_advertise_deletion(self):
+        # Feishu message recall leaves a visible "此消息已撤回" tombstone, so we do
+        # NOT delete the bubble; the dispatcher collapses it to a terminal marker
+        # instead (keeps the pushing result message, no tombstone).
         from config.platform_registry import get_platform_descriptor
 
-        self.assertTrue(get_platform_descriptor("lark").capabilities.supports_message_deletion)
+        self.assertFalse(get_platform_descriptor("lark").capabilities.supports_message_deletion)
 
 
 if __name__ == "__main__":

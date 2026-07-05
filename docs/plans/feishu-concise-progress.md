@@ -112,21 +112,30 @@ Footer text is composed in core (`_compose_status_message`) from existing
 i18n-safe pieces; no new user-facing strings in the Feishu adapter. Verify the
 `note` content carries no hardcoded English added in the adapter.
 
-## Single-message finalize (implemented)
+## Turn-end: collapse, do NOT recall (keeps push, no tombstone)
 
-Feishu can recall its own messages (`im.v1.message.delete`, verified live), so
-this closes the "two persistent messages" gap:
+Feishu message *recall* (`im.v1.message.delete`) works, but it leaves a visible
+"此消息已撤回" tombstone in the thread — worse than the bubble it removes. And a
+card *edit* fires no push, while the result must push. So on Feishu:
 
-- lark declares `supports_message_deletion=True`.
-- `FeishuBot.delete_message` overrides the base no-op to call `adelete`.
-- At turn end `_retire_status_bubble` (`message_dispatcher.py:891-911`) deletes
-  the status bubble; only the fresh final-answer message remains, and being a
-  new message it fires a push notification — matching Slack/Discord.
-- `delete_message` returns `False` on any failure, so the dispatcher falls back
-  to collapsing the bubble to a terminal marker (never left as "running").
+- lark does NOT declare `supports_message_deletion` (recall would tombstone).
+- The result is delivered as a fresh, **pushing** message (unchanged).
+- `_retire_status_bubble` (`message_dispatcher.py:891-911`) falls through to
+  `_collapse_status_bubble`, which EDITS the bubble in place to a terminal
+  marker (no recall → no tombstone).
+- The collapsed marker always shows the run time: `✅ done · 1:30 · 240k tok`
+  (`_status_footer_text(..., force_duration=True)`), independent of the
+  `show_duration` config, because the residual bubble IS the turn's run summary.
+  The result-message footer keeps `show_duration` gating so it doesn't
+  double-surface the duration.
+
+Net turn-end state on Feishu: a small grey `✅ done · <time> · <tok>` marker
+(the former bubble, edited in place) + the pushing answer message. No tombstone.
 
 ## Out of scope / follow-up
 
+- True single-message finalize (bubble edited into the full answer) would drop
+  the residual marker but also the final push; deferred since push is wanted.
 - Per-channel progress style override (core already notes it can layer later).
 
 ## Risks / breakage surface
