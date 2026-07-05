@@ -473,8 +473,13 @@ class FeishuBot(BaseIMClient):
         """
         elements: list = [{"tag": "markdown", "content": text}]
         if buttons:
+            # Full-width ``fill`` only when the whole keyboard is a lone button.
+            # A single-button row that is merely the remainder of a chunked
+            # layout (e.g. 4 buttons -> 3 + 1) must stay in the flow column_set,
+            # otherwise it renders full width and clashes with the row above it.
+            single_button_card = len(buttons) == 1 and len(buttons[0]) == 1
             for row in buttons:
-                if len(row) == 1:
+                if len(row) == 1 and single_button_card:
                     btn = row[0]
                     behaviors_value: dict = {"key": btn["callback_data"]}
                     if btn.get("thread_id"):
