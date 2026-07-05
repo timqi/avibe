@@ -199,6 +199,56 @@ class SendEditForwardsSubtextTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+class KeyboardRemovalFooterTests(unittest.IsolatedAsyncioTestCase):
+    """Removing quick-reply buttons must keep the concise footer (P2 fix)."""
+
+    async def test_remove_inline_keyboard_reapplies_cached_footer(self):
+        bot = _make_bot()
+        _stub_lark_client(bot)
+        ctx = MessageContext(user_id="U1", channel_id="oc_chat", platform="lark")
+        kb = InlineKeyboard(buttons=[[InlineButton(text="Continue", callback_data="c")]])
+        mid = await bot.send_message_with_buttons(ctx, "Final answer", kb, subtext="✅ done · 1:30 · 240k tok")
+        # The footer was cached alongside the body at send time.
+        self.assertEqual(bot._message_footer_cache.get(mid), "✅ done · 1:30 · 240k tok")
+
+        bot.edit_message = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        ok = await bot.remove_inline_keyboard(ctx, mid)
+        self.assertTrue(ok)
+        _, kwargs = bot.edit_message.await_args
+        self.assertEqual(kwargs["text"], "Final answer")
+        self.assertIsNone(kwargs["keyboard"])
+        # Footer re-applied, not dropped.
+        self.assertEqual(kwargs["subtext"], "✅ done · 1:30 · 240k tok")
+
+    async def test_remove_inline_keyboard_recovers_footer_from_card_on_cache_miss(self):
+        # Restart / cache miss: the footer is recovered from the live card and
+        # kept OUT of the body (font wrapper stripped), not folded into it.
+        bot = _make_bot()
+        _stub_lark_client(bot)
+        ctx = MessageContext(user_id="U1", channel_id="oc_chat", platform="lark")
+        card = json.loads(
+            bot._build_card_json("Final answer", [[{"text": "OK", "callback_data": "ok"}]], subtext="✅ done · 5s")
+        )
+        bot._fetch_message_card_content = AsyncMock(return_value=card)  # type: ignore[method-assign]
+        bot.edit_message = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        ok = await bot.remove_inline_keyboard(ctx, "om_uncached")
+        self.assertTrue(ok)
+        _, kwargs = bot.edit_message.await_args
+        self.assertEqual(kwargs["text"], "Final answer")  # footer NOT folded into body
+        self.assertEqual(kwargs["subtext"], "✅ done · 5s")  # font wrapper stripped
+
+    def test_extract_splits_body_and_footer(self):
+        bot = _make_bot()
+        card = json.loads(bot._build_card_json("Body text", subtext="✅ done · 5s"))
+        body, footer = bot._extract_text_from_card_content(card)
+        self.assertEqual(body, "Body text")
+        self.assertEqual(footer, "✅ done · 5s")
+
+    def test_strip_grey_font_unwraps_only_when_wrapped(self):
+        self.assertEqual(FeishuBot._strip_grey_font("<font color='grey'>x</font>"), "x")
+        self.assertEqual(FeishuBot._strip_grey_font("plain"), "plain")
+
+
 class LarkCapabilityTests(unittest.TestCase):
     def test_lark_advertises_status_bubble(self):
         from config.platform_registry import get_platform_descriptor

@@ -121,6 +121,10 @@ class FeishuBot(BaseIMClient):
         self._user_info_cache: Dict[str, Dict[str, Any]] = {}
         self._dm_chat_ids: set = set()
         self._message_text_cache: Dict[str, str] = {}
+        # Concise-status footer (subtext) per message, so removing quick-reply
+        # buttons can rebuild the card WITHOUT dropping the ✅ done · time · tok
+        # footer. Parallel to the body cache above.
+        self._message_footer_cache: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle / injection
@@ -607,7 +611,7 @@ class FeishuBot(BaseIMClient):
         root_id = context.thread_id
         if root_id:
             message_id = await self._reply_message_with_card(root_id, card_json)
-            self._remember_message_text(message_id, text)
+            self._remember_message_text(message_id, text, subtext=subtext)
             if self.settings_manager:
                 if self.sessions:
                     self.sessions.mark_thread_active(context.user_id, context.channel_id, root_id)
@@ -636,7 +640,7 @@ class FeishuBot(BaseIMClient):
             raise RuntimeError(f"Feishu send card failed: {response.msg}")
 
         message_id = response.data.message_id
-        self._remember_message_text(message_id, text)
+        self._remember_message_text(message_id, text, subtext=subtext)
         if self.settings_manager and context.thread_id:
             if self.sessions:
                 self.sessions.mark_thread_active(context.user_id, context.channel_id, context.thread_id)
@@ -726,19 +730,30 @@ class FeishuBot(BaseIMClient):
                 )
                 return False
             if text is not None:
-                self._remember_message_text(message_id, text)
+                self._remember_message_text(message_id, text, subtext=subtext)
             return True
         except Exception as exc:
             logger.error("Error editing Feishu message %s: %s", message_id, exc)
             return False
 
-    def _remember_message_text(self, message_id: Optional[str], text: Optional[str]) -> None:
+    def _remember_message_text(
+        self, message_id: Optional[str], text: Optional[str], subtext: Optional[str] = None
+    ) -> None:
         if not message_id or text is None:
             return
         self._message_text_cache[message_id] = text
         while len(self._message_text_cache) > 200:
             oldest_key = next(iter(self._message_text_cache))
             self._message_text_cache.pop(oldest_key, None)
+        # Track the footer so a later button-removal edit can re-apply it. A
+        # truthy subtext sets it; an explicit empty subtext clears it (the footer
+        # was removed); ``None`` leaves any known footer untouched.
+        if subtext:
+            self._message_footer_cache[message_id] = subtext
+            while len(self._message_footer_cache) > 200:
+                self._message_footer_cache.pop(next(iter(self._message_footer_cache)), None)
+        elif subtext is not None:
+            self._message_footer_cache.pop(message_id, None)
 
     async def _fetch_message_card_content(self, message_id: str) -> Optional[Dict[str, Any]]:
         """Fetch and parse card content JSON for an existing message."""
@@ -780,9 +795,18 @@ class FeishuBot(BaseIMClient):
             return None
 
     @staticmethod
-    def _extract_text_from_card_content(card_content: Dict[str, Any]) -> Optional[str]:
-        """Extract human-visible text from card content for button removal."""
+    def _extract_text_from_card_content(
+        card_content: Dict[str, Any],
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Extract ``(body, footer)`` from card content for button removal.
+
+        The concise status footer is a notation-sized grey markdown element (see
+        ``_build_card_json``); it must NOT be folded into the body, or removing
+        quick-reply buttons would duplicate/mangle it. It is captured separately
+        (with the ``<font color='grey'>`` wrapper stripped, since ``edit_message``
+        re-wraps the subtext) so the caller can re-apply it as ``subtext``."""
         collected_texts: list[str] = []
+        footer_texts: list[str] = []
 
         def _collect(node: Any) -> None:
             if isinstance(node, list):
@@ -800,7 +824,12 @@ class FeishuBot(BaseIMClient):
             if tag == "markdown":
                 markdown_content = node.get("content")
                 if isinstance(markdown_content, str) and markdown_content.strip():
-                    collected_texts.append(markdown_content)
+                    # A notation-sized markdown element is the concise footer;
+                    # keep it out of the body and unwrap the grey font tag.
+                    if node.get("text_size") == "notation":
+                        footer_texts.append(FeishuBot._strip_grey_font(markdown_content))
+                    else:
+                        collected_texts.append(markdown_content)
 
             text_obj = node.get("text")
             if isinstance(text_obj, dict):
@@ -821,10 +850,19 @@ class FeishuBot(BaseIMClient):
 
         _collect(card_content)
 
-        if not collected_texts:
-            return None
+        body = "\n\n".join(collected_texts) if collected_texts else None
+        footer = " ".join(f for f in footer_texts if f) or None
+        return body, footer
 
-        return "\n\n".join(collected_texts)
+    @staticmethod
+    def _strip_grey_font(content: str) -> str:
+        """Unwrap a ``<font color='grey'>…</font>`` footer back to its raw text."""
+        s = content.strip()
+        prefix = "<font color='grey'>"
+        suffix = "</font>"
+        if s.startswith(prefix) and s.endswith(suffix):
+            return s[len(prefix) : -len(suffix)]
+        return s
 
     async def remove_inline_keyboard(
         self,
@@ -840,6 +878,9 @@ class FeishuBot(BaseIMClient):
         card text before updating the card without buttons.
         """
         display_text = text
+        # Preserve the concise footer (✅ done · time · tok) so removing the
+        # quick-reply buttons doesn't strip it from the result message.
+        footer = self._message_footer_cache.get(message_id)
         if display_text is None:
             display_text = self._message_text_cache.get(message_id)
         if display_text is None:
@@ -847,12 +888,16 @@ class FeishuBot(BaseIMClient):
             if card_content is None:
                 logger.debug("Skip Feishu keyboard removal: unable to fetch card content for %s", message_id)
                 return False
-            display_text = self._extract_text_from_card_content(card_content)
+            display_text, extracted_footer = self._extract_text_from_card_content(card_content)
             if display_text is None:
                 logger.debug("Skip Feishu keyboard removal: unable to extract card text for %s", message_id)
                 return False
+            if footer is None:
+                footer = extracted_footer
 
-        return await self.edit_message(context, message_id, text=display_text, keyboard=None, parse_mode=parse_mode)
+        return await self.edit_message(
+            context, message_id, text=display_text, keyboard=None, subtext=footer, parse_mode=parse_mode
+        )
 
     # ------------------------------------------------------------------
     # Callbacks
