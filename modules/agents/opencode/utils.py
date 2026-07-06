@@ -442,6 +442,8 @@ def build_reasoning_effort_options(
 _CODEX_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
 _CLAUDE_REASONING_EFFORTS = ["low", "medium", "high"]
 _CLAUDE_1M_CONTEXT_LABEL = "[1M]"
+_CLAUDE_OPUS_ALIASES = {"opus", "opus[1m]"}
+_CLAUDE_SONNET_ALIASES = {"sonnet", "sonnet[1m]"}
 
 
 def _supports_claude_xhigh_reasoning(target_model: Optional[str]) -> bool:
@@ -449,9 +451,11 @@ def _supports_claude_xhigh_reasoning(target_model: Optional[str]) -> bool:
     if not normalized_model:
         return False
     return (
-        normalized_model in {"opus", "opus[1m]"}
+        normalized_model in _CLAUDE_OPUS_ALIASES
+        or normalized_model in _CLAUDE_SONNET_ALIASES
         or normalized_model.startswith("claude-opus-4-7")
         or normalized_model.startswith("claude-opus-4-8")
+        or normalized_model.startswith("claude-sonnet-5")
         or normalized_model.startswith("claude-fable-5")
     )
 
@@ -461,10 +465,12 @@ def _supports_claude_max_reasoning(target_model: Optional[str]) -> bool:
     if not normalized_model:
         return False
     return (
-        normalized_model in {"opus", "opus[1m]"}
+        normalized_model in _CLAUDE_OPUS_ALIASES
+        or normalized_model in _CLAUDE_SONNET_ALIASES
         or normalized_model.startswith("claude-opus-4-6")
         or normalized_model.startswith("claude-opus-4-7")
         or normalized_model.startswith("claude-opus-4-8")
+        or normalized_model.startswith("claude-sonnet-5")
         or normalized_model.startswith("claude-sonnet-4-6")
         or normalized_model.startswith("claude-fable-5")
     )
@@ -475,10 +481,12 @@ def supports_claude_1m_context(target_model: Optional[str]) -> bool:
     if not normalized_model:
         return False
     return (
-        normalized_model in {"opus", "opus[1m]", "sonnet", "sonnet[1m]"}
+        normalized_model in _CLAUDE_OPUS_ALIASES
+        or normalized_model in _CLAUDE_SONNET_ALIASES
         or normalized_model.startswith("claude-opus-4-6")
         or normalized_model.startswith("claude-opus-4-7")
         or normalized_model.startswith("claude-opus-4-8")
+        or normalized_model.startswith("claude-sonnet-5")
         or normalized_model.startswith("claude-sonnet-4-6")
         or normalized_model.startswith("claude-fable-5")
     )
@@ -515,8 +523,8 @@ def build_claude_reasoning_options(target_model: Optional[str]) -> List[Dict[str
     """Return the canonical Claude reasoning-effort option list for a model.
 
     Claude currently supports `low` / `medium` / `high` broadly. Newer
-    Opus 4.7 and 4.8 models add `xhigh`; Opus 4.8, 4.7, 4.6, and
-    Sonnet 4.6 also support `max`.
+    Opus 4.7, Opus 4.8, and Sonnet 5 models add `xhigh`; Opus 4.8,
+    4.7, 4.6, Sonnet 5, and Sonnet 4.6 also support `max`.
     """
 
     efforts = list(_CLAUDE_REASONING_EFFORTS)
