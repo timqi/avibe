@@ -118,6 +118,68 @@ class ReplyEnhancerPlatformTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("file:///Users/test/.codex/generated_images/thread-id/image-file.png", prompt)
         self.assertIn("Never emit variables, placeholder paths, or sandbox paths like `/mnt/data/...`", prompt)
 
+    def test_prompt_includes_vault_guidance(self):
+        with patch.object(paths, "get_user_preferences_path", return_value=Path("/tmp/user_preferences.md")):
+            prompt = build_system_prompt_injection(include_quick_replies=False)
+
+        self.assertIn("## Vault", prompt)
+        self.assertIn("prefer Avibe Vault: agents reference secrets by name, tag, or skill tag", prompt)
+        self.assertIn("Static secret: a regular secret value", prompt)
+        self.assertIn("Keypair secret: a signing key", prompt)
+        self.assertIn("Because protected secrets are end-to-end encrypted", prompt)
+        self.assertNotIn("irreversible operations", prompt)
+        self.assertIn("never run commands that may print env vars", prompt)
+        self.assertNotIn("With `vibe vault fetch` and `vibe vault sign`, the agent does not receive", prompt)
+        self.assertIn("Avibe automatically asks the user to decrypt and authorize access", prompt)
+        self.assertIn("it does not replay the command for you", prompt)
+        self.assertIn("run the same `run` / `fetch` command again", prompt)
+        self.assertIn("Avibe creates a browser signing request and returns immediately", prompt)
+        self.assertIn("Do not rerun `sign`", prompt)
+        self.assertIn("follow the callback instruction to read the completed request result", prompt)
+        self.assertIn("vibe vault request OPENAI_API_KEY", prompt)
+        self.assertIn("Request that the user add a missing static secret.", prompt)
+        self.assertIn("ask the user to create a keypair secret in the Vault UI", prompt)
+        self.assertIn("do not request or store private-key material as a static secret", prompt)
+        self.assertNotIn("$<OPENAI_API_KEY>", prompt)
+        self.assertNotIn("clickable placeholder", prompt)
+        self.assertIn("vibe vault find --kind static --protection protected", prompt)
+        self.assertIn("vibe vault find openai --tag prod", prompt)
+        self.assertIn("vibe vault tags", prompt)
+        self.assertNotIn("vibe vault discover", prompt)
+        self.assertIn("vibe vault run --env OPENAI_API_KEY,GITHUB_TOKEN", prompt)
+        self.assertIn("vibe vault run --tag deploy", prompt)
+        self.assertIn("vibe vault fetch --auth GITHUB_PAT", prompt)
+        self.assertIn("vibe vault access PROD_DB_URL", prompt)
+        self.assertIn("Request approval before a protected `run`", prompt)
+        self.assertIn("For protected `fetch`, run `vibe vault fetch`", prompt)
+        self.assertIn("vibe vault sign WALLET_KEY", prompt)
+        self.assertNotIn("vibe vault await <request_id>", prompt)
+        self.assertNotIn("vibe vault sign WALLET_KEY --skill", prompt)
+        self.assertNotIn("vibe vault sign WALLET_KEY --tag", prompt)
+
+    def test_prompt_includes_vault_web_placeholder_only_for_web_chat(self):
+        web_context = MessageContext(
+            user_id="U1",
+            channel_id="C1",
+            platform="avibe",
+            platform_specific={"agent_session_id": "sesk8m4q2p7x"},
+        )
+        slack_context = MessageContext(
+            user_id="U1",
+            channel_id="C1",
+            platform="slack",
+            platform_specific={"agent_session_id": "sesk8m4q2p7x"},
+        )
+
+        with patch.object(paths, "get_user_preferences_path", return_value=Path("/tmp/user_preferences.md")):
+            web_prompt = build_system_prompt_injection(include_quick_replies=False, context=web_context)
+            slack_prompt = build_system_prompt_injection(include_quick_replies=False, context=slack_context)
+
+        self.assertIn("$<OPENAI_API_KEY>", web_prompt)
+        self.assertIn("clickable placeholder in your reply", web_prompt)
+        self.assertNotIn("$<OPENAI_API_KEY>", slack_prompt)
+        self.assertNotIn("clickable placeholder in your reply", slack_prompt)
+
     def test_prompt_can_exclude_show_pages(self):
         context = MessageContext(
             user_id="U1",
