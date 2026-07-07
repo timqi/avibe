@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useReducer, useState } from 'react';
 
-import { useApi } from '@/context/ApiContext';
+import {
+  useApi,
+  type ApiContextType,
+  type VaultDeleteAuthz,
+  type VaultDeleteChallengeResult,
+  type VaultWebAuthnRegistrationPayload,
+  type VaultWebAuthnSerializedCredential,
+} from '@/context/ApiContext';
 import {
   base64ToBytes,
   buildWrapMeta,
@@ -48,10 +55,16 @@ export type ProtectedUnlockMaterial = {
  */
 export type ProtectedVaultStatus = 'checking' | 'needs-setup' | 'locked' | 'unlocked' | 'error';
 
-const sessionVault: { vmk: Uint8Array | null; wrapMeta: string | null; freshSetup: boolean } = {
+const sessionVault: {
+  vmk: Uint8Array | null;
+  wrapMeta: string | null;
+  freshSetup: boolean;
+  authzFactorRegistration: VaultWebAuthnRegistrationPayload | null;
+} = {
   vmk: null,
   wrapMeta: null,
   freshSetup: false,
+  authzFactorRegistration: null,
 };
 
 /**
@@ -166,6 +179,7 @@ function clearVmk(): void {
     // expiry in vaultUnlocked() — leaves a consistent state.
     sessionVault.wrapMeta = null;
     sessionVault.freshSetup = false;
+    sessionVault.authzFactorRegistration = null;
   }
 }
 
@@ -215,6 +229,10 @@ function randomChallenge(): ArrayBuffer {
   return bufferSource(crypto.getRandomValues(new Uint8Array(32)));
 }
 
+function bufferSourceFromBase64(value: string): ArrayBuffer {
+  return bufferSource(base64ToBytes(value));
+}
+
 /** Strip a stored record's DEK fields back to the bare VMK wrap_meta ({v, copies, scheme?}). */
 function baseVmkWrapMeta(wrapMeta: string): string {
   const parsed = JSON.parse(wrapMeta) as Record<string, unknown>;
@@ -258,17 +276,33 @@ function singlePasskeyEntry(entries: PasskeyEntry[]): PasskeyEntry {
   return entries[0];
 }
 
-export function passkeyCreationOptions(rpId: string): PublicKeyCredentialCreationOptions {
+export function passkeyCreationOptions(
+  rpId: string,
+  challenge: ArrayBuffer | ArrayBufferView | ArrayLike<number> = randomChallenge(),
+): PublicKeyCredentialCreationOptions {
   return {
     rp: { name: WEBAUTHN_RP_NAME, id: rpId },
     user: { id: bufferSource(WEBAUTHN_USER_HANDLE), name: 'avibe-vault', displayName: WEBAUTHN_RP_NAME },
-    challenge: randomChallenge(),
+    challenge: bufferSource(toUint8(challenge)),
     pubKeyCredParams: [
       { type: 'public-key', alg: -7 },
       { type: 'public-key', alg: -257 },
     ],
     authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
     extensions: { prf: {} } as AuthenticationExtensionsClientInputs,
+  };
+}
+
+function passkeyCreationOptionsFromServer(
+  webauthn: Awaited<ReturnType<ApiContextType['createVaultAuthzWebAuthnOptions']>>['webauthn'],
+): PublicKeyCredentialCreationOptions {
+  return {
+    rp: webauthn.rp,
+    user: { ...webauthn.user, id: bufferSourceFromBase64(webauthn.user.id) },
+    challenge: bufferSourceFromBase64(webauthn.challenge),
+    pubKeyCredParams: webauthn.pubKeyCredParams,
+    authenticatorSelection: webauthn.authenticatorSelection,
+    extensions: webauthn.extensions,
   };
 }
 
@@ -291,6 +325,55 @@ export function passkeyPrfAssertionOptions(entries: PasskeyEntry[], rpId: string
   return options;
 }
 
+export function passkeyAssertionOptionsFromServer(
+  webauthn: VaultDeleteChallengeResult['webauthn'],
+): PublicKeyCredentialRequestOptions {
+  return {
+    challenge: bufferSourceFromBase64(webauthn.challenge),
+    rpId: webauthn.rpId,
+    userVerification: webauthn.userVerification,
+    allowCredentials: webauthn.allowCredentials.map((entry) => ({
+      type: 'public-key' as const,
+      id: bufferSourceFromBase64(entry.id),
+      ...(entry.transports ? { transports: entry.transports } : {}),
+    })),
+  };
+}
+
+function serializeCredentialBase(credential: PublicKeyCredential): Pick<VaultWebAuthnSerializedCredential, 'id' | 'rawId' | 'type'> {
+  return {
+    id: credential.id,
+    rawId: bytesToBase64(toUint8(credential.rawId)),
+    type: credential.type,
+  };
+}
+
+export function serializeAttestationCredential(credential: PublicKeyCredential): VaultWebAuthnSerializedCredential {
+  const response = credential.response as AuthenticatorAttestationResponse;
+  const transports = typeof response.getTransports === 'function' ? response.getTransports() : [];
+  return {
+    ...serializeCredentialBase(credential),
+    response: {
+      clientDataJSON: bytesToBase64(toUint8(response.clientDataJSON)),
+      attestationObject: bytesToBase64(toUint8(response.attestationObject)),
+      transports,
+    },
+  };
+}
+
+export function serializeAssertionCredential(credential: PublicKeyCredential): VaultWebAuthnSerializedCredential {
+  const response = credential.response as AuthenticatorAssertionResponse;
+  return {
+    ...serializeCredentialBase(credential),
+    response: {
+      clientDataJSON: bytesToBase64(toUint8(response.clientDataJSON)),
+      authenticatorData: bytesToBase64(toUint8(response.authenticatorData)),
+      signature: bytesToBase64(toUint8(response.signature)),
+      userHandle: response.userHandle ? bytesToBase64(toUint8(response.userHandle)) : null,
+    },
+  };
+}
+
 /**
  * Assert the vault passkey and extract its PRF output. Keep the assertion on the
  * simple `prf.eval` path: iOS 1Password currently fails on `evalByCredential`,
@@ -308,14 +391,26 @@ async function assertPasskeyPrf(entries: PasskeyEntry[]): Promise<{ prfOutput: U
 }
 
 /** Create a resident passkey, then assert it once to extract the PRF output. */
-async function setupPasskeyFactor(prfSalt: Uint8Array): Promise<{ prfOutput: Uint8Array; credentialId: string }> {
+async function setupPasskeyFactor(
+  api: ApiContextType,
+  prfSalt: Uint8Array,
+): Promise<{ prfOutput: Uint8Array; credentialId: string; registration: VaultWebAuthnRegistrationPayload }> {
+  const options = await api.createVaultAuthzWebAuthnOptions();
+  if (!options?.ok) throw new Error(options?.code || 'passkey-registration-options-failed');
   const created = (await navigator.credentials.create({
-    publicKey: passkeyCreationOptions(window.location.hostname),
+    publicKey: passkeyCreationOptionsFromServer(options.webauthn),
   })) as PublicKeyCredential | null;
   if (!created) throw new Error('passkey-cancelled');
   const credentialId = bytesToBase64(toUint8(created.rawId));
   const { prfOutput } = await assertPasskeyPrf([{ credentialId, prfSalt }]);
-  return { prfOutput, credentialId };
+  return {
+    prfOutput,
+    credentialId,
+    registration: {
+      challenge_id: options.challenge_id,
+      credential: serializeAttestationCredential(created),
+    },
+  };
 }
 
 export function useProtectedVault() {
@@ -366,11 +461,17 @@ export function useProtectedVault() {
     }
   }, [api]);
 
-  const commit = (vmk: Uint8Array, wrapMeta: string, freshSetup: boolean) => {
+  const commit = (
+    vmk: Uint8Array,
+    wrapMeta: string,
+    freshSetup: boolean,
+    authzFactorRegistration: VaultWebAuthnRegistrationPayload | null = null,
+  ) => {
     sessionVault.vmk?.fill(0);
     sessionVault.vmk = vmk;
     sessionVault.wrapMeta = wrapMeta;
     sessionVault.freshSetup = freshSetup;
+    sessionVault.authzFactorRegistration = authzFactorRegistration;
     armVaultAutoLock();
     setStatus('unlocked');
     setError(null);
@@ -380,11 +481,11 @@ export function useProtectedVault() {
   // UI requires an explicit acknowledgement before calling this.
   const setupPasskey = useCallback(async () => {
     const prfSalt = newPasskeyPrfSalt();
-    const { prfOutput, credentialId } = await setupPasskeyFactor(prfSalt);
+    const { prfOutput, credentialId, registration } = await setupPasskeyFactor(api, prfSalt);
     const vmk = newVmk();
     const wrapMeta = await buildWrapMeta(vmk, [{ kind: 'passkey', prfOutput, prfSalt, credentialId }]);
-    commit(vmk, withRpId(wrapMeta, window.location.hostname), true);
-  }, []);
+    commit(vmk, withRpId(wrapMeta, window.location.hostname), true, registration);
+  }, [api]);
 
   const unlockPasskey = useCallback(async () => {
     const wrapMeta = sessionVault.wrapMeta;
@@ -401,7 +502,14 @@ export function useProtectedVault() {
    * signing keys seal the key material itself, not a UTF-8 string.
    */
   const sealValue = useCallback(
-    async (name: string, value: Uint8Array | string): Promise<{ envelope: ProtectedRecordEnvelope; establishingVmk: boolean }> => {
+    async (
+      name: string,
+      value: Uint8Array | string,
+    ): Promise<{
+      envelope: ProtectedRecordEnvelope;
+      establishingVmk: boolean;
+      authzFactorRegistration?: VaultWebAuthnRegistrationPayload;
+    }> => {
       if (!enforceAutoLock()) throw new Error('vault-locked');
       const { vmk, wrapMeta, freshSetup } = sessionVault;
       if (!vmk || !wrapMeta) throw new Error('vault-locked');
@@ -411,7 +519,11 @@ export function useProtectedVault() {
       // `establishingVmk` lets the create transaction enforce the atomic single-init
       // guard server-side (a UI re-check here can't be race-free); the daemon rejects a
       // second VMK so concurrent first-time setups can't split the key history.
-      return { envelope: packProtectedRecord(sealed, wrapMeta), establishingVmk: freshSetup };
+      return {
+        envelope: packProtectedRecord(sealed, wrapMeta),
+        establishingVmk: freshSetup,
+        authzFactorRegistration: freshSetup ? (sessionVault.authzFactorRegistration ?? undefined) : undefined,
+      };
     },
     [],
   );
@@ -419,6 +531,7 @@ export function useProtectedVault() {
   const afterCreated = useCallback(() => {
     // The vault now exists server-side; subsequent creates this session aren't "establishing".
     sessionVault.freshSetup = false;
+    sessionVault.authzFactorRegistration = null;
   }, []);
 
   /**
@@ -461,6 +574,29 @@ export function useProtectedVault() {
     [],
   );
 
+  const authorizeProtectedDelete = useCallback(
+    async (name: string): Promise<VaultDeleteAuthz> => {
+      const challenge = await api.createVaultDeleteChallenge(name, { handleError: false });
+      if (!challenge?.ok) {
+        throw new Error(challenge?.code || challenge?.message || 'protected-delete-challenge-failed');
+      }
+      const assertion = (await navigator.credentials.get({
+        publicKey: passkeyAssertionOptionsFromServer(challenge.webauthn),
+      })) as PublicKeyCredential | null;
+      if (!assertion) throw new Error('passkey-cancelled');
+      const rawId = bytesToBase64(toUint8(assertion.rawId));
+      const factor = challenge.webauthn.allowCredentials.find((entry) => entry.id === rawId);
+      if (!factor?.factor_id) throw new Error('protected-authz-factor-missing');
+      return {
+        kind: 'webauthn',
+        challenge_id: challenge.challenge_id,
+        factor_id: factor.factor_id,
+        assertion: serializeAssertionCredential(assertion),
+      };
+    },
+    [api],
+  );
+
   const lock = useCallback(() => {
     lockVault(true);
     setStatus(vaultStatusNow());
@@ -473,6 +609,7 @@ export function useProtectedVault() {
     clearVmk();
     sessionVault.wrapMeta = null;
     sessionVault.freshSetup = false;
+    sessionVault.authzFactorRegistration = null;
     notifyVaultLockChange();
     await refresh();
   }, [refresh]);
@@ -511,6 +648,7 @@ export function useProtectedVault() {
     sealValue,
     signProtectedRequest,
     releaseProtectedDelivery,
+    authorizeProtectedDelete,
     afterCreated,
     lock,
     discardAndRefresh,

@@ -1473,6 +1473,71 @@ def get_vault_vmk() -> dict:
     return {"ok": True, "exists": wrap_meta is not None, "wrap_meta": wrap_meta}
 
 
+def _vault_webauthn_context(origin: str | None):
+    from storage import vault_webauthn
+
+    try:
+        return vault_webauthn.rp_context_from_origin(origin or "")
+    except vault_webauthn.WebAuthnVerificationError as exc:
+        raise VaultApiError(str(exc), code="webauthn_origin_unsupported", status=409) from exc
+
+
+def create_vault_authz_webauthn_options(*, origin: str | None = None) -> dict:
+    from storage import vault_service
+
+    context = _vault_webauthn_context(origin)
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        return vault_service.create_webauthn_registration_options(
+            conn,
+            rp_id=context.rp_id,
+            origin=context.origin,
+        )
+
+
+def register_vault_authz_webauthn_factor(payload: dict, *, origin: str | None = None) -> dict:
+    from storage import vault_service
+
+    context = _vault_webauthn_context(origin)
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            result = vault_service.register_webauthn_factor(
+                conn,
+                payload,
+                rp_id=context.rp_id,
+                origin=context.origin,
+            )
+    except vault_service.InvalidProtectedAuthzError as exc:
+        raise VaultApiError(str(exc), code="invalid_protected_authz", status=409) from exc
+    except vault_service.ProtectedAuthRequiredError as exc:
+        raise VaultApiError(str(exc), code="protected_auth_required", status=409) from exc
+    except vault_service.ProtectedAuthzSetupRequiredError as exc:
+        raise VaultApiError(str(exc), code="protected_authz_setup_required", status=409) from exc
+    return result
+
+
+def create_vault_delete_challenge(name: str, *, origin: str | None = None) -> dict:
+    from storage import vault_service
+
+    context = _vault_webauthn_context(origin)
+    engine = _vault_engine()
+    try:
+        with engine.begin() as conn:
+            return vault_service.create_delete_challenge(
+                conn,
+                name,
+                rp_id=context.rp_id,
+                origin=context.origin,
+            )
+    except vault_service.SecretNotFoundError as exc:
+        raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.SecretNotProtectedError as exc:
+        raise VaultApiError(f"secret '{name}' is not protected", code="not_protected", status=409) from exc
+    except vault_service.ProtectedAuthzSetupRequiredError as exc:
+        raise VaultApiError(str(exc), code="protected_authz_setup_required", status=409) from exc
+
+
 def _reject_plaintext_value_fields(payload: object) -> None:
     if isinstance(payload, dict):
         if "value" in payload:
@@ -1537,7 +1602,7 @@ def _sealed_from_payload(payload: dict):
     return Sealed(ciphertext=ciphertext, nonce=nonce, wrap_meta=wrap_meta)
 
 
-def create_vault_secret(payload: dict) -> dict:
+def create_vault_secret(payload: dict, *, origin: str | None = None) -> dict:
     from storage import vault_crypto, vault_service
 
     if not isinstance(payload, dict):
@@ -1550,6 +1615,7 @@ def create_vault_secret(payload: dict) -> dict:
     policy = payload.get("policy") if isinstance(payload.get("policy"), dict) else None
     public_meta = payload.get("public_meta") if isinstance(payload.get("public_meta"), dict) else None
     links = payload.get("links") if isinstance(payload.get("links"), dict) else None
+    authz_factor_registration = payload.get("authz_factor_registration")
     try:
         if links and isinstance(links.get("skills"), list):
             tags.extend(vault_service.skill_tag(str(skill)) for skill in links["skills"] if isinstance(skill, str))
@@ -1623,6 +1689,8 @@ def create_vault_secret(payload: dict) -> dict:
                 policy=policy,
                 public_meta=public_meta,
                 establishing_vmk=establishing_vmk,
+                authz_factor_registration=authz_factor_registration if isinstance(authz_factor_registration, dict) else None,
+                authz_factor_origin=origin,
                 provision_request_id=provision_request_id,
             )
     except vault_service.InvalidSecretNameError as exc:
@@ -1645,6 +1713,10 @@ def create_vault_secret(payload: dict) -> dict:
         raise VaultApiError(f"secret '{name}' already exists", code="secret_exists", status=409) from exc
     except vault_service.VaultAlreadyInitializedError as exc:
         raise VaultApiError(str(exc), code="vault_already_initialized", status=409) from exc
+    except vault_service.ProtectedAuthzSetupRequiredError as exc:
+        raise VaultApiError(str(exc), code="protected_authz_setup_required", status=409) from exc
+    except vault_service.InvalidProtectedAuthzError as exc:
+        raise VaultApiError(str(exc), code="invalid_protected_authz", status=409) from exc
     except vault_service.VaultServiceError as exc:
         raise VaultApiError(str(exc), code="vault_error") from exc
     _publish_vaults_updated(
@@ -1689,18 +1761,30 @@ def update_vault_secret(name: str, payload: dict) -> dict:
     return {"ok": True, "secret": meta}
 
 
-def delete_vault_secret(name: str) -> dict:
+def delete_vault_secret(name: str, authz: dict | None = None) -> dict:
     from storage import vault_service
 
     engine = _vault_engine()
     release_scopes: list[dict[str, str]] = []
     try:
         with engine.begin() as conn:
+            meta = vault_service.get_secret_meta(conn, name)
+            protected_authz = (
+                vault_service.verify_delete_secret_authz(conn, name, authz)
+                if meta.get("protection") == "protected"
+                else None
+            )
             grant_rows = vault_service.active_grant_rows_for_secret(conn, name)
-            vault_service.delete_secret(conn, name)
+            vault_service.delete_secret(conn, name, protected_authz=protected_authz)
             release_scopes = vault_service.agent_release_scopes_after_rows(conn, grant_rows)
     except vault_service.SecretNotFoundError as exc:
         raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
+    except vault_service.ProtectedAuthRequiredError as exc:
+        raise VaultApiError(str(exc), code="protected_auth_required", status=409) from exc
+    except vault_service.ProtectedAuthzSetupRequiredError as exc:
+        raise VaultApiError(str(exc), code="protected_authz_setup_required", status=409) from exc
+    except vault_service.InvalidProtectedAuthzError as exc:
+        raise VaultApiError(str(exc), code="invalid_protected_authz", status=409) from exc
     release_vault_agent_scopes(release_scopes, reason="delete_vault_secret")
     _publish_vaults_updated(scope="secret", secret_name=name)
     return {"ok": True, "removed": True, "name": name}
