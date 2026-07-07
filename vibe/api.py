@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from config import paths
 from config.v2_config import CONFIG_LOCK, V2Config
@@ -1473,6 +1476,222 @@ def get_vault_vmk() -> dict:
     return {"ok": True, "exists": wrap_meta is not None, "wrap_meta": wrap_meta}
 
 
+_VAULT_DAEMON_AGENT_BINDING_KEY = "vault.daemon_agent_binding_key.v1"
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_vault_daemon_binding_key(raw: object) -> dict[str, str] | None:
+    if not isinstance(raw, str):
+        return None
+    with contextlib.suppress(Exception):
+        payload = json.loads(raw)
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("keyId"), str)
+            and isinstance(payload.get("privateKey"), str)
+            and isinstance(payload.get("publicKey"), str)
+        ):
+            return payload
+    return None
+
+
+def _new_vault_daemon_binding_key() -> dict[str, str]:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    private_raw = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_raw = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    key_id = "vault-daemon-ed25519-v1"
+    return {"keyId": key_id, "privateKey": _b64(private_raw), "publicKey": _b64(public_raw)}
+
+
+def _load_or_create_vault_daemon_binding_key(conn) -> dict[str, str]:
+    from storage.models import state_meta
+
+    raw = conn.execute(
+        select(state_meta.c.value_json).where(state_meta.c.key == _VAULT_DAEMON_AGENT_BINDING_KEY)
+    ).scalar_one_or_none()
+    existing = _parse_vault_daemon_binding_key(raw)
+    if existing is not None:
+        return existing
+
+    payload = _new_vault_daemon_binding_key()
+    stmt = sqlite_insert(state_meta).values(
+        key=_VAULT_DAEMON_AGENT_BINDING_KEY,
+        value_json=json.dumps(payload, sort_keys=True),
+        updated_at=_utc_now_iso(),
+    )
+    conn.execute(stmt.on_conflict_do_nothing(index_elements=[state_meta.c.key]))
+    raw = conn.execute(
+        select(state_meta.c.value_json).where(state_meta.c.key == _VAULT_DAEMON_AGENT_BINDING_KEY)
+    ).scalar_one_or_none()
+    existing = _parse_vault_daemon_binding_key(raw)
+    if existing is not None:
+        return existing
+
+    conn.execute(
+        state_meta.update()
+        .where(state_meta.c.key == _VAULT_DAEMON_AGENT_BINDING_KEY)
+        .values(value_json=json.dumps(payload, sort_keys=True), updated_at=_utc_now_iso())
+    )
+    return payload
+
+
+def get_vault_sandbox_root_metadata() -> dict:
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        key = _load_or_create_vault_daemon_binding_key(conn)
+    return {
+        "ok": True,
+        "root_metadata": {
+            "daemon": {
+                "verificationKeys": [
+                    {
+                        "alg": "ed25519",
+                        "keyId": key["keyId"],
+                        "publicKey": key["publicKey"],
+                    }
+                ]
+            }
+        },
+    }
+
+
+def _u64_be(value: int) -> bytes:
+    if value < 0 or value > 0xFFFF_FFFF_FFFF_FFFF:
+        raise VaultApiError("ttl_seconds out of bounds", code="invalid_grant")
+    return value.to_bytes(8, "big")
+
+
+def _length_prefixed(fields: list[str | bytes]) -> bytes:
+    out = bytearray()
+    for field in fields:
+        data = field.encode("utf-8") if isinstance(field, str) else field
+        if len(data) > 0xFFFF_FFFF:
+            raise VaultApiError("blind-box AAD field is too large", code="invalid_grant")
+        out.extend(len(data).to_bytes(4, "big"))
+        out.extend(data)
+    return bytes(out)
+
+
+def _agent_deliver_operation_hash(name: str, ttl_seconds: int) -> str:
+    return hashlib.sha256(
+        _length_prefixed(["agent-deliver", name, _u64_be(ttl_seconds)])
+    ).hexdigest()
+
+
+def _signed_agent_binding(binding: dict[str, Any], key: dict[str, str]) -> dict[str, Any]:
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(base64.b64decode(key["privateKey"]))
+    canonical = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+    signature = _b64(private_key.sign(canonical.encode("utf-8")))
+    return {
+        **binding,
+        "signature": {
+            "alg": "ed25519",
+            "keyId": key["keyId"],
+            "value": signature,
+        },
+    }
+
+
+def create_vault_agent_binding(payload: dict) -> dict:
+    from storage import vault_crypto, vault_service
+
+    if not isinstance(payload, dict):
+        raise VaultApiError("payload must be an object", code="invalid_payload")
+    request_id = str(payload.get("request_id") or payload.get("requestId") or "").strip()
+    grant_id = str(payload.get("grant_id") or payload.get("grantId") or "").strip()
+    name = str(payload.get("name") or "").strip()
+    try:
+        ttl_seconds = int(payload.get("ttl_seconds") or payload.get("ttlSecs") or 300)
+    except (TypeError, ValueError) as exc:
+        raise VaultApiError("ttl_seconds must be an integer", code="invalid_grant") from exc
+    if not request_id or not grant_id:
+        raise VaultApiError("request_id and grant_id are required", code="invalid_request", status=409)
+    if ttl_seconds < 1 or ttl_seconds > 24 * 60 * 60:
+        raise VaultApiError("ttl_seconds out of bounds", code="invalid_grant")
+    if not vault_crypto.is_valid_secret_name(name):
+        raise VaultApiError("invalid secret name (use ^[A-Za-z_][A-Za-z0-9_]*$)", code="invalid_name")
+
+    engine = _vault_engine()
+    with engine.begin() as conn:
+        option = _grant_option_from_request(conn, request_id)
+        if grant_id != option["grant_id"]:
+            raise VaultApiError("grant id does not match the approval request", code="invalid_request", status=409)
+        if name not in set(option["member_names"]):
+            raise VaultApiError("secret is not part of the approval request", code="invalid_request", status=409)
+        try:
+            meta = vault_service.get_secret_meta(conn, name)
+        except vault_service.SecretNotFoundError as exc:
+            raise VaultApiError(f"secret '{name}' not found", code="secret_not_found", status=404) from exc
+        if meta.get("protection") != "protected":
+            raise VaultApiError("agent binding is only valid for protected secrets", code="not_protected", status=409)
+        key = _load_or_create_vault_daemon_binding_key(conn)
+
+    try:
+        _require_avault_grant_delivery_surface("resident agent grant")
+        agent_pubkey = avault_agent_pubkey()
+    except AvaultError as exc:
+        raise _vault_api_error_from_avault(exc, prefix="avault agent binding failed") from exc
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=ttl_seconds)
+    expires_at_unix = int(expires_at.timestamp())
+    approval_nonce = list(os.urandom(16))
+    context = {
+        "purpose": "agent-deliver",
+        "name": name,
+        "grantId": grant_id,
+        "ttlSecs": ttl_seconds,
+        "approvalNonce": approval_nonce,
+        "approvalExpiresAtUnix": expires_at_unix,
+        "operationHash": _agent_deliver_operation_hash(name, ttl_seconds),
+    }
+    binding = {
+        "challengeId": f"vab_{uuid.uuid4().hex}",
+        "requestId": request_id,
+        "grantId": grant_id,
+        "agent": {
+            "publicKey": {
+                "public_key": str(agent_pubkey["public_key"]),
+                "fingerprint": str(agent_pubkey["fingerprint"]),
+            },
+            "fingerprint": str(agent_pubkey["fingerprint"]),
+        },
+        "context": context,
+        "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
+    }
+    return {
+        "ok": True,
+        "agent_pubkey": {
+            "public_key": str(agent_pubkey["public_key"]),
+            "fingerprint": str(agent_pubkey["fingerprint"]),
+        },
+        "binding": _signed_agent_binding(binding, key),
+        "approval": {
+            "nonce": _b64(bytes(approval_nonce)),
+            "expires_at_unix": expires_at_unix,
+        },
+    }
+
+
 def _vault_webauthn_context(origin: str | None):
     from storage import vault_webauthn
 
@@ -2016,11 +2235,17 @@ def request_vault_sign(payload: dict) -> dict:
                     code="unsupported_signer_kind",
                     status=409,
                 )
+            signing_context = _verifiable_signing_context_from_payload(
+                payload,
+                digest=digest,
+                required=meta.get("protection") == "protected",
+            )
             request = vault_service.create_sign_request(
                 conn,
                 name,
                 digest=digest,
                 scheme=scheme,
+                signing_context=signing_context,
                 requester=_vault_requester_payload(payload),
                 delivery=_vault_delivery_payload(payload),
                 expires_at=_expires_at_from_ttl(payload),
@@ -2544,6 +2769,40 @@ def _sign_digest_from_payload(value: object) -> str:
     return digest.lower()
 
 
+def _verifiable_signing_context_from_payload(payload: dict, *, digest: str, required: bool = False) -> dict[str, Any] | None:
+    context = payload.get("signing_context")
+    if context is None:
+        context = payload.get("signingContext")
+    if context is None:
+        delivery = payload.get("delivery")
+        if isinstance(delivery, dict):
+            context = delivery.get("signing_context") if delivery.get("signing_context") is not None else delivery.get("signingContext")
+    if context is None:
+        if required:
+            raise VaultApiError("protected signing requires a verifiable signing_context", code="missing_signing_context", status=409)
+        return None
+    if not isinstance(context, dict):
+        raise VaultApiError("signing_context must be an object", code="invalid_request", status=409)
+    kind = context.get("kind")
+    if kind not in {"evm-transaction", "eip-712-typed-data", "avault-agent-operation"}:
+        raise VaultApiError("unsupported signing_context kind", code="invalid_request", status=409)
+    context_digest = context.get("digest")
+    if not isinstance(context_digest, str) or context_digest.lower() != digest:
+        raise VaultApiError("signing_context digest must match the sign request digest", code="invalid_request", status=409)
+    if kind == "evm-transaction":
+        if context.get("digestAlgorithm") != "keccak256" or not isinstance(context.get("chainId"), str):
+            raise VaultApiError("invalid evm signing_context", code="invalid_request", status=409)
+        if "unsignedTransaction" not in context:
+            raise VaultApiError("invalid evm signing_context", code="invalid_request", status=409)
+    elif kind == "eip-712-typed-data":
+        if context.get("digestAlgorithm") != "eip712" or "typedData" not in context:
+            raise VaultApiError("invalid EIP-712 signing_context", code="invalid_request", status=409)
+    else:
+        if context.get("digestAlgorithm") != "avault-operation-hash-v1" or not isinstance(context.get("canonicalPreimage"), str):
+            raise VaultApiError("invalid avault operation signing_context", code="invalid_request", status=409)
+    return dict(context)
+
+
 def _protected_sign_invalid(message: str) -> VaultApiError:
     return VaultApiError(message, code="invalid_request", status=409)
 
@@ -2873,11 +3132,13 @@ def vault_sign(payload: dict) -> dict:
             if meta.get("protection") == "protected":
                 signature = payload.get("signature")
                 if not isinstance(signature, dict):
+                    signing_context = _verifiable_signing_context_from_payload(payload, digest=digest, required=True)
                     request = vault_service.create_sign_request(
                         conn,
                         name,
                         digest=digest,
                         scheme=scheme,
+                        signing_context=signing_context,
                         requester=payload.get("requester") if isinstance(payload.get("requester"), dict) else None,
                         delivery=payload.get("delivery") if isinstance(payload.get("delivery"), dict) else None,
                     )
@@ -2892,7 +3153,14 @@ def vault_sign(payload: dict) -> dict:
                     request_id = str(payload.get("request_id") or "")
                     if not request_id:
                         raise VaultApiError("request_id is required to complete protected signing", code="missing_request_id")
-                    vault_service.validate_sign_request(conn, request_id, name=name, digest=digest, scheme=scheme)
+                    sign_request = vault_service.validate_sign_request(conn, request_id, name=name, digest=digest, scheme=scheme)
+                    delivery = sign_request.get("delivery") if isinstance(sign_request.get("delivery"), dict) else {}
+                    if not isinstance(delivery.get("signing_context"), dict):
+                        raise VaultApiError(
+                            "protected signing request is missing a verifiable signing_context",
+                            code="missing_signing_context",
+                            status=409,
+                        )
                     signature = _normalized_protected_signature(signature)
                     # `meta` is the masked payload (derived addresses only, no raw key); source
                     # the pinned public key from storage for server-side verification.
