@@ -1411,12 +1411,23 @@ class ConsolidatedMessageDispatcher:
                         context, status_consolidated_key, done=True, reason=terminal_reason, result_body=display_text
                     )
                 # A caller-supplied ``result_footer`` (the show_duration duration +
-                # token footnote) takes precedence: it renders in EVERY delivery
-                # mode as the de-emphasized subtext footer, and in concise mode it
-                # supersedes the bubble's own ``✅ done · …`` line so the terminal
-                # footer stays consistent (grey, one line, no head text).
+                # token footnote) is delivered per platform capability:
+                #   * platforms that render the de-emphasized subtext footer
+                #     (``supports_status_bubble``: Slack/Discord/Lark) get it as
+                #     grey subtext — and in concise mode it supersedes the bubble's
+                #     own ``✅ done · …`` line so the terminal footer stays
+                #     consistent (grey, one line, no head text);
+                #   * platforms WITHOUT subtext rendering (Telegram/WeChat/Avibe)
+                #     fold it onto the body as a trailing line, so the footnote
+                #     stays visible AND their senders (which don't accept the
+                #     ``subtext`` kwarg) are never handed it.
                 if result_footer:
-                    done_footer = result_footer
+                    if self._capabilities(context).supports_status_bubble:
+                        done_footer = result_footer
+                    elif display_text.strip():
+                        display_text = f"{display_text}\n\n{result_footer}"
+                    else:
+                        display_text = result_footer
                 # Pass subtext to RAW send_message calls only when set, so an adapter
                 # whose send_message predates the subtext kwarg is never handed it
                 # (the helper paths apply the same guard internally).

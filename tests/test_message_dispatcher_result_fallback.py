@@ -79,6 +79,21 @@ class _NativeMarkdownIMClient(_StubIMClient):
         return message_id
 
 
+class _SubtextNativeMarkdownIMClient(_StubIMClient):
+    """Native-markdown client that accepts (and records) the ``subtext`` footer,
+    modelling a ``supports_status_bubble`` platform (Slack/Discord/Lark)."""
+
+    def __init__(self):
+        super().__init__()
+        self.native_markdown_messages = []
+
+    async def send_markdown_message(self, context, text, keyboard=None, reply_to=None, subtext=None):
+        self.native_markdown_messages.append((context.channel_id, text, keyboard, reply_to, subtext))
+        message_id = f"native-{self._next_id}"
+        self._next_id += 1
+        return message_id
+
+
 class _StubController:
     def __init__(
         self,
@@ -145,6 +160,41 @@ class MessageDispatcherResultFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "Body")
         self.assertIsNone(reply_to)
         self.assertEqual([button.text for button in keyboard.buttons[0]], ["Continue", "Stop"])
+
+    async def test_result_footer_rides_subtext_on_status_bubble_platform(self):
+        """On a ``supports_status_bubble`` platform (Slack) the show_duration
+        footnote is delivered as the de-emphasized ``subtext`` footer and the body
+        stays clean."""
+        im_client = _SubtextNativeMarkdownIMClient()
+        controller = _StubController(platform="slack", im_client=im_client)
+        dispatcher = ConsolidatedMessageDispatcher(controller)
+        context = MessageContext(user_id="U1", channel_id="C1", platform="slack")
+
+        message_id = await dispatcher.emit_agent_message(
+            context, "result", "Answer body", result_footer="✅ ⏱️ 5s · 🪙 1.2k tok"
+        )
+
+        self.assertEqual(message_id, "native-1")
+        channel_id, text, _keyboard, _reply_to, subtext = im_client.native_markdown_messages[0]
+        self.assertEqual(text, "Answer body")
+        self.assertEqual(subtext, "✅ ⏱️ 5s · 🪙 1.2k tok")
+
+    async def test_result_footer_folds_into_body_without_subtext_platform(self):
+        """On a platform WITHOUT subtext rendering (Telegram) the footnote folds
+        onto the body and no ``subtext`` kwarg is passed — a send_message that
+        lacks the kwarg would otherwise raise (the Codex P2 regression)."""
+        im_client = _StubIMClient()  # send_message has no ``subtext`` parameter
+        controller = _StubController(platform="telegram", im_client=im_client)
+        dispatcher = ConsolidatedMessageDispatcher(controller)
+        context = MessageContext(user_id="U1", channel_id="C1", platform="telegram")
+
+        message_id = await dispatcher.emit_agent_message(
+            context, "result", "Answer body", result_footer="✅ ⏱️ 5s · 🪙 1.2k tok"
+        )
+
+        self.assertEqual(message_id, "msg-1")
+        channel_id, text, _parse_mode = im_client.sent_messages[0]
+        self.assertEqual(text, "Answer body\n\n✅ ⏱️ 5s · 🪙 1.2k tok")
 
     async def test_result_persists_cleaned_display_text_not_raw(self):
         """The persisted result must match what the user was shown, not the raw
