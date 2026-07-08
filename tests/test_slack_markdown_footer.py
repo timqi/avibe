@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.v2_config import SlackConfig
 from modules.im.base import MessageContext
-from modules.im.slack import SlackBot, _SLACK_MARKDOWN_TEXT_LIMIT
+from modules.im.slack import SlackApiError, SlackBot, _SLACK_MARKDOWN_TEXT_LIMIT
 
 
 class SlackMarkdownFooterTests(unittest.IsolatedAsyncioTestCase):
@@ -49,6 +49,32 @@ class SlackMarkdownFooterTests(unittest.IsolatedAsyncioTestCase):
         await slack.send_markdown_message(context, big)
 
         self.assertEqual(captured["text"], big)
+
+
+    async def test_block_rejection_fallback_folds_subtext(self):
+        """When Slack rejects the native markdown block (invalid_blocks etc.), the
+        legacy-mrkdwn recovery must fold the footnote onto the body so the
+        show_duration/token footer survives (Codex P2)."""
+        slack = SlackBot(SlackConfig(bot_token="xoxb-test"))
+        slack._ensure_clients = lambda: None
+        slack._is_markdown_block_rejection = lambda err: True
+        captured = {}
+
+        async def raise_rejection(context, kwargs, log_label=None):
+            raise SlackApiError("invalid_blocks", {"ok": False, "error": "invalid_blocks"})
+
+        async def fake_send(context, text, parse_mode=None, reply_to=None):
+            captured["text"] = text
+            return "ts-3"
+
+        slack._post_message_with_dm_recovery = raise_rejection
+        slack.send_message = fake_send
+        context = MessageContext(user_id="U1", channel_id="C1", platform="slack")
+
+        message_id = await slack.send_markdown_message(context, "Answer body", subtext="✅ ⏱️ 5s · 🪙 1.2k tok")
+
+        self.assertEqual(message_id, "ts-3")
+        self.assertEqual(captured["text"], "Answer body\n\n✅ ⏱️ 5s · 🪙 1.2k tok")
 
 
 if __name__ == "__main__":

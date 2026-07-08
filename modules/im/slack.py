@@ -903,20 +903,22 @@ class SlackBot(BaseIMClient):
                 logger.error(f"Error sending Slack native markdown message: {e}")
                 raise
             logger.warning("Slack rejected native markdown block; falling back to legacy mrkdwn rendering")
-            # Do NOT forward subtext here: it re-routes through _send_status_message,
-            # which rebuilds the SAME native markdown block Slack just rejected, so
-            # the fallback would hit the identical invalid_blocks error and degrade
-            # to attachment/failure. Use the legacy mrkdwn/section path; the done
-            # footer is dropped on this rare recovery path so the body still posts.
+            # Do NOT forward subtext as a separate footer block here: that re-routes
+            # through _send_status_message, which rebuilds the SAME native markdown
+            # block Slack just rejected, so the fallback would hit the identical
+            # invalid_blocks error and degrade to attachment/failure. Instead FOLD
+            # the footer onto the body (plain mrkdwn) so the show_duration/token
+            # footnote is retained rather than dropped on this recovery path.
+            body = f"{text}\n\n{subtext}" if subtext else text
             if keyboard:
                 return await self.send_message_with_buttons(
                     context,
-                    text,
+                    body,
                     keyboard,
                     parse_mode="markdown",
                     reply_to=reply_to,
                 )
-            return await self.send_message(context, text, parse_mode="markdown", reply_to=reply_to)
+            return await self.send_message(context, body, parse_mode="markdown", reply_to=reply_to)
 
         if self.settings_manager and (context.thread_id or reply_to):
             thread_ts = context.thread_id or reply_to
