@@ -1078,12 +1078,17 @@ class TelegramBot(BaseIMClient):
         text: str,
         keyboard: Optional[InlineKeyboard] = None,
         reply_to: Optional[str] = None,
+        subtext: Optional[str] = None,
     ) -> str:
         """Send LLM-authored Markdown through Telegram Rich Messages when useful.
 
         Bot API 10.1 rich messages understand GFM-like block structure. Plain
         short markdown still uses the legacy HTML conversion path because it is
         older, broadly deployed, and sufficient for simple emphasis/links/code.
+
+        ``subtext`` is accepted for the BaseIMClient contract and ignored:
+        Telegram has no native de-emphasized footer, so the dispatcher folds any
+        footnote into ``text`` for this platform instead.
         """
         if not self._should_send_rich_markdown(text):
             if keyboard is not None:

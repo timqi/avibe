@@ -392,38 +392,78 @@ class BaseMarkdownFormatter(ABC):
         parts = [header] + escaped_parts
         return "\n\n".join(parts)
 
-    def format_result_message(
+    def format_result_footer(
         self,
         subtype: str,
         duration_ms: int,
-        result: Optional[str] = None,
+        token_field: str = "",
         show_duration: bool = True,
     ) -> str:
-        """Format result message.
+        """Build the compact one-line result footnote (no answer body).
 
-        Format: ⏱️ Success: 2m 24s  (when show_duration=True)
-                ⏱️ Success           (when show_duration=False)
+        The outcome word (``Success``/``Done``/…) is a compact status emoji, and
+        the duration/token fields keep their own glyphs (⏱️ time, 🪙 tokens) so it
+        reads like the concise status footer. Meant to ride as a de-emphasized
+        grey subtext footer, not as a prominent head line.
+
+        Format: ✅ ⏱️ 2m 24s · 🪙 240k tok  (success, duration + tokens known)
+                ✅ ⏱️ 2m 24s               (success, no tokens)
+                ✅ 🪙 240k tok             (no duration, tokens known)
+                ✅                          (nothing else to show)
+                ⚠️ ⏱️ 2m 24s               (warning subtype)
+                ❌ ⏱️ 2m 24s               (error subtype)
+
+        ``token_field`` is the already-formatted compact usage string (e.g.
+        ``240k tok``); duration and tokens share the same ``·`` separator as the
+        concise footer, and each field is omitted when empty.
         """
-        subtype_display = subtype.capitalize() if subtype else "Done"
+        subtype_lower = (subtype or "").lower()
+        if subtype_lower.startswith("error"):
+            marker = "❌"
+        elif subtype_lower == "warning":
+            marker = "⚠️"
+        else:
+            marker = "✅"
 
+        segments: list[str] = []
         if show_duration and duration_ms > 0:
             total_seconds = duration_ms / 1000
             minutes = int(total_seconds // 60)
             seconds = int(total_seconds % 60)
 
             if minutes > 0:
-                duration_str = f"{minutes}m {seconds}s"
+                segments.append(f"⏱️ {minutes}m {seconds}s")
             else:
-                duration_str = f"{seconds}s"
+                segments.append(f"⏱️ {seconds}s")
 
-            result_text = f"⏱️ {subtype_display}: {duration_str}"
-        else:
-            result_text = f"⏱️ {subtype_display}"
+        if token_field:
+            segments.append(f"🪙 {token_field}")
 
+        footer = marker
+        if segments:
+            footer += " " + " · ".join(segments)
+        return footer
+
+    def format_result_message(
+        self,
+        subtype: str,
+        duration_ms: int,
+        result: Optional[str] = None,
+        show_duration: bool = True,
+        token_field: str = "",
+    ) -> str:
+        """Result footnote plus (optionally) the answer body below it.
+
+        Retained for the legacy Claude SDK formatting path; the primary result
+        flow now delivers the footnote via :meth:`format_result_footer` as a
+        de-emphasized subtext footer instead of a head line.
+        """
+        footer = self.format_result_footer(
+            subtype, duration_ms, token_field=token_field, show_duration=show_duration
+        )
         if result:
-            result_text += f"\n\n{result}"
-
-        return result_text
+            return f"{footer}\n\n{result}"
+        return footer
 
     def format_tool_result(self, is_error: bool, content: Optional[str] = None) -> str:
         """Format tool result block"""

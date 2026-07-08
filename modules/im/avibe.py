@@ -109,7 +109,11 @@ class AvibeBot(BaseIMClient):
         text: str,
         parse_mode: Optional[str] = None,
         reply_to: Optional[str] = None,
+        subtext: Optional[str] = None,
     ) -> str:
+        # ``subtext`` is accepted for the BaseIMClient contract and ignored: the
+        # Web Chat surface has no native de-emphasized footer, so the dispatcher
+        # folds any footnote into ``text`` for this platform instead.
         message_id = _new_message_id()
         logger.debug(
             "AvibeBot.send_message: scope=%s message_id=%s len=%s reply_to=%s",
@@ -135,7 +139,10 @@ class AvibeBot(BaseIMClient):
         text: str,
         keyboard: InlineKeyboard,
         parse_mode: Optional[str] = None,
+        subtext: Optional[str] = None,
     ) -> str:
+        # ``subtext`` accepted for the BaseIMClient contract and ignored (see
+        # send_message); the dispatcher folds footnotes into ``text`` here.
         message_id = _new_message_id()
         button_count = len(getattr(keyboard, "buttons", []) or [])
         logger.debug(

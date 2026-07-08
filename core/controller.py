@@ -1262,6 +1262,7 @@ class Controller:
         is_error: bool = False,
         level: str = "normal",
         status_label: Optional[str] = None,
+        result_footer: Optional[str] = None,
     ):
         """Backward-compatible entrypoint; delegated to message dispatcher."""
         return await self.message_dispatcher.emit_agent_message(
@@ -1272,6 +1273,7 @@ class Controller:
             is_error=is_error,
             level=level,
             status_label=status_label,
+            result_footer=result_footer,
         )
 
     def note_session_tokens(self, context: MessageContext, *, total: int) -> None:
@@ -1283,6 +1285,15 @@ class Controller:
         if dispatcher is None:
             return
         dispatcher.note_session_tokens(context, total=total)
+
+    def session_token_field(self, context: MessageContext) -> str:
+        """The compact ``{n} tok`` footer field for the session's current
+        context-window occupancy, or "" when unknown/zero or the dispatcher is
+        unavailable (partially-wired test controllers)."""
+        dispatcher = getattr(self, "message_dispatcher", None)
+        if dispatcher is None:
+            return ""
+        return dispatcher.session_token_field(context)
 
     # Main run method
     def run(self):

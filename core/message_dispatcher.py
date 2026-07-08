@@ -571,6 +571,16 @@ class ConsolidatedMessageDispatcher:
             return f"{n / 1_000_000:.1f}M"
         return f"{round(n / 1_000_000)}M"
 
+    @staticmethod
+    def _fold_footer(text: str, footer: Optional[str]) -> str:
+        """Append a de-emphasized footnote onto a body for platforms that cannot
+        render a native subtext footer, with the same ``\\n\\n`` separator used for
+        delivery. Returns ``text`` unchanged when there is no footer, and the
+        footer alone when the body is empty."""
+        if not footer:
+            return text
+        return f"{text}\n\n{footer}" if (text or "").strip() else footer
+
     def _token_session_key(self, context: MessageContext) -> str:
         """Key for context-window occupancy: scoped per CONVERSATION (thread / DM),
         not per channel. The channel-level ``_get_session_key`` alone would let one
@@ -626,6 +636,13 @@ class ConsolidatedMessageDispatcher:
         if tokens <= 0:
             return ""
         return self._t("status.tokens", count=self._format_token_count(tokens))
+
+    def session_token_field(self, context: MessageContext) -> str:
+        """Public accessor for the compact ``{n} tok`` field of the session's
+        current context-window occupancy (``""`` when unknown/zero). Lets the
+        ``show_duration`` result footer reuse the same figure and styling as the
+        concise status bubble."""
+        return self._token_field(context)
 
     def _status_footer_text(
         self,
@@ -1197,6 +1214,7 @@ class ConsolidatedMessageDispatcher:
         is_error: bool = False,
         level: str = "normal",
         status_label: Optional[str] = None,
+        result_footer: Optional[str] = None,
     ) -> Optional[str]:
         """Centralized dispatch for agent messages.
 
@@ -1228,6 +1246,11 @@ class ConsolidatedMessageDispatcher:
         process path (assistant/toolcall). The persisted row and the verbose
         append path keep using the original ``text`` unchanged; when it is empty
         the bubble falls back to ``to_status_label(text)`` as before.
+
+        ``result_footer`` is an optional de-emphasized one-line footnote for a
+        terminal ``result`` (the show_duration duration + token usage). It rides
+        as the platform subtext footer and, in concise mode, supersedes the status
+        bubble's own terminal footer so the outcome line stays consistent.
         """
         settings_manager = self.controller.get_settings_manager_for_context(context)
         im_client = self._get_im_client(context)
@@ -1322,20 +1345,25 @@ class ConsolidatedMessageDispatcher:
             try:
                 message_id = f"suppressed:{(context.platform_specific or {}).get('task_execution_id') or canonical_type}"
                 terminal_status = None
+                # Delivery is suppressed (private scheduled/agent_run), so the footer
+                # can't ride subtext — fold the show_duration footnote into the
+                # RECORDED text so the stored result keeps the duration/token info
+                # that used to live in the body. No-op when there is no footer.
+                recorded_text = self._fold_footer(text, result_footer)
                 if (
                     canonical_type == "result"
                     and (context.platform_specific or {}).get("task_trigger_kind") == "agent_run"
                 ):
                     self._record_suppressed_agent_run_terminal_result(
                         context,
-                        text,
+                        recorded_text,
                         message_id,
                         is_error=is_error,
                     )
                 elif canonical_type == "result" or (context.platform_specific or {}).get("task_trigger_kind") != "agent_run":
                     self._record_suppressed_run_message(
                         context,
-                        text,
+                        recorded_text,
                         message_id,
                         terminal_status=terminal_status,
                     )
@@ -1397,6 +1425,34 @@ class ConsolidatedMessageDispatcher:
                     _, done_footer = self._compose_status_message(
                         context, status_consolidated_key, done=True, reason=terminal_reason, result_body=display_text
                     )
+                # A caller-supplied ``result_footer`` (the show_duration duration +
+                # token footnote) is delivered per platform capability:
+                #   * platforms that render the de-emphasized subtext footer
+                #     (``supports_status_bubble``: Slack/Discord/Lark) get it as
+                #     grey subtext — and in concise mode it supersedes the bubble's
+                #     own ``✅ done · …`` line so the terminal footer stays
+                #     consistent (grey, one line, no head text);
+                #   * platforms WITHOUT subtext rendering (Telegram/WeChat/Avibe)
+                #     fold it onto the body as a trailing line, so the footnote
+                #     stays visible AND their senders (which don't accept the
+                #     ``subtext`` kwarg) are never handed it.
+                # ``folded_footer`` is the footnote to APPEND to the stored text so
+                # a reloaded transcript / inbox / agent-run record keeps the
+                # duration/token info (it used to live in the result body). It is
+                # set for BOTH platform kinds; only the DELIVERY form differs.
+                folded_footer: Optional[str] = result_footer or None
+                if result_footer:
+                    # Gate on the DELIVERY TARGET's capabilities, not the source
+                    # context: a delivery_override can redirect a Slack/Discord/Lark
+                    # turn to a non-subtext target (or vice versa), and the footer
+                    # must follow where it is actually delivered/persisted.
+                    if self._capabilities(target_context).supports_status_bubble:
+                        # Subtext-capable: deliver as the grey subtext footer (body
+                        # stays clean); persistence still folds it in below.
+                        done_footer = result_footer
+                    else:
+                        # No subtext rendering: fold onto the delivered body too.
+                        display_text = self._fold_footer(display_text, result_footer)
                 # Pass subtext to RAW send_message calls only when set, so an adapter
                 # whose send_message predates the subtext kwarg is never handed it
                 # (the helper paths apply the same guard internally).
@@ -1561,9 +1617,17 @@ class ConsolidatedMessageDispatcher:
                 else:
                     await self._clear_consolidated_state(context)
 
+                # The stored text keeps the footnote for BOTH platform kinds:
+                # ``display_text`` already carries it on non-subtext platforms (folded
+                # above), while subtext platforms delivered it out-of-band — folding
+                # ``folded_footer`` onto the clean ``persist_text`` reconstructs the
+                # same body+footer without double-appending (persist_text is never
+                # mutated) and is a no-op when there is no footer.
+                persisted_result_text = self._fold_footer(persist_text, folded_footer)
+
                 self._record_agent_run_terminal_result(
                     context,
-                    display_text,
+                    persisted_result_text,
                     primary_message_id,
                     is_error=is_error,
                 )
@@ -1588,7 +1652,7 @@ class ConsolidatedMessageDispatcher:
                         avibe_enhanced = process_reply(
                             text, include_quick_replies=quick_replies_on, keep_file_links=True
                         )
-                        avibe_text = avibe_enhanced.text or persist_text
+                        avibe_text = self._fold_footer(avibe_enhanced.text or persist_text, folded_footer)
                         persist_agent_message(
                             target_context,
                             result_type,
@@ -1596,7 +1660,9 @@ class ConsolidatedMessageDispatcher:
                             quick_replies=[b.text for b in avibe_enhanced.buttons] or None,
                         )
                     else:
-                        persist_agent_message(target_context, result_type, persist_text)
+                        persist_agent_message(
+                            target_context, result_type, persisted_result_text
+                        )
 
                 if primary_message_id and display_text:
                     # Stream the delivered result to live consumers (avibe SSE).

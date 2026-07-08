@@ -504,15 +504,44 @@ class BaseAgent(ABC):
                 # dot stays green and the stream hangs until the 600s timeout (Codex P2).
                 await self.controller.emit_agent_message(context, "result", "", parse_mode=parse_mode, is_error=is_error)
         else:
-            formatted = self._get_formatter(context).format_result_message(
-                subtype or "",
-                duration_ms,
-                visible_result,
-                show_duration=True,
-            )
+            token_field = ""
+            get_token_field = getattr(self.controller, "session_token_field", None)
+            if callable(get_token_field):
+                try:
+                    token_field = get_token_field(context) or ""
+                except Exception:
+                    token_field = ""
+            # Duration + token usage ride as a de-emphasized grey subtext footer
+            # (the same channel as the concise status footer), NOT a prominent head
+            # line. The body carries only the actual answer + suffix.
+            result_footer = None
+            if duration_ms > 0 or token_field:
+                result_footer = self._get_formatter(context).format_result_footer(
+                    subtype or "",
+                    duration_ms,
+                    token_field=token_field,
+                )
+            parts = []
+            if visible_result and visible_result.strip():
+                parts.append(visible_result)
             if visible_suffix:
-                formatted = f"{formatted}\n{visible_suffix}"
-            await self.controller.emit_agent_message(context, "result", formatted, parse_mode=parse_mode, is_error=is_error)
+                parts.append(visible_suffix)
+            body = "\n".join(parts)
+            # Footer-only completion (show_duration on, no visible result/suffix):
+            # promote the footnote to the visible body so a duration/token-only turn
+            # is still delivered/persisted/streamed. An empty body would otherwise be
+            # treated as a silent terminal result and the footnote would be lost.
+            if not body.strip() and result_footer:
+                body = result_footer
+                result_footer = None
+            await self.controller.emit_agent_message(
+                context,
+                "result",
+                body,
+                parse_mode=parse_mode,
+                is_error=is_error,
+                result_footer=result_footer,
+            )
 
         # Remove ack reaction after result is sent
         if request:
