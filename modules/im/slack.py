@@ -857,20 +857,21 @@ class SlackBot(BaseIMClient):
             raise ValueError("Slack send_markdown_message requires non-empty text")
 
         if len(text) > _SLACK_MARKDOWN_TEXT_LIMIT:
-            # Over the markdown-block cap: keep the LEGACY mrkdwn/section path and
-            # do NOT attach the done-footer subtext. Passing subtext routes the
-            # send through the status-bubble path, which rejects bodies > the cap
-            # (so a 12k–30k inline result would otherwise fail to post). The footer
-            # is a non-essential trailer; reliable delivery of the body wins.
+            # Over the markdown-block cap: keep the LEGACY mrkdwn/section path, which
+            # cannot carry a separate context-footer block (routing through the
+            # status-bubble path would reject bodies > the cap). Fold ``subtext``
+            # onto the body instead so the show_duration/token footnote is retained
+            # rather than silently dropped for 12k–30k inline results.
+            body = f"{text}\n\n{subtext}" if subtext else text
             if keyboard:
                 return await self.send_message_with_buttons(
                     context,
-                    text,
+                    body,
                     keyboard,
                     parse_mode="markdown",
                     reply_to=reply_to,
                 )
-            return await self.send_message(context, text, parse_mode="markdown", reply_to=reply_to)
+            return await self.send_message(context, body, parse_mode="markdown", reply_to=reply_to)
 
         blocks = [self._build_markdown_block(text)]
         if keyboard:
