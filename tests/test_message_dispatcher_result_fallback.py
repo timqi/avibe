@@ -316,6 +316,28 @@ class MessageDispatcherResultFallbackTests(unittest.IsolatedAsyncioTestCase):
         persist.assert_not_called()
         self.assertTrue(message_id.startswith("suppressed:"))
 
+    async def test_suppressed_result_records_folded_footer(self):
+        """A suppressed (private) result can't ride subtext, so the footnote must
+        be folded into the recorded text to keep the duration/token info (Codex P2)."""
+        controller = _StubController(platform="slack")
+        dispatcher = ConsolidatedMessageDispatcher(controller)
+        captured = {}
+
+        def _capture(context, text, message_id, terminal_status=None):
+            captured["text"] = text
+
+        dispatcher._record_suppressed_run_message = _capture
+        context = MessageContext(
+            user_id="U1", channel_id="C1", platform="slack",
+            platform_specific={"suppress_delivery": True},
+        )
+
+        await dispatcher.emit_agent_message(
+            context, "result", "private output", result_footer="✅ ⏱️ 5s · 🪙 1.2k tok"
+        )
+
+        self.assertEqual(captured["text"], "private output\n\n✅ ⏱️ 5s · 🪙 1.2k tok")
+
     async def test_notify_persisted_only_on_successful_send(self):
         controller = _StubController(platform="slack")
         dispatcher = ConsolidatedMessageDispatcher(controller)

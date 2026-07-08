@@ -1345,20 +1345,25 @@ class ConsolidatedMessageDispatcher:
             try:
                 message_id = f"suppressed:{(context.platform_specific or {}).get('task_execution_id') or canonical_type}"
                 terminal_status = None
+                # Delivery is suppressed (private scheduled/agent_run), so the footer
+                # can't ride subtext — fold the show_duration footnote into the
+                # RECORDED text so the stored result keeps the duration/token info
+                # that used to live in the body. No-op when there is no footer.
+                recorded_text = self._fold_footer(text, result_footer)
                 if (
                     canonical_type == "result"
                     and (context.platform_specific or {}).get("task_trigger_kind") == "agent_run"
                 ):
                     self._record_suppressed_agent_run_terminal_result(
                         context,
-                        text,
+                        recorded_text,
                         message_id,
                         is_error=is_error,
                     )
                 elif canonical_type == "result" or (context.platform_specific or {}).get("task_trigger_kind") != "agent_run":
                     self._record_suppressed_run_message(
                         context,
-                        text,
+                        recorded_text,
                         message_id,
                         terminal_status=terminal_status,
                     )
