@@ -402,32 +402,45 @@ class BaseMarkdownFormatter(ABC):
     ) -> str:
         """Format result message.
 
-        Format: ⏱️ Success: 2m 24s · 240k tok  (show_duration=True, tokens known)
-                ⏱️ Success: 2m 24s              (show_duration=True, no tokens)
-                ⏱️ Success                       (show_duration=False)
+        The outcome word (``Success``/``Done``/…) is replaced by a compact status
+        emoji so the footer reads like the concise status bubble:
+
+        Format: ✅ 2m 24s · 240k tok  (success, show_duration=True, tokens known)
+                ✅ 2m 24s             (success, show_duration=True, no tokens)
+                ✅ 240k tok           (show_duration=False / no duration, tokens known)
+                ✅                     (nothing else to show)
+                ⚠️ 2m 24s             (warning subtype)
+                ❌ 2m 24s             (error subtype)
 
         ``token_field`` is the already-formatted compact usage string (e.g.
-        ``240k tok``); it is appended with the same ``·`` separator as the concise
-        status footer and omitted when empty.
+        ``240k tok``); duration and tokens share the same ``·`` separator as the
+        concise footer, and each field is omitted when empty.
         """
-        subtype_display = subtype.capitalize() if subtype else "Done"
+        subtype_lower = (subtype or "").lower()
+        if subtype_lower.startswith("error"):
+            marker = "❌"
+        elif subtype_lower == "warning":
+            marker = "⚠️"
+        else:
+            marker = "✅"
 
+        segments: list[str] = []
         if show_duration and duration_ms > 0:
             total_seconds = duration_ms / 1000
             minutes = int(total_seconds // 60)
             seconds = int(total_seconds % 60)
 
             if minutes > 0:
-                duration_str = f"{minutes}m {seconds}s"
+                segments.append(f"{minutes}m {seconds}s")
             else:
-                duration_str = f"{seconds}s"
-
-            result_text = f"⏱️ {subtype_display}: {duration_str}"
-        else:
-            result_text = f"⏱️ {subtype_display}"
+                segments.append(f"{seconds}s")
 
         if token_field:
-            result_text += f" · {token_field}"
+            segments.append(token_field)
+
+        result_text = marker
+        if segments:
+            result_text += " " + " · ".join(segments)
 
         if result:
             result_text += f"\n\n{result}"
