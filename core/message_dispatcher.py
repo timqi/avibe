@@ -571,6 +571,16 @@ class ConsolidatedMessageDispatcher:
             return f"{n / 1_000_000:.1f}M"
         return f"{round(n / 1_000_000)}M"
 
+    @staticmethod
+    def _fold_footer(text: str, footer: Optional[str]) -> str:
+        """Append a de-emphasized footnote onto a body for platforms that cannot
+        render a native subtext footer, with the same ``\\n\\n`` separator used for
+        delivery. Returns ``text`` unchanged when there is no footer, and the
+        footer alone when the body is empty."""
+        if not footer:
+            return text
+        return f"{text}\n\n{footer}" if (text or "").strip() else footer
+
     def _token_session_key(self, context: MessageContext) -> str:
         """Key for context-window occupancy: scoped per CONVERSATION (thread / DM),
         not per channel. The channel-level ``_get_session_key`` alone would let one
@@ -1421,13 +1431,16 @@ class ConsolidatedMessageDispatcher:
                 #     fold it onto the body as a trailing line, so the footnote
                 #     stays visible AND their senders (which don't accept the
                 #     ``subtext`` kwarg) are never handed it.
+                folded_footer: Optional[str] = None
                 if result_footer:
                     if self._capabilities(context).supports_status_bubble:
                         done_footer = result_footer
-                    elif display_text.strip():
-                        display_text = f"{display_text}\n\n{result_footer}"
                     else:
-                        display_text = result_footer
+                        # Non-subtext platform: fold onto the body AND remember it
+                        # so the persisted transcript/inbox matches what was shown
+                        # (the result-path invariant — persist what the user saw).
+                        folded_footer = result_footer
+                        display_text = self._fold_footer(display_text, result_footer)
                 # Pass subtext to RAW send_message calls only when set, so an adapter
                 # whose send_message predates the subtext kwarg is never handed it
                 # (the helper paths apply the same guard internally).
@@ -1619,7 +1632,7 @@ class ConsolidatedMessageDispatcher:
                         avibe_enhanced = process_reply(
                             text, include_quick_replies=quick_replies_on, keep_file_links=True
                         )
-                        avibe_text = avibe_enhanced.text or persist_text
+                        avibe_text = self._fold_footer(avibe_enhanced.text or persist_text, folded_footer)
                         persist_agent_message(
                             target_context,
                             result_type,
@@ -1627,7 +1640,9 @@ class ConsolidatedMessageDispatcher:
                             quick_replies=[b.text for b in avibe_enhanced.buttons] or None,
                         )
                     else:
-                        persist_agent_message(target_context, result_type, persist_text)
+                        persist_agent_message(
+                            target_context, result_type, self._fold_footer(persist_text, folded_footer)
+                        )
 
                 if primary_message_id and display_text:
                     # Stream the delivered result to live consumers (avibe SSE).
