@@ -1204,6 +1204,7 @@ class ConsolidatedMessageDispatcher:
         is_error: bool = False,
         level: str = "normal",
         status_label: Optional[str] = None,
+        result_footer: Optional[str] = None,
     ) -> Optional[str]:
         """Centralized dispatch for agent messages.
 
@@ -1235,6 +1236,11 @@ class ConsolidatedMessageDispatcher:
         process path (assistant/toolcall). The persisted row and the verbose
         append path keep using the original ``text`` unchanged; when it is empty
         the bubble falls back to ``to_status_label(text)`` as before.
+
+        ``result_footer`` is an optional de-emphasized one-line footnote for a
+        terminal ``result`` (the show_duration duration + token usage). It rides
+        as the platform subtext footer and, in concise mode, supersedes the status
+        bubble's own terminal footer so the outcome line stays consistent.
         """
         settings_manager = self.controller.get_settings_manager_for_context(context)
         im_client = self._get_im_client(context)
@@ -1404,6 +1410,13 @@ class ConsolidatedMessageDispatcher:
                     _, done_footer = self._compose_status_message(
                         context, status_consolidated_key, done=True, reason=terminal_reason, result_body=display_text
                     )
+                # A caller-supplied ``result_footer`` (the show_duration duration +
+                # token footnote) takes precedence: it renders in EVERY delivery
+                # mode as the de-emphasized subtext footer, and in concise mode it
+                # supersedes the bubble's own ``✅ done · …`` line so the terminal
+                # footer stays consistent (grey, one line, no head text).
+                if result_footer:
+                    done_footer = result_footer
                 # Pass subtext to RAW send_message calls only when set, so an adapter
                 # whose send_message predates the subtext kwarg is never handed it
                 # (the helper paths apply the same guard internally).

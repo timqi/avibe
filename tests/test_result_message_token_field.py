@@ -8,77 +8,55 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from modules.im.formatters.slack_formatter import SlackFormatter
 
 
-def test_result_message_uses_status_emoji_and_token_field() -> None:
+def test_result_footer_uses_status_emoji_time_and_token_glyphs() -> None:
     formatter = SlackFormatter()
 
-    rendered = formatter.format_result_message(
+    footer = formatter.format_result_footer(
         "success",
         duration_ms=144_000,
-        result=None,
-        show_duration=True,
         token_field="240k tok",
     )
 
-    assert rendered == "✅ ⏱️ 2m 24s · 🪙 240k tok"
+    assert footer == "✅ ⏱️ 2m 24s · 🪙 240k tok"
 
 
-def test_result_message_omits_token_field_when_empty() -> None:
+def test_result_footer_omits_token_field_when_empty() -> None:
     formatter = SlackFormatter()
 
-    rendered = formatter.format_result_message(
-        "success",
-        duration_ms=5_000,
-        result=None,
-        show_duration=True,
-        token_field="",
-    )
+    footer = formatter.format_result_footer("success", duration_ms=5_000, token_field="")
 
-    assert rendered == "✅ ⏱️ 5s"
+    assert footer == "✅ ⏱️ 5s"
 
 
-def test_result_message_shows_token_field_without_duration() -> None:
+def test_result_footer_shows_token_without_duration() -> None:
     formatter = SlackFormatter()
 
-    rendered = formatter.format_result_message(
-        "success",
-        duration_ms=0,
-        result=None,
-        show_duration=True,
-        token_field="12.3k tok",
-    )
+    footer = formatter.format_result_footer("success", duration_ms=0, token_field="12.3k tok")
 
-    assert rendered == "✅ 🪙 12.3k tok"
+    assert footer == "✅ 🪙 12.3k tok"
 
 
-def test_result_message_bare_marker_when_nothing_else() -> None:
+def test_result_footer_bare_marker_when_nothing_else() -> None:
     formatter = SlackFormatter()
 
-    rendered = formatter.format_result_message(
-        "success",
-        duration_ms=0,
-        result=None,
-        show_duration=False,
-        token_field="",
+    footer = formatter.format_result_footer(
+        "success", duration_ms=0, token_field="", show_duration=False
     )
 
-    assert rendered == "✅"
+    assert footer == "✅"
 
 
-def test_result_message_error_and_warning_markers() -> None:
+def test_result_footer_error_and_warning_markers() -> None:
     formatter = SlackFormatter()
 
-    error = formatter.format_result_message(
-        "error_max_turns", duration_ms=5_000, show_duration=True
-    )
-    warning = formatter.format_result_message(
-        "warning", duration_ms=5_000, show_duration=True
-    )
+    error = formatter.format_result_footer("error_max_turns", duration_ms=5_000)
+    warning = formatter.format_result_footer("warning", duration_ms=5_000)
 
     assert error == "❌ ⏱️ 5s"
     assert warning == "⚠️ ⏱️ 5s"
 
 
-def test_result_message_token_field_precedes_result_body() -> None:
+def test_result_message_keeps_footer_above_body_for_legacy_path() -> None:
     formatter = SlackFormatter()
 
     rendered = formatter.format_result_message(

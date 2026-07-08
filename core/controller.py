@@ -1262,6 +1262,7 @@ class Controller:
         is_error: bool = False,
         level: str = "normal",
         status_label: Optional[str] = None,
+        result_footer: Optional[str] = None,
     ):
         """Backward-compatible entrypoint; delegated to message dispatcher."""
         return await self.message_dispatcher.emit_agent_message(
@@ -1272,6 +1273,7 @@ class Controller:
             is_error=is_error,
             level=level,
             status_label=status_label,
+            result_footer=result_footer,
         )
 
     def note_session_tokens(self, context: MessageContext, *, total: int) -> None:

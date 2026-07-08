@@ -392,19 +392,19 @@ class BaseMarkdownFormatter(ABC):
         parts = [header] + escaped_parts
         return "\n\n".join(parts)
 
-    def format_result_message(
+    def format_result_footer(
         self,
         subtype: str,
         duration_ms: int,
-        result: Optional[str] = None,
-        show_duration: bool = True,
         token_field: str = "",
+        show_duration: bool = True,
     ) -> str:
-        """Format result message.
+        """Build the compact one-line result footnote (no answer body).
 
-        The outcome word (``Success``/``Done``/…) is replaced by a compact status
-        emoji, and the duration/token fields keep their own glyphs (⏱️ time, 🪙
-        tokens) so the footer reads like the concise status bubble:
+        The outcome word (``Success``/``Done``/…) is a compact status emoji, and
+        the duration/token fields keep their own glyphs (⏱️ time, 🪙 tokens) so it
+        reads like the concise status footer. Meant to ride as a de-emphasized
+        grey subtext footer, not as a prominent head line.
 
         Format: ✅ ⏱️ 2m 24s · 🪙 240k tok  (success, duration + tokens known)
                 ✅ ⏱️ 2m 24s               (success, no tokens)
@@ -439,14 +439,31 @@ class BaseMarkdownFormatter(ABC):
         if token_field:
             segments.append(f"🪙 {token_field}")
 
-        result_text = marker
+        footer = marker
         if segments:
-            result_text += " " + " · ".join(segments)
+            footer += " " + " · ".join(segments)
+        return footer
 
+    def format_result_message(
+        self,
+        subtype: str,
+        duration_ms: int,
+        result: Optional[str] = None,
+        show_duration: bool = True,
+        token_field: str = "",
+    ) -> str:
+        """Result footnote plus (optionally) the answer body below it.
+
+        Retained for the legacy Claude SDK formatting path; the primary result
+        flow now delivers the footnote via :meth:`format_result_footer` as a
+        de-emphasized subtext footer instead of a head line.
+        """
+        footer = self.format_result_footer(
+            subtype, duration_ms, token_field=token_field, show_duration=show_duration
+        )
         if result:
-            result_text += f"\n\n{result}"
-
-        return result_text
+            return f"{footer}\n\n{result}"
+        return footer
 
     def format_tool_result(self, is_error: bool, content: Optional[str] = None) -> str:
         """Format tool result block"""
