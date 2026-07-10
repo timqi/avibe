@@ -1,11 +1,13 @@
 """Settings and configuration handlers"""
 
+import asyncio
 import logging
 from typing import Optional
 
 from modules.agents import get_agent_display_name
 from modules.im import MessageContext, InlineKeyboard, InlineButton
 from core.modals import RoutingModalData, RoutingModalSelection
+from vibe import backend_model_catalog
 
 from .base import BaseHandler
 
@@ -446,6 +448,7 @@ class SettingsHandler(BaseHandler):
         claude_models = []
         codex_agents = []
         codex_models = []
+        backend_reasoning_options = {}
 
         if "opencode" in backends_to_load:
             try:
@@ -469,9 +472,12 @@ class SettingsHandler(BaseHandler):
                 agents_result = get_claude_agents(cwd)
                 if agents_result.get("ok"):
                     claude_agents = agents_result.get("agents", [])
-                models_result = get_claude_models()
+                models_result = await asyncio.to_thread(get_claude_models)
                 if models_result.get("ok"):
                     claude_models = models_result.get("models", [])
+                    reasoning_options = models_result.get("reasoning_options")
+                    if isinstance(reasoning_options, dict):
+                        backend_reasoning_options["claude"] = reasoning_options
             except Exception as e:
                 logger.warning(f"Failed to fetch Claude data: {e}")
 
@@ -479,9 +485,12 @@ class SettingsHandler(BaseHandler):
             try:
                 from vibe.api import codex_agents as get_codex_agents, codex_models as get_codex_models
 
-                models_result = get_codex_models()
+                models_result = await asyncio.to_thread(get_codex_models)
                 if models_result.get("ok"):
                     codex_models = models_result.get("models", [])
+                    reasoning_options = models_result.get("reasoning_options")
+                    if isinstance(reasoning_options, dict):
+                        backend_reasoning_options["codex"] = reasoning_options
                 cwd = self.controller.get_cwd(context)
                 agents_result = get_codex_agents(cwd)
                 if agents_result.get("ok"):
@@ -500,6 +509,7 @@ class SettingsHandler(BaseHandler):
             claude_models=claude_models,
             codex_agents=codex_agents,
             codex_models=codex_models,
+            backend_reasoning_options=backend_reasoning_options,
         )
 
     def _is_backend_enabled(self, backend: str) -> bool:
@@ -783,6 +793,7 @@ class SettingsHandler(BaseHandler):
                     claude_models=routing_data.claude_models,
                     codex_agents=routing_data.codex_agents,
                     codex_models=routing_data.codex_models,
+                    backend_reasoning_options=routing_data.backend_reasoning_options,
                     selected_backend=visible_selected_backend,
                     selected_opencode_agent=selection.selected_opencode_agent,
                     selected_opencode_model=selection.selected_opencode_model,
@@ -833,6 +844,7 @@ class SettingsHandler(BaseHandler):
             normalized_claude_reasoning_effort = normalize_claude_reasoning_effort(
                 claude_model,
                 claude_reasoning_effort,
+                backend_model_catalog.catalog_reasoning_efforts_for_model("claude", claude_model),
             )
             if backend == "codex" and codex_agent is _UNSET:
                 resolved_codex_agent = existing_routing.codex_agent if existing_routing else None
