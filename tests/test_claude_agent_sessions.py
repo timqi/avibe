@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from modules.agents.base import BaseAgent
 from modules.agents.claude_agent import ClaudeAgent
 from modules.agents.service import AgentService
+from modules.claude_sdk_compat import TextBlock
 
 
 class _StubSessions:
@@ -1361,6 +1362,135 @@ class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(getattr(runtime_client, "_vibe_native_session_id"), "session-sdk")
         self.assertEqual(agent._native_session_ids[composite_key], "session-sdk")
         controller.emit_agent_message.assert_not_awaited()
+
+    async def test_receive_legacy_refusal_fallback_notifies_without_dropping_replacement_text(self):
+        controller = _StubController()
+        controller._get_session_key = lambda _context: "avibe::project::p1"
+        controller.im_client.formatter = SimpleNamespace(
+            escape_special_chars=lambda text: text,
+            format_assistant_message=lambda parts: "\n\n".join(parts),
+        )
+        controller.session_handler = SimpleNamespace(
+            capture_session_id=lambda *_args, **_kwargs: None,
+            mark_session_idle=lambda _key: None,
+            _t=lambda key, **kwargs: (
+                (
+                    "Claude's safety checks triggered for this request. "
+                    f"It switched from {kwargs['originalModel']} to {kwargs['fallbackModel']} and retried. "
+                    f"This session will continue on {kwargs['fallbackModel']}."
+                )
+                if key == "status.claudeRefusalFallback"
+                else key
+            ),
+        )
+        agent = ClaudeAgent(controller)
+        agent.emit_result_message = AsyncMock()
+        context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform_specific={
+                "turn_token": "stale-turn",
+                "agent_runtime_turn_token": "stale-runtime",
+            },
+        )
+        pending_context = SimpleNamespace(
+            platform_specific={
+                "turn_token": "current-turn",
+                "agent_runtime_turn_key": "session-1:/tmp/work",
+                "agent_runtime_turn_token": "current-runtime",
+            }
+        )
+        pending_request = SimpleNamespace(context=pending_context)
+        composite_key = "session-1:/tmp/work"
+        agent._pending_requests[composite_key] = [pending_request]
+
+        emitted = []
+
+        async def _emit(message_context, message_type, text, **kwargs):
+            emitted.append(
+                (
+                    message_type,
+                    text,
+                    kwargs,
+                    dict(message_context.platform_specific),
+                )
+            )
+
+        controller.emit_agent_message = AsyncMock(side_effect=_emit)
+        replacement_block = TextBlock.__new__(TextBlock)
+        replacement_block.text = "replacement answer"
+        replacement_message = type(
+            "AssistantMessage",
+            (),
+            {
+                "content": [replacement_block],
+                "model": "claude-opus-4-8",
+                "usage": None,
+                "error": None,
+            },
+        )()
+        fallback_message = type(
+            "ModelRefusalFallbackMessage",
+            (),
+            {
+                "subtype": "model_refusal_fallback",
+                "data": {
+                    "trigger": "refusal",
+                    "originalModel": "claude-fable-5[1m]",
+                    "fallbackModel": "claude-opus-4-8",
+                },
+            },
+        )()
+        result_message = type(
+            "ResultMessage",
+            (),
+            {"subtype": "success", "result": None, "duration_ms": 1},
+        )()
+
+        class _Client:
+            def receive_messages(self):
+                async def _iterate():
+                    yield replacement_message
+                    yield fallback_message
+                    yield result_message
+
+                return _iterate()
+
+        await agent._receive_messages(
+            _Client(),
+            "session-1",
+            "/tmp/work",
+            context,
+            composite_key=composite_key,
+        )
+
+        self.assertEqual(
+            emitted,
+            [
+                (
+                    "notify",
+                    "Claude's safety checks triggered for this request. It switched from claude-fable-5[1m] "
+                    "to claude-opus-4-8 and retried. This session will continue on "
+                    "claude-opus-4-8.",
+                    {"parse_mode": "markdown"},
+                    {
+                        "turn_token": "current-turn",
+                        "agent_runtime_turn_key": composite_key,
+                        "agent_runtime_turn_token": "current-runtime",
+                    },
+                )
+            ],
+        )
+        self.assertNotIn(composite_key, agent._pending_assistant_message)
+        self.assertNotIn(composite_key, agent._last_assistant_text)
+        agent.emit_result_message.assert_awaited_once_with(
+            context,
+            "replacement answer",
+            subtype="success",
+            duration_ms=1,
+            parse_mode="markdown",
+            request=pending_request,
+        )
 
     async def test_init_message_binds_native_session_to_existing_agent_session(self):
         controller = _StubController()
