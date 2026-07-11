@@ -312,6 +312,7 @@ class MessageDispatcherResultFallbackTests(unittest.IsolatedAsyncioTestCase):
             "already delivered",
             None,
             is_error=False,
+            terminal_error=None,
             output_semantics=output,
         )
         dispatcher._collapse_status_bubble.assert_awaited_once()

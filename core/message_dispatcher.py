@@ -983,6 +983,7 @@ class ConsolidatedMessageDispatcher:
         text: str,
         message_id: str | None,
         terminal_status: str | None,
+        terminal_error: str | None,
         output_semantics: MessageOutput,
         provenance: dict[str, Any],
     ) -> None:
@@ -1006,23 +1007,33 @@ class ConsolidatedMessageDispatcher:
                 if not output_id:
                     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
                     output_id = f"content:{digest}"
+                record_kwargs = {
+                    "output_id": output_id,
+                    "text": text,
+                    "message_id": message_id,
+                    "sequence": output_semantics.sequence,
+                    "provenance": provenance,
+                    "terminal_status": run_terminal_status,
+                }
+                if terminal_error is not None:
+                    record_kwargs["error"] = terminal_error
                 record_output(
                     run_id,
-                    output_id=output_id,
-                    text=text,
-                    message_id=message_id,
-                    sequence=output_semantics.sequence,
-                    provenance=provenance,
-                    terminal_status=run_terminal_status,
+                    **record_kwargs,
                 )
             else:
                 # Compatibility for isolated stores and older persisted-state
                 # adapters while the shared SQLite path owns the output ledger.
+                record_kwargs = {
+                    "text": text,
+                    "message_id": message_id,
+                    "terminal_status": run_terminal_status,
+                }
+                if terminal_error is not None:
+                    record_kwargs["error"] = terminal_error
                 store.record_run_message(
                     run_id,
-                    text=text,
-                    message_id=message_id,
-                    terminal_status=run_terminal_status,
+                    **record_kwargs,
                 )
 
     def _run_has_blocking_activity(self, run_id: str) -> bool:
@@ -1061,6 +1072,7 @@ class ConsolidatedMessageDispatcher:
         message_id: str | None,
         *,
         is_error: bool,
+        terminal_error: str | None = None,
         output_semantics: MessageOutput | None = None,
         log_label: str = "agent run terminal result",
     ) -> None:
@@ -1093,6 +1105,7 @@ class ConsolidatedMessageDispatcher:
                 text=text,
                 message_id=message_id,
                 terminal_status=terminal_status,
+                terminal_error=terminal_error,
                 output_semantics=semantics,
                 provenance=semantics.provenance(context),
             )
@@ -1115,6 +1128,7 @@ class ConsolidatedMessageDispatcher:
         message_id: str | None,
         *,
         is_error: bool,
+        terminal_error: str | None = None,
         output_semantics: MessageOutput | None = None,
     ) -> None:
         self._record_agent_run_terminal_result(
@@ -1122,6 +1136,7 @@ class ConsolidatedMessageDispatcher:
             text,
             message_id,
             is_error=is_error,
+            terminal_error=terminal_error,
             output_semantics=output_semantics,
             log_label="suppressed agent run terminal result",
         )
@@ -1313,6 +1328,7 @@ class ConsolidatedMessageDispatcher:
         status_label: Optional[str] = None,
         result_footer: Optional[str] = None,
         output: MessageOutput | None = None,
+        terminal_error: Optional[str] = None,
     ) -> Optional[str]:
         """Centralized dispatch for agent messages.
 
@@ -1411,6 +1427,7 @@ class ConsolidatedMessageDispatcher:
                         text,
                         None,
                         is_error=is_error,
+                        terminal_error=terminal_error,
                         output_semantics=output_semantics,
                     )
                 if mutates_turn_lifecycle:
@@ -1462,6 +1479,7 @@ class ConsolidatedMessageDispatcher:
                         duplicate_result_text,
                         None,
                         is_error=is_error,
+                        terminal_error=terminal_error,
                         output_semantics=output_semantics,
                     )
                 if mutates_turn_lifecycle:
@@ -1534,7 +1552,13 @@ class ConsolidatedMessageDispatcher:
                 # Record only once delivered (avibe always, via SSE) so a failed
                 # IM send isn't stored as if the user received it.
                 if persists_without_delivery or message_id is not None:
-                    persist_agent_message(target_context, "notify", text)
+                    persist_agent_message(
+                        target_context,
+                        "notify",
+                        text,
+                        metadata=output_metadata,
+                        native_message_id=native_output_id,
+                    )
                 # Live SSE turn stream for the web Chat page (no-op for IM/CLI).
                 await _stream_chunk(self.controller, context, text=text, message_id=message_id, kind="notify")
                 return message_id
@@ -1781,6 +1805,7 @@ class ConsolidatedMessageDispatcher:
                         persisted_result_text,
                         primary_message_id,
                         is_error=is_error,
+                        terminal_error=terminal_error,
                         output_semantics=output_semantics,
                     )
 
@@ -1836,6 +1861,7 @@ class ConsolidatedMessageDispatcher:
                         persisted_result_text,
                         primary_message_id,
                         is_error=is_error,
+                        terminal_error=terminal_error,
                         output_semantics=output_semantics,
                     )
 

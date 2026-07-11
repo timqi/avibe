@@ -1199,6 +1199,7 @@ class SQLiteBackgroundTaskStore:
         text: str,
         message_id: str | None = None,
         terminal_status: Optional[str] = None,
+        error: Optional[str] = None,
         updated_at: Optional[str] = None,
     ) -> None:
         now = updated_at or _utc_now_iso()
@@ -1224,6 +1225,8 @@ class SQLiteBackgroundTaskStore:
             if terminal_status:
                 values["status"] = normalize_run_status(terminal_status)
                 values["completed_at"] = now
+                if error is not None:
+                    values["error"] = str(error)
             result = conn.execute(
                 update(agent_runs)
                 .where(agent_runs.c.id == run_id)
@@ -1245,6 +1248,7 @@ class SQLiteBackgroundTaskStore:
         sequence: int | None = None,
         provenance: Optional[dict[str, Any]] = None,
         terminal_status: Optional[str] = None,
+        error: Optional[str] = None,
         updated_at: Optional[str] = None,
     ) -> dict[str, Any]:
         """Append one idempotent Run output and optionally settle the Run once."""
@@ -1325,6 +1329,13 @@ class SQLiteBackgroundTaskStore:
                     .values(**values)
                 )
             if effective_terminal_status:
+                terminal_values: dict[str, Any] = {
+                    "status": normalize_run_status(effective_terminal_status),
+                    "completed_at": now,
+                    "updated_at": now,
+                }
+                if error is not None:
+                    terminal_values["error"] = str(error)
                 transition = conn.execute(
                     update(agent_runs)
                     .where(agent_runs.c.id == run_id)
@@ -1334,11 +1345,7 @@ class SQLiteBackgroundTaskStore:
                             + _status_query_values("running")
                         )
                     )
-                    .values(
-                        status=normalize_run_status(effective_terminal_status),
-                        completed_at=now,
-                        updated_at=now,
-                    )
+                    .values(**terminal_values)
                 )
                 terminal_transition = bool(transition.rowcount)
 

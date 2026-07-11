@@ -11,6 +11,7 @@ import { useRegisterComposerTarget, type ComposerInsertTarget } from '../../cont
 import type { SessionRuntimeState, VaultRequest, VibeAgentBrief, WorkbenchMessage, WorkbenchSession } from '../../context/ApiContext';
 import { apiFetch } from '../../lib/apiFetch';
 import { normalizeChatMessageFontSize } from '../../lib/chatDisplay';
+import { isNotifyMessageType } from '../../lib/chatMessageTypes';
 import { useIosKeyboardInset } from '../../lib/useIosKeyboardInset';
 import { isProxyMediaUrl } from '../../lib/mediaProxy';
 import { localPath, type ShowPageLinkInfo } from '../../lib/showPageLinks';
@@ -2432,9 +2433,9 @@ const MessageRow = memo(function MessageRow({ message, session, messageFontSize,
   // Each branch composes this onto its own ``justify-*`` so alignment is kept.
   const rowClass = (extra: string) => clsx('flex w-full', extra, highlighted && 'msg-highlight');
 
-  // A notify row is a turn-terminal marker (agent run that failed/stopped
-  // without a result) — a compact status pill, not an answer.
-  const isNotify = message.type === 'notify';
+  // Runtime notifications and legacy error rows are compact status pills,
+  // not Agent-authored answers.
+  const isNotify = isNotifyMessageType(message.type);
   const isAgent = !isNotify && message.author === 'agent';
   const isSystem = !isNotify && message.author === 'system';
   // A harness-origin row is a user-role prompt the human didn't type (scheduled
