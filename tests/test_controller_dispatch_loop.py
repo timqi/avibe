@@ -12,6 +12,7 @@ from core.controller import Controller
 from core.git_binary import ResolvedGit
 from core.inbox_events import InboxEventBus
 from core.message_output import MessageOutput
+from core.session_turns import SessionTurnManager
 from core.show_git import ShowGitCheckpointService
 from modules.im import MessageContext
 
@@ -261,6 +262,7 @@ def test_im_show_checkpoint_lifecycle_spans_real_start_to_terminal_result(monkey
     checkpoint_bus = InboxEventBus()
     checkpoint_service.start(checkpoint_bus)
     controller.show_git_checkpoint_service = checkpoint_service
+    controller.session_turns = SessionTurnManager(controller)
     monkeypatch.setattr(
         "core.message_mirror.link_inbound_message_session",
         lambda **kwargs: linked_messages.append(kwargs),
@@ -272,7 +274,6 @@ def test_im_show_checkpoint_lifecycle_spans_real_start_to_terminal_result(monkey
         message_id="msg-1",
         platform_specific={},
     )
-    checkpoint_service.mark_im_turn(context)
     context.platform_specific["turn_base_session_id"] = "anchor"
     lifecycle = []
     subscription_id = checkpoint_bus.subscribe_callback(
@@ -281,6 +282,7 @@ def test_im_show_checkpoint_lifecycle_spans_real_start_to_terminal_result(monkey
         else None
     )
     try:
+        controller.session_turns.on_running(context)
         controller.update_thread_message_id(context)
         detached_result = asyncio.run(
             controller.emit_agent_message(
@@ -292,7 +294,11 @@ def test_im_show_checkpoint_lifecycle_spans_real_start_to_terminal_result(monkey
         )
         assert lifecycle == [("turn.start", {"session_id": "ses_im"})]
         first_result = asyncio.run(controller.emit_agent_message(context, "result", "done"))
+        controller.session_turns.on_terminal_result(context, is_error=False)
+        controller.session_turns.on_terminal_delivery_complete(context)
         second_result = asyncio.run(controller.emit_agent_message(context, "result", "duplicate"))
+        controller.session_turns.on_terminal_result(context, is_error=False)
+        controller.session_turns.on_terminal_delivery_complete(context)
     finally:
         checkpoint_bus.unsubscribe(subscription_id)
         checkpoint_service.stop()
@@ -337,6 +343,7 @@ def test_first_im_show_turn_adopts_on_terminal_after_backend_binds_session(monke
     checkpoint_bus = InboxEventBus()
     checkpoint_service.start(checkpoint_bus)
     controller.show_git_checkpoint_service = checkpoint_service
+    controller.session_turns = SessionTurnManager(controller)
     monkeypatch.setattr(
         "core.message_mirror.link_inbound_message_session",
         lambda **kwargs: linked_messages.append(kwargs),
@@ -348,7 +355,6 @@ def test_first_im_show_turn_adopts_on_terminal_after_backend_binds_session(monke
         message_id="msg-new",
         platform_specific={},
     )
-    checkpoint_service.mark_im_turn(context)
     context.platform_specific["turn_base_session_id"] = "new-anchor"
     lifecycle = []
     subscription_id = checkpoint_bus.subscribe_callback(
@@ -357,10 +363,13 @@ def test_first_im_show_turn_adopts_on_terminal_after_backend_binds_session(monke
         else None
     )
     try:
+        controller.session_turns.on_running(context)
         controller.update_thread_message_id(context)
         assert lifecycle == []
         context.platform_specific["agent_session_id"] = "ses_new_im"
         asyncio.run(controller.emit_agent_message(context, "result", "done"))
+        controller.session_turns.on_terminal_result(context, is_error=False)
+        controller.session_turns.on_terminal_delivery_complete(context)
     finally:
         checkpoint_bus.unsubscribe(subscription_id)
         checkpoint_service.stop()
@@ -373,3 +382,40 @@ def test_first_im_show_turn_adopts_on_terminal_after_backend_binds_session(monke
             "session_id": "ses_new_im",
         }
     ]
+
+
+def test_terminal_checkpoint_runs_after_dispatcher_delivery() -> None:
+    controller = Controller.__new__(Controller)
+    order = []
+
+    class _CheckpointService:
+        @staticmethod
+        def begin_turn(_controller, _context) -> None:
+            order.append("checkpoint-start")
+
+        @staticmethod
+        def end_turn(_context) -> None:
+            order.append("checkpoint-end")
+
+    class _Dispatcher:
+        async def emit_agent_message(self, **kwargs):
+            controller.session_turns.on_terminal_result(kwargs["context"], is_error=False)
+            order.append("delivered")
+            return "result-1"
+
+    controller.show_git_checkpoint_service = _CheckpointService()
+    controller.message_dispatcher = _Dispatcher()
+    controller.set_agent_status = lambda _session_id, _status: None
+    controller.session_turns = SessionTurnManager(controller)
+    context = MessageContext(
+        user_id="U",
+        channel_id="C",
+        platform="slack",
+        platform_specific={"agent_session_id": "ses_delivery_order"},
+    )
+
+    controller.session_turns.on_running(context)
+    result = asyncio.run(controller.emit_agent_message(context, "result", "done"))
+
+    assert result == "result-1"
+    assert order == ["checkpoint-start", "delivered", "checkpoint-end"]

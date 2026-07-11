@@ -684,10 +684,6 @@ class Controller:
         from core.services.dispatch import dispatch_turn
 
         async def _on_im_message(context, text):
-            checkpoint_service = getattr(self, "show_git_checkpoint_service", None)
-            mark_im_turn = getattr(checkpoint_service, "mark_im_turn", None)
-            if callable(mark_im_turn):
-                mark_im_turn(context)
             await dispatch_turn(self, context, text)
 
         # Register callbacks with the IM client
@@ -1118,10 +1114,6 @@ class Controller:
 
     def update_thread_message_id(self, context: MessageContext) -> None:
         """Run real-turn-start hooks after the runtime gate is acquired."""
-        checkpoint_service = getattr(self, "show_git_checkpoint_service", None)
-        begin_im_turn = getattr(checkpoint_service, "begin_im_turn", None)
-        if callable(begin_im_turn):
-            begin_im_turn(self, context)
         self.message_dispatcher.update_thread_message_id(context)
 
     async def clear_consolidated_message_id(
@@ -1283,13 +1275,6 @@ class Controller:
         output: MessageOutput | None = None,
     ):
         """Backward-compatible entrypoint; delegated to message dispatcher."""
-        checkpoint_service = getattr(self, "show_git_checkpoint_service", None)
-        should_end_im_turn = getattr(checkpoint_service, "should_end_im_turn", None)
-        publish_checkpoint_end = bool(
-            should_end_im_turn(self, context, message_type, output=output)
-            if callable(should_end_im_turn)
-            else False
-        )
         try:
             return await self.message_dispatcher.emit_agent_message(
                 context=context,
@@ -1303,8 +1288,10 @@ class Controller:
                 output=output,
             )
         finally:
-            if publish_checkpoint_end:
-                checkpoint_service.end_im_turn(context)
+            manager = getattr(self, "session_turns", None)
+            complete = getattr(manager, "on_terminal_delivery_complete", None)
+            if callable(complete):
+                complete(context)
 
     def note_session_tokens(self, context: MessageContext, *, total: int) -> None:
         """Report the session's current context-window occupancy for the status
