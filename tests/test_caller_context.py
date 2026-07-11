@@ -34,7 +34,9 @@ def test_caller_context_from_env_round_trips_metadata_and_env() -> None:
         "backend": "codex",
         "native_session_id": "thread789",
     }
-    assert context.to_env()[AVIBE_SESSION_ID_ENV] == "ses123"
+    caller_env = context.to_env()
+    assert caller_env[AVIBE_SESSION_ID_ENV] == "ses123"
+    assert "PATH" not in caller_env
 
 
 def test_caller_context_from_platform_payload_prefers_agent_session_target() -> None:
