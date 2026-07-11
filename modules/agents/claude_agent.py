@@ -5,7 +5,7 @@ import uuid
 from typing import Callable, Optional
 
 from core.agent_auth_service import classify_auth_error
-from core.backend_failure import emit_backend_failure
+from core.backend_failure import backend_failure_notification_output, emit_backend_failure
 from core.message_output import MessageOutput, terminal_output_for, terminal_turn_output
 from core.reply_enhancer import strip_silent_blocks
 from core.session_activities import SessionActivity, activity_completion_output
@@ -190,7 +190,19 @@ class ClaudeAgent(BaseAgent):
                     try:
                         from core.message_mirror import persist_agent_message
 
-                        persist_agent_message(context, "notify", error_notify)
+                        notification = backend_failure_notification_output(
+                            context,
+                            "claude",
+                            request=request,
+                            output=terminal_output_for(request),
+                        )
+                        persist_agent_message(
+                            context,
+                            "notify",
+                            error_notify,
+                            metadata=notification.metadata,
+                            native_message_id=notification.idempotency_key,
+                        )
                     except Exception:
                         logger.debug("claude: failed to persist terminal error row", exc_info=True)
                     # No async receiver result is coming. Auth recovery settles its
@@ -1019,7 +1031,19 @@ class ClaudeAgent(BaseAgent):
                 try:
                     from core.message_mirror import persist_agent_message
 
-                    persist_agent_message(context, "notify", error_notify)
+                    notification = backend_failure_notification_output(
+                        context,
+                        "claude",
+                        request=pending_request,
+                        output=terminal_output_for(pending_request),
+                    )
+                    persist_agent_message(
+                        context,
+                        "notify",
+                        error_notify,
+                        metadata=notification.metadata,
+                        native_message_id=notification.idempotency_key,
+                    )
                 except Exception:
                     logger.debug("claude: failed to persist terminal receiver-error row", exc_info=True)
                 # A dead receiver is terminal. The HANDLED (auth) branch already

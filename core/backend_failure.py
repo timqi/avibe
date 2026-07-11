@@ -57,6 +57,39 @@ def _failure_identity(
     return uuid.uuid4().hex
 
 
+def backend_failure_notification_output(
+    context: Any,
+    backend: str,
+    *,
+    request: Any = None,
+    output: MessageOutput | None = None,
+    failure_id: str | None = None,
+) -> MessageOutput:
+    """Build the durable, non-settling visible half of a backend failure."""
+
+    backend_name = str(backend or "backend").strip() or "backend"
+    terminal = _terminal_output(request, output)
+    identity = _failure_identity(context, request, failure_id)
+    metadata = dict(terminal.metadata)
+    metadata.update(
+        {
+            "backend": backend_name,
+            "event": BACKEND_FAILURE_EVENT,
+            "failure_id": identity,
+        }
+    )
+    return MessageOutput(
+        completes_turn=False,
+        completes_run=False,
+        detached=terminal.detached,
+        idempotency_key=f"backend-failure:{identity}",
+        activity_id=terminal.activity_id,
+        causation_id=terminal.causation_id,
+        run_id=terminal.run_id,
+        metadata=metadata,
+    )
+
+
 async def emit_backend_failure(
     controller: Any,
     context: Any,
@@ -80,24 +113,12 @@ async def emit_backend_failure(
     error = str(diagnostic or "").strip() or f"{backend_name} backend failed"
     visible = str(display_text or "").strip() or error
     terminal = _terminal_output(request, output)
-    identity = _failure_identity(context, request, failure_id)
-    notify_metadata = dict(terminal.metadata)
-    notify_metadata.update(
-        {
-            "backend": backend_name,
-            "event": BACKEND_FAILURE_EVENT,
-            "failure_id": identity,
-        }
-    )
-    notification = MessageOutput(
-        completes_turn=False,
-        completes_run=False,
-        detached=terminal.detached,
-        idempotency_key=f"backend-failure:{identity}",
-        activity_id=terminal.activity_id,
-        causation_id=terminal.causation_id,
-        run_id=terminal.run_id,
-        metadata=notify_metadata,
+    notification = backend_failure_notification_output(
+        context,
+        backend_name,
+        request=request,
+        output=terminal,
+        failure_id=failure_id,
     )
 
     async def settle_terminal_failure() -> None:

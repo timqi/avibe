@@ -119,6 +119,14 @@ class BackendFailureTests(unittest.IsolatedAsyncioTestCase):
             "backend-failure:turn-1",
         )
         self.assertEqual(
+            notify_call.kwargs["output"].metadata,
+            {
+                "backend": "codex",
+                "event": "backend_failure",
+                "failure_id": "turn-1",
+            },
+        )
+        self.assertEqual(
             terminal_call,
             call(
                 request.context,

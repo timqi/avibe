@@ -836,12 +836,21 @@ class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         agent._pending_requests[runtime_key] = [queued_request]
         agent._pending_reactions[runtime_key] = [("m2", ":eyes:")]
 
-        await agent.handle_message(request)
+        with patch("core.message_mirror.persist_agent_message") as persist:
+            await agent.handle_message(request)
 
         self.assertEqual(mark_idle_calls, [])
         self.assertEqual(agent._pending_requests[runtime_key], [queued_request])
         self.assertEqual(agent._pending_reactions[runtime_key], [("m2", ":eyes:")])
         agent._remove_ack_reaction.assert_awaited_once_with(request)
+        persist.assert_called_once()
+        self.assertEqual(persist.call_args.args[1:], ("notify", "❌ Claude error: boom"))
+        self.assertEqual(persist.call_args.kwargs["metadata"]["backend"], "claude")
+        self.assertEqual(persist.call_args.kwargs["metadata"]["event"], "backend_failure")
+        self.assertTrue(persist.call_args.kwargs["metadata"]["failure_id"])
+        self.assertTrue(
+            persist.call_args.kwargs["native_message_id"].startswith("backend-failure:")
+        )
 
     async def test_clear_sessions_cancels_receiver_tasks_for_cleared_session(self):
         controller = _StubController()
@@ -1249,6 +1258,12 @@ class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         persist.assert_called_once()
         self.assertEqual(persist.call_args.args[1], "notify")
         self.assertEqual(persist.call_args.args[2], "❌ Claude error: Connection lost")
+        self.assertEqual(persist.call_args.kwargs["metadata"]["backend"], "claude")
+        self.assertEqual(persist.call_args.kwargs["metadata"]["event"], "backend_failure")
+        self.assertTrue(persist.call_args.kwargs["metadata"]["failure_id"])
+        self.assertTrue(
+            persist.call_args.kwargs["native_message_id"].startswith("backend-failure:")
+        )
 
     async def test_receiver_buffer_error_persists_connection_lost_notify(self):
         controller = _StubController()
@@ -1296,10 +1311,20 @@ class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
             output=ANY,
             terminal_error=terminal_error,
         )
-        persist.assert_called_once_with(
-            context,
-            "notify",
-            "❌ Connection to Claude was lost. Please try your message again.",
+        persist.assert_called_once()
+        self.assertEqual(
+            persist.call_args.args,
+            (
+                context,
+                "notify",
+                "❌ Connection to Claude was lost. Please try your message again.",
+            ),
+        )
+        self.assertEqual(persist.call_args.kwargs["metadata"]["backend"], "claude")
+        self.assertEqual(persist.call_args.kwargs["metadata"]["event"], "backend_failure")
+        self.assertTrue(persist.call_args.kwargs["metadata"]["failure_id"])
+        self.assertTrue(
+            persist.call_args.kwargs["native_message_id"].startswith("backend-failure:")
         )
 
     async def test_result_auth_error_prefers_oauth_recovery_message(self):
