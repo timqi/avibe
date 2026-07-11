@@ -1086,6 +1086,27 @@ class CodexAgentHandleMessageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CodexAgentPayloadTests(unittest.IsolatedAsyncioTestCase):
+    def test_inject_caller_env_config_adds_vendored_git_for_gitless_session(self):
+        agent = object.__new__(CodexAgent)
+        params = {"config": {"shell_environment_policy": {"set": {"PATH": ""}}}}
+        request = SimpleNamespace(
+            working_path="/tmp/workspace",
+            context=SimpleNamespace(platform_specific={}),
+        )
+
+        def inject_git(env, *, base_env, working_dir):
+            self.assertEqual(env["PATH"], "")
+            self.assertIs(base_env, os.environ)
+            self.assertEqual(working_dir, "/tmp/workspace")
+            env["PATH"] = "/managed/git/bin"
+            return True
+
+        with patch("core.git_runtime.prepend_vendored_git_to_path", side_effect=inject_git):
+            agent._inject_caller_env_config(params, request)
+
+        set_env = params["config"]["shell_environment_policy"]["set"]
+        self.assertEqual(set_env, {"PATH": "/managed/git/bin"})
+
     def test_inject_caller_env_config_merges_shell_environment_policy(self):
         agent = object.__new__(CodexAgent)
         params = {"config": {"shell_environment_policy": {"set": {"KEEP": "1"}}}}
@@ -1103,7 +1124,8 @@ class CodexAgentPayloadTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        agent._inject_caller_env_config(params, request)
+        with patch("core.git_runtime.prepend_vendored_git_to_path", return_value=False):
+            agent._inject_caller_env_config(params, request)
 
         set_env = params["config"]["shell_environment_policy"]["set"]
         self.assertEqual(set_env["KEEP"], "1")
@@ -1113,6 +1135,7 @@ class CodexAgentPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set_env["AVIBE_CALLER_BACKEND"], "codex")
         self.assertEqual(set_env["AVIBE_NATIVE_SESSION_ID"], "thread-parent")
         self.assertTrue(set_env["BASH_ENV"].endswith("/codex-caller-env/ses-parent.sh"))
+        self.assertNotIn("PATH", set_env)
 
     def test_write_caller_env_script_refreshes_reused_thread_run_id(self):
         agent = object.__new__(CodexAgent)
@@ -2580,6 +2603,98 @@ class CodexAgentPayloadTests(unittest.IsolatedAsyncioTestCase):
             "run-two",
         )
         self.assertEqual(second_params["threadId"], "thread-existing")
+
+    async def test_refresh_thread_developer_instructions_refreshes_git_path_state(self):
+        agent = object.__new__(CodexAgent)
+        agent.sessions = SimpleNamespace(ensure_agent_session_id=Mock(return_value="sesk8m4q2p7x"))
+        agent._resolve_resume_model_provider_override = AsyncMock(return_value=None)
+        agent._build_thread_developer_instructions = Mock(return_value="stable instructions")
+        agent._thread_developer_instructions = {
+            "session-1": ("thread-existing", "stable instructions")
+        }
+        agent._thread_caller_env_configs = {}
+        agent._thread_git_path_configs = {
+            "session-1": ("thread-existing", "/gitless/bin", False)
+        }
+        request = SimpleNamespace(
+            working_path="/tmp/work",
+            session_key="slack::channel::C1::thread::171717.123",
+            base_session_id="session-1",
+            context=SimpleNamespace(platform_specific={}),
+        )
+        transport = SimpleNamespace(send_request=AsyncMock(return_value={"thread": {"id": "thread-existing"}}))
+
+        def inject_git(env, *, base_env, working_dir):
+            env["PATH"] = "/managed/git/bin:/gitless/bin"
+            return True
+
+        with patch.dict(os.environ, {"PATH": "/gitless/bin"}), patch(
+            "core.git_runtime.prepend_vendored_git_to_path",
+            side_effect=inject_git,
+        ):
+            await agent._refresh_thread_developer_instructions_if_needed(
+                transport,
+                request,
+                "thread-existing",
+            )
+            await agent._refresh_thread_developer_instructions_if_needed(
+                transport,
+                request,
+                "thread-existing",
+            )
+
+        transport.send_request.assert_awaited_once()
+        method, params = transport.send_request.await_args.args
+        self.assertEqual(method, "thread/resume")
+        self.assertNotIn("developerInstructions", params)
+        self.assertEqual(
+            params["config"]["shell_environment_policy"]["set"]["PATH"],
+            "/managed/git/bin:/gitless/bin",
+        )
+        self.assertEqual(
+            agent._thread_git_path_configs["session-1"],
+            ("thread-existing", "/managed/git/bin:/gitless/bin", True),
+        )
+
+    async def test_refresh_thread_developer_instructions_clears_stale_vendored_path(self):
+        agent = object.__new__(CodexAgent)
+        agent.sessions = SimpleNamespace(ensure_agent_session_id=Mock(return_value="sesk8m4q2p7x"))
+        agent._resolve_resume_model_provider_override = AsyncMock(return_value=None)
+        agent._build_thread_developer_instructions = Mock(return_value="stable instructions")
+        agent._thread_developer_instructions = {
+            "session-1": ("thread-existing", "stable instructions")
+        }
+        agent._thread_caller_env_configs = {}
+        agent._thread_git_path_configs = {
+            "session-1": ("thread-existing", "/managed/git/bin:/usr/bin", True)
+        }
+        request = SimpleNamespace(
+            working_path="/tmp/work",
+            session_key="slack::channel::C1::thread::171717.123",
+            base_session_id="session-1",
+            context=SimpleNamespace(platform_specific={}),
+        )
+        transport = SimpleNamespace(send_request=AsyncMock(return_value={"thread": {"id": "thread-existing"}}))
+
+        with patch.dict(os.environ, {"PATH": "/usr/bin"}), patch(
+            "core.git_runtime.prepend_vendored_git_to_path",
+            return_value=False,
+        ):
+            await agent._refresh_thread_developer_instructions_if_needed(
+                transport,
+                request,
+                "thread-existing",
+            )
+
+        _, params = transport.send_request.await_args.args
+        self.assertEqual(
+            params["config"]["shell_environment_policy"]["set"]["PATH"],
+            "/usr/bin",
+        )
+        self.assertEqual(
+            agent._thread_git_path_configs["session-1"],
+            ("thread-existing", "/usr/bin", True),
+        )
 
     async def test_refresh_thread_developer_instructions_preserves_resume_model_provider_override(self):
         agent = object.__new__(CodexAgent)

@@ -130,33 +130,58 @@ def _prune_sessions(sessions: dict[str, Any], now: datetime) -> dict[str, Any]:
     return pruned
 
 
+def _write_bindings(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def bind_session(
     opencode_session_id: str,
     platform_payload: Mapping[str, object] | None,
     *,
+    base_env: Mapping[str, str],
+    working_dir: Path | str | None,
     ttl_hours: int = BINDING_TTL_HOURS,
 ) -> bool:
+    from core.git_runtime import prepend_vendored_git_to_path
+
     session_id = str(opencode_session_id or "").strip()
     if not session_id:
         return False
     caller = caller_context_from_platform_payload(platform_payload)
-    if caller is None:
+    env = caller.to_env() if caller is not None else {}
+    prepend_vendored_git_to_path(
+        env,
+        base_env=base_env,
+        working_dir=working_dir,
+    )
+    path = binding_path()
+    now = _utc_now()
+    if not env:
+        if not path.is_file():
+            return False
+        data = _load_bindings(path)
+        existing_sessions = data.get("sessions", {})
+        sessions = _prune_sessions(existing_sessions, now)
+        sessions.pop(session_id, None)
+        if sessions != existing_sessions:
+            data["sessions"] = sessions
+            _write_bindings(path, data)
         return False
 
-    path = binding_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    now = _utc_now()
     expires_at = now + timedelta(hours=max(1, int(ttl_hours)))
     data = _load_bindings(path)
     sessions = _prune_sessions(data.get("sessions", {}), now)
-    sessions[session_id] = {
-        "env": caller.to_env(),
-        "caller_context": caller.to_metadata(),
+    entry = {
+        "env": env,
         "updated_at": now.isoformat(),
         "expires_at": expires_at.isoformat(),
     }
+    if caller is not None:
+        entry["caller_context"] = caller.to_metadata()
+    sessions[session_id] = entry
     data["sessions"] = sessions
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(path)
+    _write_bindings(path, data)
     return True

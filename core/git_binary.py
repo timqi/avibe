@@ -16,8 +16,10 @@ class ResolvedGit:
 
 
 def _resolve_vendored() -> ResolvedGit | None:
-    # TODO(#867): resolve the managed minimal Git bundle once it ships.
-    return None
+    from core.git_runtime import get_git_runtime_manager
+
+    path = get_git_runtime_manager().resolve_git_path()
+    return ResolvedGit(path=path, source="vendored") if path is not None else None
 
 
 def _macos_command_line_tools_available() -> bool:

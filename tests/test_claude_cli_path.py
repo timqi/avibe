@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.handlers.session_handler as session_handler_module
 from config.v2_compat import to_app_config
 from config.v2_config import AgentsConfig, ClaudeConfig, RuntimeConfig, SlackConfig, V2Config
+from core import git_runtime as git_runtime_module
 from core.handlers.session_handler import SessionHandler
 from modules.claude_sdk_compat import CLAUDE_SDK_MAX_BUFFER_SIZE
 from modules.im import MessageContext
@@ -159,6 +160,38 @@ def test_session_handler_passes_configured_claude_cli_path(monkeypatch, tmp_path
     assert controller.claude_sessions[f"slack_C123:{tmp_path}"] is client
     assert getattr(client, "_vibe_runtime_base_session_id") == "slack_C123"
     assert getattr(client, "_vibe_runtime_session_key") == f"slack_C123:{tmp_path}"
+
+
+def test_session_handler_injects_vendored_git_into_gitless_child_env(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _StubClaudeSDKClient:
+        def __init__(self, options):
+            captured["options"] = options
+
+        async def connect(self) -> None:
+            return None
+
+    def inject_git(env, *, base_env, working_dir):
+        assert "PATH" not in env
+        assert base_env is session_handler_module.os.environ
+        assert working_dir == str(tmp_path)
+        env["PATH"] = "/managed/git/bin"
+        return True
+
+    monkeypatch.setattr(session_handler_module, "ClaudeAgentOptions", _StubClaudeAgentOptions)
+    monkeypatch.setattr(session_handler_module, "ClaudeSDKClient", _StubClaudeSDKClient)
+    monkeypatch.setattr(git_runtime_module, "prepend_vendored_git_to_path", inject_git)
+
+    _run_session(
+        SessionHandler(_Controller(tmp_path)),
+        MessageContext(user_id="U123", channel_id="C123"),
+    )
+
+    assert captured["options"].env["PATH"] == "/managed/git/bin"
 
 
 def test_session_handler_moves_claude_process_into_agent_cgroup(monkeypatch, tmp_path: Path) -> None:
@@ -825,6 +858,49 @@ def test_session_handler_does_not_repeat_claude_model_control_request(monkeypatc
     assert len(captured["clients"]) == 1
     assert captured["options"].extra_args == {"model": "claude-sonnet-4-5"}
     assert first_client.model_calls == []
+
+
+def test_session_handler_recreates_cached_client_when_git_path_changes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    clients: list[Any] = []
+    runtime_ready = {"value": False}
+
+    class _StubClaudeSDKClient:
+        def __init__(self, options):
+            self.options = options
+            self.disconnects = 0
+            clients.append(self)
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            self.disconnects += 1
+
+    def inject_git(env, *, base_env, working_dir):
+        if runtime_ready["value"]:
+            env["PATH"] = f"/managed/git/bin{session_handler_module.os.pathsep}{base_env['PATH']}"
+            return True
+        return False
+
+    monkeypatch.setenv("PATH", "/gitless/bin")
+    monkeypatch.setattr(session_handler_module, "ClaudeAgentOptions", _StubClaudeAgentOptions)
+    monkeypatch.setattr(session_handler_module, "ClaudeSDKClient", _StubClaudeSDKClient)
+    monkeypatch.setattr(git_runtime_module, "prepend_vendored_git_to_path", inject_git)
+    handler = SessionHandler(_Controller(tmp_path))
+    context = MessageContext(user_id="U123", channel_id="C123")
+
+    first_client = _run_session(handler, context)
+    runtime_ready["value"] = True
+    second_client = _run_session(handler, context)
+
+    assert first_client is not second_client
+    assert first_client.disconnects == 1
+    assert len(clients) == 2
+    assert "PATH" not in first_client.options.env
+    assert second_client.options.env["PATH"] == "/managed/git/bin:/gitless/bin"
 
 
 def test_session_handler_recreates_cached_claude_client_when_caller_env_changes(
