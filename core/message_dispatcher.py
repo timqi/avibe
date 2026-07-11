@@ -995,7 +995,10 @@ class ConsolidatedMessageDispatcher:
             if run_terminal_status and self._run_has_blocking_activity(run_id):
                 defer_terminal = getattr(store, "defer_run_terminal", None)
                 if callable(defer_terminal):
-                    defer_terminal(run_id, terminal_status=run_terminal_status)
+                    defer_kwargs = {"terminal_status": run_terminal_status}
+                    if terminal_error is not None:
+                        defer_kwargs["error"] = terminal_error
+                    defer_terminal(run_id, **defer_kwargs)
                 run_terminal_status = None
             record_output = getattr(store, "record_run_output", None)
             if callable(record_output):
@@ -1351,9 +1354,8 @@ class ConsolidatedMessageDispatcher:
         - ``"normal"`` (default): delivered / persisted / streamed as usual.
         - ``"silent"``: settles the dot + releases the SSE waiter for a terminal
           ``result``, then returns WITHOUT delivering, persisting, or streaming.
-          Used for intentional, non-noteworthy lifecycle events (e.g. a user-
-          initiated stop) so the turn ends cleanly with no user-facing bubble —
-          replacing the old "fake it with empty text" trick with an explicit flag.
+          Used when lifecycle settlement must not add another visible bubble,
+          including intentional stops and failures already shown as notifications.
 
         ``status_label`` is an optional backend-computed clean tool-call label
         (claude-pipe style) used ONLY as the concise status-bubble body for the
@@ -1387,10 +1389,14 @@ class ConsolidatedMessageDispatcher:
 
         # Terminal status-bubble reason word for the done/orphan footer:
         # a clean turn is "done" (✅); a failure is "stopped" (⏹) when it was an
-        # intentional silent stop (e.g. user stop), else "failed" (⏹). Computed
-        # here where both is_error + level are known, then threaded into the
-        # compose/tidy helpers so the footer marker stays consistent.
-        terminal_reason = "done" if not is_error else ("stopped" if level == "silent" else "failed")
+        # intentional silent stop (e.g. user stop), else "failed" (⏹). An explicit
+        # diagnostic distinguishes a silent backend failure from a silent stop.
+        if not is_error:
+            terminal_reason = "done"
+        elif level == "silent" and terminal_error is None:
+            terminal_reason = "stopped"
+        else:
+            terminal_reason = "failed"
 
         # OUTBOUND status chokepoint (one of exactly two — the other is the
         # inbound AgentService.handle_message). A terminal ``result`` ends the
@@ -1525,6 +1531,7 @@ class ConsolidatedMessageDispatcher:
                         recorded_text,
                         message_id,
                         is_error=is_error,
+                        terminal_error=terminal_error,
                         output_semantics=output_semantics,
                     )
                 elif canonical_type == "result" or (context.platform_specific or {}).get("task_trigger_kind") != "agent_run":

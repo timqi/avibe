@@ -2259,6 +2259,46 @@ def test_failed_run_records_error_and_enqueues_one_terminal_callback(
     assert callback_runs[0]["source_actor"] == f"{request.id}:terminal:failed"
 
 
+def test_deferred_failure_preserves_error_through_later_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    request_store = TaskExecutionStore()
+    request = request_store.enqueue_agent_run(
+        session_id="target-session",
+        message="delegated work",
+        agent_name="claude",
+    )
+    assert request_store.claim(request.id) is not None
+    sqlite_store = request_store._sqlite
+    assert sqlite_store is not None
+
+    assert sqlite_store.defer_run_terminal(
+        request.id,
+        terminal_status="failed",
+        error="provider unavailable",
+    ) is True
+    running = request_store.get_run(request.id)
+    assert running is not None
+    assert running["result_payload"]["deferred_terminal_error"] == "provider unavailable"
+
+    terminal = sqlite_store.record_run_output(
+        request.id,
+        output_id="activity-output",
+        text="background output",
+        terminal_status="succeeded",
+    )
+
+    settled = request_store.get_run(request.id)
+    assert settled is not None
+    assert terminal["terminal_transition"] is True
+    assert settled["status"] == "failed"
+    assert settled["error"] == "provider unavailable"
+    assert "deferred_terminal_status" not in settled["result_payload"]
+    assert "deferred_terminal_error" not in settled["result_payload"]
+
+
 @pytest.mark.parametrize(
     ("activity_status", "expected_run_status"),
     [

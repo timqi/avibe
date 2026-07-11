@@ -1999,7 +1999,13 @@ class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
 
         await agent._receive_messages(_Client(), "session-1", "/tmp/work", context)
 
-        controller.agent_auth_service.maybe_emit_auth_recovery_message.assert_awaited_once()
+        controller.agent_auth_service.maybe_emit_auth_recovery_message.assert_awaited_once_with(
+            context,
+            "claude",
+            "❌ Claude error: OAuth authentication failed.",
+            output=ANY,
+            terminal_error="OAuth authentication failed.",
+        )
         agent._remove_ack_reaction.assert_awaited_once_with(pending_request)
         self.assertNotIn(composite_key, controller.receiver_tasks)
         self.assertNotIn(composite_key, controller.claude_sessions)

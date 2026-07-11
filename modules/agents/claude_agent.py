@@ -2312,6 +2312,12 @@ class ClaudeAgent(BaseAgent):
             str(getattr(message, "result", "") or "").strip(),
             cls._error_value_text(error_value),
         ]
+        error_token = cls._error_value_text(error_value).lower()
+        if not candidates[0] and error_token in {
+            "authentication_error",
+            "authentication_failed",
+        }:
+            candidates.insert(0, "OAuth authentication failed.")
         if isinstance(errors, (list, tuple)):
             candidates.extend(cls._error_value_text(item) for item in errors)
         elif errors:

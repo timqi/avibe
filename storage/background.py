@@ -1277,11 +1277,15 @@ class SQLiteBackgroundTaskStore:
                 result_payload = {}
             payload_changed = False
             effective_terminal_status = terminal_status
+            effective_terminal_error = error
             if terminal_status and "deferred_terminal_status" in result_payload:
                 effective_terminal_status = _stronger_terminal_status(
                     result_payload.pop("deferred_terminal_status", None),
                     terminal_status,
                 )
+                deferred_error = result_payload.pop("deferred_terminal_error", None)
+                if deferred_error is not None:
+                    effective_terminal_error = str(deferred_error)
                 payload_changed = True
             raw_outputs = result_payload.get("outputs")
             outputs = [dict(item) for item in raw_outputs if isinstance(item, dict)] if isinstance(raw_outputs, list) else []
@@ -1334,8 +1338,8 @@ class SQLiteBackgroundTaskStore:
                     "completed_at": now,
                     "updated_at": now,
                 }
-                if error is not None:
-                    terminal_values["error"] = str(error)
+                if effective_terminal_error is not None:
+                    terminal_values["error"] = str(effective_terminal_error)
                 transition = conn.execute(
                     update(agent_runs)
                     .where(agent_runs.c.id == run_id)
@@ -1370,9 +1374,10 @@ class SQLiteBackgroundTaskStore:
         run_id: str,
         *,
         terminal_status: str,
+        error: Optional[str] = None,
         updated_at: Optional[str] = None,
     ) -> bool:
-        """Remember a terminal intent while an owned Activity still blocks it."""
+        """Remember a terminal intent and diagnostic while an Activity blocks it."""
 
         now = updated_at or _utc_now_iso()
         row_to_publish = None
@@ -1393,9 +1398,17 @@ class SQLiteBackgroundTaskStore:
                 result_payload.get("deferred_terminal_status"),
                 terminal_status,
             )
-            if result_payload.get("deferred_terminal_status") == normalized:
+            status_changed = result_payload.get("deferred_terminal_status") != normalized
+            error_text = str(error) if error is not None else None
+            error_changed = bool(
+                error_text is not None
+                and not result_payload.get("deferred_terminal_error")
+            )
+            if not status_changed and not error_changed:
                 return False
             result_payload["deferred_terminal_status"] = normalized
+            if error_changed:
+                result_payload["deferred_terminal_error"] = error_text
             conn.execute(
                 update(agent_runs)
                 .where(agent_runs.c.id == run_id)
@@ -1438,6 +1451,7 @@ class SQLiteBackgroundTaskStore:
             if not deferred_status:
                 return False
             result_payload.pop("deferred_terminal_status", None)
+            deferred_error = result_payload.pop("deferred_terminal_error", None)
             status = (
                 _stronger_terminal_status(deferred_status, terminal_status)
                 if terminal_status
@@ -1449,8 +1463,9 @@ class SQLiteBackgroundTaskStore:
                 "updated_at": now,
                 "result_payload_json": _json_dumps(result_payload),
             }
-            if error is not None:
-                values["error"] = error
+            effective_error = deferred_error if deferred_error is not None else error
+            if effective_error is not None:
+                values["error"] = str(effective_error)
             transition = conn.execute(
                 update(agent_runs)
                 .where(agent_runs.c.id == run_id)
