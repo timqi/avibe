@@ -2379,7 +2379,10 @@ async def show_runtime_hmr_websocket(websocket: WebSocket, session_id: str):
     store = ShowPageStore()
     try:
         page = store.get(session_id)
-        if page is None or page.visibility != "private":
+        # Amendment (§2.3, 2026-07-13): the authed /show/ surface serves public
+        # pages too, so a public page framed in the Dock app must also get live
+        # HMR. Mirror the serve route's private+public visibility gate here.
+        if page is None or page.visibility not in {"private", "public"}:
             await websocket.close(code=1008)
             return
     finally:
@@ -3552,6 +3555,60 @@ def show_page_set_share_id_post(session_id):
         return jsonify(api.set_show_page_share_id(session_id, str(payload.get("share_id") or "")))
     except ShowPageError as exc:
         return _show_page_error_response(exc)
+
+
+def _dock_error_response(exc):
+    code = getattr(exc, "code", "invalid_dock_request")
+    # A missing Show Page (nothing to pin) is a 404; a malformed id or a bad
+    # order is a 400. Structured ``error`` so the Web UI's shared handler can
+    # localize via ``errors.<code>`` and fall back to the human message.
+    status = 404 if code in {"show_page_not_found", "session_not_found"} else 400
+    message = str(exc)
+    return jsonify({"ok": False, "error": {"code": code, "message": message}, "code": code, "message": message}), status
+
+
+@app.route("/api/dock", methods=["GET"])
+def dock_get():
+    from vibe import api
+
+    return jsonify(api.get_dock())
+
+
+@app.route("/api/dock/pins", methods=["POST"])
+def dock_pin_post():
+    from core.dock_store import DockError
+    from core.show_pages import ShowPageError
+    from vibe import api
+
+    payload = request.json or {}
+    try:
+        return jsonify(api.pin_dock_show_page(str(payload.get("session_id") or "")))
+    except (DockError, ShowPageError) as exc:
+        return _dock_error_response(exc)
+
+
+@app.route("/api/dock/pins/<session_id>", methods=["DELETE"])
+def dock_unpin_delete(session_id):
+    from core.dock_store import DockError
+    from core.show_pages import ShowPageError
+    from vibe import api
+
+    try:
+        return jsonify(api.unpin_dock_show_page(session_id))
+    except (DockError, ShowPageError) as exc:
+        return _dock_error_response(exc)
+
+
+@app.route("/api/dock/order", methods=["PUT"])
+def dock_order_put():
+    from core.dock_store import DockError
+    from vibe import api
+
+    payload = request.json or {}
+    try:
+        return jsonify(api.set_dock_order(payload.get("order")))
+    except DockError as exc:
+        return _dock_error_response(exc)
 
 
 @app.route("/api/csrf-token", methods=["GET"])
@@ -8907,7 +8964,10 @@ def redirect_private_show_page_to_canonical_path(session_id):
         page = store.get(session_id)
         if page is None:
             return _show_page_not_found_response()
-        if page.visibility not in {"private", "offline"}:
+        # Amendment (§2.3, 2026-07-13): the authed /show/ surface serves public
+        # pages too, so the sibling no-trailing-slash canonical redirect must
+        # accept public as well (offline still redirects to its offline page).
+        if page.visibility not in {"private", "public", "offline"}:
             return _show_page_not_found_response()
         return redirect(f"/show/{quote(session_id, safe='')}/")
     finally:
@@ -8934,7 +8994,15 @@ async def serve_private_show_page(session_id, asset_path):
             return _show_page_not_found_response()
         if page.visibility == "offline":
             return _show_page_offline_response()
-        if page.visibility != "private":
+        # Amendment (2026-07-13, docs/plans/dock-pinned-show-page-apps.md §2.3): the
+        # authed workbench `/show/<id>/` surface serves BOTH private and public
+        # pages, so a Show Page pinned to the Dock while public still opens (a
+        # pinned public page must not open a broken window). This is no new
+        # exposure — the route stays behind workbench auth, and a public page is
+        # already anonymously readable via `/p/<share_id>`, which remains the only
+        # anonymous surface. `offline` (handled above) and any unexpected
+        # visibility still fall through to not-found.
+        if page.visibility not in {"private", "public"}:
             return _show_page_not_found_response()
         if _is_show_page_runtime_denied_path(asset_path, session_id=page.session_id):
             return _show_page_file_not_found_response()
