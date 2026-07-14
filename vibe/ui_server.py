@@ -3557,6 +3557,66 @@ def show_page_set_share_id_post(session_id):
         return _show_page_error_response(exc)
 
 
+def _show_page_icon_not_found():
+    # 404 on any missing page / no icon / policy rejection — the frontend's
+    # onerror -> letter-avatar fallback covers it. No body needed. `no-store` so a
+    # heuristically-cached 404 can't strand the letter fallback on the stable
+    # sid-only URL after the page later adds the icon.
+    response = Response("", status=404, mimetype="text/plain")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/api/show-pages/<session_id>/icon", methods=["GET", "HEAD"])
+def show_page_icon_get(session_id):
+    # The page's own HTML icon, served as the single chokepoint (§7.1f): ALL href
+    # resolution + policy (document semantics incl. <base>; reject api / traversal /
+    # absolute / root-relative / external / non-image / stock) lives server-side in
+    # resolve_show_page_icon. The `?v=` token NEVER selects the file — resolution is
+    # sid + workspace only — it is validated as a read-time CONTENT ASSERTION so the
+    # stable URL's `immutable` cache is honest. Auth rides the global /api hooks.
+    #
+    # Contract: bytes-or-404, NEVER a 500 — the icon is decorative. A malformed
+    # session id (validate_session_id -> ShowPageError), a page-authored href that
+    # resolves to a filesystem-invalid path (ValueError/OSError), a live-edit swap,
+    # or a token mismatch all degrade to the letter-avatar fallback, never erroring.
+    from core.show_pages import ShowPageError, ShowPageStore, read_show_page_icon
+
+    try:
+        store = ShowPageStore()
+        try:
+            page = store.get(session_id)
+            # Any of the user's own pages — private, public, OR offline — may serve
+            # its static icon: the payload advertises an icon token for all of them
+            # and the inventory lists them, so gating by visibility would strand
+            # offline rows / pinned offline apps on the letter avatar despite an icon.
+            if page is None:
+                return _show_page_icon_not_found()
+            # read_show_page_icon does the race-safe read (O_NOFOLLOW + fstat cap on
+            # the descriptor) and enforces `?v=` as a content assertion — resolution
+            # stays sid-only; the query can never pick a different file.
+            result = read_show_page_icon(page.session_id, request.args.get("v", ""))
+        finally:
+            store.close()
+        if result is None:
+            return _show_page_icon_not_found()
+        data, content_type = result
+        response = Response(data, mimetype=content_type)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        # A directly-navigated SVG must not execute scripts in the API origin.
+        response.headers["Content-Security-Policy"] = "sandbox"
+        # `immutable` is honest now: `?v=` is enforced against the served bytes, so a
+        # given URL maps to exactly one byte-content — a changed icon gets a new token
+        # → a new URL → a fresh fetch, and the cache can never be poisoned across a
+        # content revert. A plain Response also never honors `Range` (no 206/416).
+        response.headers["Cache-Control"] = "private, max-age=604800, immutable"
+        return response
+    except (ShowPageError, ValueError, OSError):
+        # Enforce the bytes-or-404 contract at the boundary: a bad session id, a bad
+        # page-authored icon, or a file that vanished mid-race must fall back, not 500.
+        return _show_page_icon_not_found()
+
+
 def _dock_error_response(exc):
     code = getattr(exc, "code", "invalid_dock_request")
     # A missing Show Page (nothing to pin) is a 404; a malformed id or a bad

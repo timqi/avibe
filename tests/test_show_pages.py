@@ -1,11 +1,21 @@
 import json
+import os
 from dataclasses import dataclass
 
 import pytest
 
 from config import paths
 from config.v2_config import AgentsConfig, PlatformsConfig, RemoteAccessConfig, RuntimeConfig, SlackConfig, UiConfig, V2Config
-from core.show_pages import ShowPageError, ShowPageStore, ensure_show_page_dir, show_cli_event_token, show_page_payload
+from core.show_pages import (
+    ShowPage,
+    ShowPageError,
+    ShowPageStore,
+    _default_index_html,
+    _extract_icon_path,
+    ensure_show_page_dir,
+    show_cli_event_token,
+    show_page_payload,
+)
 from storage.pagination import PageRequest
 from vibe import cli
 
@@ -731,6 +741,409 @@ def test_show_page_dir_creates_default_index(monkeypatch, tmp_path):
     assert 'from "./router"' in app_tsx
     assert "<RouterView" in app_tsx
     assert (page_dir / "api" / "health.ts").exists()
+
+
+def test_extract_icon_path_custom_relative_href(tmp_path):
+    (tmp_path / "index.html").write_text(
+        '<!doctype html><html><head><link rel="icon" href="./favicon.svg"></head></html>',
+        encoding="utf-8",
+    )
+    # A leading "./" is normalized away; the path stays relative to /show/<sid>/.
+    assert _extract_icon_path(tmp_path) == "favicon.svg"
+
+
+def test_extract_icon_path_relative_subdir_href(tmp_path):
+    (tmp_path / "index.html").write_text('<link rel="icon" href="assets/logo.png">', encoding="utf-8")
+    assert _extract_icon_path(tmp_path) == "assets/logo.png"
+
+
+def test_extract_icon_path_shortcut_icon_rel(tmp_path):
+    # rel="shortcut icon" still carries the "icon" token, so it matches.
+    (tmp_path / "index.html").write_text('<link rel="shortcut icon" href="fav.ico">', encoding="utf-8")
+    assert _extract_icon_path(tmp_path) == "fav.ico"
+
+
+def test_extract_icon_path_first_icon_wins(tmp_path):
+    (tmp_path / "index.html").write_text(
+        '<link rel="icon" href="first.svg"><link rel="icon" href="second.svg">',
+        encoding="utf-8",
+    )
+    assert _extract_icon_path(tmp_path) == "first.svg"
+
+
+def test_extract_icon_path_missing_index_is_null(tmp_path):
+    assert _extract_icon_path(tmp_path) is None
+
+
+def test_extract_icon_path_no_link_is_null(tmp_path):
+    (tmp_path / "index.html").write_text("<html><head><title>x</title></head></html>", encoding="utf-8")
+    assert _extract_icon_path(tmp_path) is None
+
+
+def test_extract_icon_path_apple_touch_icon_ignored(tmp_path):
+    # apple-touch-icon is not rel="icon"; prefer the letter avatar over it.
+    (tmp_path / "index.html").write_text('<link rel="apple-touch-icon" href="touch.png">', encoding="utf-8")
+    assert _extract_icon_path(tmp_path) is None
+
+
+def test_extract_icon_path_stock_scaffold_index_is_null(tmp_path):
+    # The real scaffold ships NO icon link, so an un-customized page yields null
+    # and the letter avatar is used. This locks that contract to the scaffold.
+    (tmp_path / "index.html").write_text(_default_index_html("ses123"), encoding="utf-8")
+    assert _extract_icon_path(tmp_path) is None
+
+
+def test_extract_icon_path_stock_vite_icons_are_null(tmp_path):
+    # The Vite default favicon ships as an ABSOLUTE href, and even a relative copy
+    # of the generic mascot is treated as stock — both prefer the letter avatar.
+    for href in ("/vite.svg", "./vite.svg", "assets/vite.svg"):
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) is None, href
+
+
+def test_extract_icon_path_absolute_href_is_null(tmp_path):
+    # Absolute (root-relative) hrefs resolve to the workbench origin, not the
+    # page workspace — only same-workspace relative paths are allowed.
+    (tmp_path / "index.html").write_text('<link rel="icon" href="/favicon.ico">', encoding="utf-8")
+    assert _extract_icon_path(tmp_path) is None
+
+
+def test_extract_icon_path_external_and_scheme_hrefs_are_null(tmp_path):
+    for href in (
+        "https://cdn.example.com/i.png",
+        "//cdn.example.com/i.png",
+        "data:image/svg+xml,<svg/>",
+    ):
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) is None, href
+
+
+def test_extract_icon_path_parent_traversal_is_null(tmp_path):
+    for href in ("../secret.svg", "../../a/b.svg", "a/../../b.svg"):
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) is None, href
+
+
+def test_extract_icon_path_encoded_and_backslash_traversal_is_null(tmp_path):
+    # The browser normalizes %2e%2e/, encoded slashes, and backslashes before it
+    # resolves the icon URL, so these must be rejected even without a literal "../".
+    for href in (
+        "%2e%2e/other/icon.svg",
+        "..%2fother%2ficon.svg",
+        "..\\other\\icon.svg",
+        "%2fetc%2fpasswd",
+        "sub/%2e%2e/%2e%2e/secret.svg",
+    ):
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) is None, href
+
+
+def test_extract_icon_path_skips_symlinked_index(tmp_path):
+    # An agent could point index.html at a large/special file via a symlink; skip it.
+    real = tmp_path / "real.html"
+    real.write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    (tmp_path / "index.html").symlink_to(real)
+    assert _extract_icon_path(tmp_path) is None
+
+
+def test_extract_icon_path_reads_only_head_of_large_index(tmp_path):
+    # A huge inline page must not stall the read; the icon <link> in <head> (top) is
+    # still found, and the trailing bulk beyond the head limit is never scanned.
+    head = '<head><link rel="icon" href="favicon.svg"></head>'
+    (tmp_path / "index.html").write_text(head + "<!-- padding -->" * 20000, encoding="utf-8")
+    assert _extract_icon_path(tmp_path) == "favicon.svg"
+
+
+def test_extract_icon_path_resolves_through_base_href(tmp_path):
+    # A <base href="assets/"> BEFORE the icon link makes the browser resolve the
+    # icon as assets/favicon.svg; the resolver must match that document semantics.
+    (tmp_path / "index.html").write_text(
+        '<head><base href="assets/"><link rel="icon" href="favicon.svg"></head>',
+        encoding="utf-8",
+    )
+    assert _extract_icon_path(tmp_path) == "assets/favicon.svg"
+
+
+def test_extract_icon_path_base_after_icon_does_not_apply(tmp_path):
+    # A <base> AFTER the icon link does not affect it (document order).
+    (tmp_path / "index.html").write_text(
+        '<head><link rel="icon" href="favicon.svg"><base href="assets/"></head>',
+        encoding="utf-8",
+    )
+    assert _extract_icon_path(tmp_path) == "favicon.svg"
+
+
+def test_extract_icon_path_base_escaping_workspace_is_null(tmp_path):
+    for base in ("/other/", "https://cdn.example.com/", "../"):
+        (tmp_path / "index.html").write_text(
+            f'<head><base href="{base}"><link rel="icon" href="favicon.svg"></head>',
+            encoding="utf-8",
+        )
+        assert _extract_icon_path(tmp_path) is None, base
+
+
+def test_extract_icon_path_root_relative_hrefs_are_null(tmp_path):
+    # Root-relative / protocol-relative hrefs root at the ORIGIN, not the workspace,
+    # so they reject — including a literal "/w/…" that would otherwise collide with
+    # the synthetic resolution prefix and be mis-served as workspace-relative (Codex).
+    for href in ("/favicon.svg", "/w/icon.svg", "//cdn.example.com/icon.svg"):
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) is None, href
+
+
+def test_extract_icon_path_root_relative_base_is_null(tmp_path):
+    # A root-relative <base href="/w/"> likewise escapes the workspace.
+    for base in ("/w/", "/", "//cdn.example.com/"):
+        (tmp_path / "index.html").write_text(
+            f'<head><base href="{base}"><link rel="icon" href="favicon.svg"></head>',
+            encoding="utf-8",
+        )
+        assert _extract_icon_path(tmp_path) is None, base
+
+
+def test_extract_icon_path_malformed_href_returns_null_not_raises(tmp_path):
+    # A malformed absolute URL (urlsplit raises ValueError) must fall back to the
+    # letter avatar, NEVER propagate: _extract_icon_path runs while building
+    # /api/show-pages, so one bad page must not break the whole inventory (Codex).
+    for href in ("http://[bad]/icon.svg", "http://[bad/icon.svg"):
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) is None, href
+    # A malformed <base> is equally contained.
+    (tmp_path / "index.html").write_text(
+        '<head><base href="http://[bad]/"><link rel="icon" href="favicon.svg"></head>',
+        encoding="utf-8",
+    )
+    assert _extract_icon_path(tmp_path) is None
+
+
+def test_extract_icon_path_hidden_dot_segments_are_null(tmp_path):
+    # Hidden / dot segments are denied for icons exactly as the Show Page static
+    # server denies them (`_is_show_page_dot_path`); the icon endpoint must not
+    # become a bypass for that policy — even for an image-extension dot-file (Codex).
+    for href in (".env.svg", "assets/.secret.png", ".git/logo.png", ".favicon.svg", "a/.b/c.png"):
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) is None, href
+
+
+def test_extract_icon_path_runtime_api_hrefs_are_null(tmp_path):
+    for href in ("api/health", "api/health.svg", "__show/events.png", "__events"):
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) is None, href
+
+
+def test_extract_icon_path_non_image_extensions_are_null(tmp_path):
+    for href in ("icon.txt", "icon.js", "icon.html", "favicon", "noext/"):
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) is None, href
+
+
+def test_extract_icon_path_accepts_whitelisted_image_extensions(tmp_path):
+    cases = {
+        "icon.png": "icon.png",
+        "icon.jpg": "icon.jpg",
+        "icon.jpeg": "icon.jpeg",
+        "icon.webp": "icon.webp",
+        "icon.gif": "icon.gif",
+        "icon.ico": "icon.ico",
+        "logo.SVG": "logo.SVG",  # extension is case-insensitive; the path keeps its case
+    }
+    for href, expected in cases.items():
+        (tmp_path / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        assert _extract_icon_path(tmp_path) == expected, href
+
+
+def _icon_page(session_id: str) -> ShowPage:
+    return ShowPage(
+        session_id=session_id,
+        visibility="private",
+        share_id=None,
+        offline_at=None,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+
+
+def test_show_page_payload_icon_version_is_a_token_when_icon_exists(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    page_dir = ensure_show_page_dir("sesicon")
+    # A page that customized its index.html with its own relative favicon.
+    (page_dir / "index.html").write_text('<link rel="icon" href="./brand.svg">', encoding="utf-8")
+    (page_dir / "brand.svg").write_text("<svg>v1</svg>", encoding="utf-8")
+
+    version = show_page_payload(_icon_page("sesicon"))["icon_version"]
+
+    # An opaque, non-empty token — NOT the path (the frontend never composes a path).
+    assert isinstance(version, str) and version
+    assert "brand.svg" not in version
+
+
+def test_show_page_payload_icon_version_null_for_default_scaffold(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    ensure_show_page_dir("sesdefault")  # writes the stock scaffold index.html (no icon)
+    assert show_page_payload(_icon_page("sesdefault"))["icon_version"] is None
+
+
+def test_show_page_payload_icon_version_follows_the_file(monkeypatch, tmp_path):
+    # Freshness invariant (§7.1f versioned-URL): the token follows the resolved icon
+    # FILE, so ANY change to the icon content changes the next payload's token with no
+    # client update-site enumeration. Overwrite → new token; repoint <link> → new token.
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    page_dir = ensure_show_page_dir("sesfresh")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    (page_dir / "favicon.svg").write_text("<svg>v1</svg>", encoding="utf-8")
+    v1 = show_page_payload(_icon_page("sesfresh"))["icon_version"]
+    assert v1
+
+    # Overwrite the same file with different bytes → the token changes.
+    (page_dir / "favicon.svg").write_text("<svg>v2-longer</svg>", encoding="utf-8")
+    v2 = show_page_payload(_icon_page("sesfresh"))["icon_version"]
+    assert v2 and v2 != v1
+
+    # Repoint <link rel=icon> to a different file → the token changes again.
+    (page_dir / "logo.png").write_bytes(b"\x89PNG\r\n")
+    (page_dir / "index.html").write_text('<link rel="icon" href="logo.png">', encoding="utf-8")
+    v3 = show_page_payload(_icon_page("sesfresh"))["icon_version"]
+    assert v3 and v3 != v2
+
+
+def test_show_page_payload_icon_version_tracks_content_not_just_mtime(monkeypatch, tmp_path):
+    # The token hashes CONTENT, so a regeneration that preserves size AND mtime
+    # (`cp -p`/`rsync`, deterministic build artifacts) STILL changes it — an
+    # mtime+size identity would collide and, under immutable caching, keep serving
+    # the stale icon (Codex). Identical bytes, in contrast, keep the token stable.
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    page_dir = ensure_show_page_dir("sesctnt")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    favicon = page_dir / "favicon.svg"
+    favicon.write_text("<svg>AAAA</svg>", encoding="utf-8")
+    stat = favicon.stat()
+    v1 = show_page_payload(_icon_page("sesctnt"))["icon_version"]
+
+    # Same byte length + restored mtime — ONLY the content differs.
+    favicon.write_text("<svg>BBBB</svg>", encoding="utf-8")
+    os.utime(favicon, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert favicon.stat().st_size == stat.st_size
+    assert favicon.stat().st_mtime_ns == stat.st_mtime_ns
+    v2 = show_page_payload(_icon_page("sesctnt"))["icon_version"]
+    assert v1 and v2 and v1 != v2  # content change is caught despite identical mtime+size
+
+    # Restoring the exact bytes restores the token (identical icon → cache hit).
+    favicon.write_text("<svg>AAAA</svg>", encoding="utf-8")
+    assert show_page_payload(_icon_page("sesctnt"))["icon_version"] == v1
+
+
+def test_resolve_show_page_icon_rejects_oversized_icon(monkeypatch, tmp_path):
+    # A page pointing <link rel=icon> at a large in-workspace asset must NOT make
+    # /api/show-pages read it in full per row (or the endpoint materialize it): an
+    # oversized icon is dropped to the letter avatar (None), not hashed/served (Codex).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    monkeypatch.setattr("core.show_pages._ICON_MAX_BYTES", 16)
+    from core.show_pages import resolve_show_page_icon
+
+    page_dir = ensure_show_page_dir("sesbig")
+    (page_dir / "index.html").write_text('<link rel="icon" href="big.png">', encoding="utf-8")
+    (page_dir / "big.png").write_bytes(b"x" * 64)  # over the (patched) 16-byte cap
+
+    assert resolve_show_page_icon("sesbig") is None
+    assert show_page_payload(_icon_page("sesbig"))["icon_version"] is None
+    # A file at/under the cap is still accepted.
+    (page_dir / "big.png").write_bytes(b"y" * 16)
+    assert resolve_show_page_icon("sesbig") is not None
+
+
+def test_read_show_page_icon_enforces_the_token(monkeypatch, tmp_path):
+    # ?v= is a content assertion: the correct token yields the bytes; a wrong/empty
+    # token is None (→ 404), so `immutable` caching is honest (URL ⇒ one content).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    from core.show_pages import read_show_page_icon, show_page_icon_version
+
+    page_dir = ensure_show_page_dir("sesread")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    (page_dir / "favicon.svg").write_text("<svg>hi</svg>", encoding="utf-8")
+    token = show_page_icon_version("sesread")
+
+    assert read_show_page_icon("sesread", token) == (b"<svg>hi</svg>", "image/svg+xml")
+    assert read_show_page_icon("sesread", "deadbeefdeadbeef") is None  # wrong token
+    assert read_show_page_icon("sesread", "") is None  # no token
+
+
+def test_read_show_page_icon_rejects_symlink_swap(monkeypatch, tmp_path):
+    # TOCTOU: a regular file accepted by resolve is replaced by a symlink to a file
+    # OUTSIDE the workspace before the read. The result must be None (never the
+    # swapped-in target) — caught by the re-resolution's within-root guard and, for
+    # a swap in the resolve→open window, by the O_NOFOLLOW open. Even the (stale)
+    # correct token must not serve it.
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    from core.show_pages import read_show_page_icon, show_page_icon_version
+
+    page_dir = ensure_show_page_dir("sesswap")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    (page_dir / "favicon.svg").write_text("<svg>ok</svg>", encoding="utf-8")
+    token = show_page_icon_version("sesswap")
+    outside = tmp_path / "outside_secret.svg"
+    outside.write_text("<svg>SECRET</svg>", encoding="utf-8")
+    (page_dir / "favicon.svg").unlink()
+    os.symlink(outside, page_dir / "favicon.svg")
+
+    assert read_show_page_icon("sesswap", token) is None
+
+
+def test_read_show_page_icon_rejects_oversized_at_read_time(monkeypatch, tmp_path):
+    # TOCTOU: the file grows past the cap AFTER resolve's stat accepted it (a swap
+    # race). The descriptor `fstat` re-checks the cap, so the huge file is rejected
+    # on the fd → None, never buffered. Patch resolve to hand back the over-cap file
+    # (simulating "resolve saw it small") so the read-time gate is exercised alone.
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    monkeypatch.setattr("core.show_pages._ICON_MAX_BYTES", 16)
+    from core.show_pages import read_show_page_icon
+
+    page_dir = ensure_show_page_dir("sesgrow")
+    big = page_dir / "big.png"
+    big.write_bytes(b"z" * 64)  # over the patched 16-byte cap
+    monkeypatch.setattr("core.show_pages.resolve_show_page_icon", lambda sid: (big, "image/png"))
+
+    assert read_show_page_icon("sesgrow", "anytoken") is None
+
+
+def test_read_workspace_file_safely_regular_head_and_capped(tmp_path):
+    # The shared chokepoint: a regular file reads (head up to `limit`; or full within
+    # `cap`), an over-cap file is refused, a missing file is None.
+    from core.show_pages import _read_workspace_file_safely
+
+    f = tmp_path / "f.txt"
+    f.write_bytes(b"0123456789")
+    assert _read_workspace_file_safely(f, 4) == b"0123"  # cap=False → head up to limit
+    assert _read_workspace_file_safely(f, 100) == b"0123456789"
+    assert _read_workspace_file_safely(f, 100, cap=True) == b"0123456789"  # full within cap
+    assert _read_workspace_file_safely(f, 4, cap=True) is None  # over cap → refused
+    assert _read_workspace_file_safely(tmp_path / "nope.txt", 100) is None  # missing
+
+
+def test_read_workspace_file_safely_refuses_symlink(tmp_path):
+    # O_NOFOLLOW refuses a symlink swapped in for a workspace file. Skip where the
+    # flag is absent (native Windows) so windows-smoke stays green.
+    if not hasattr(os, "O_NOFOLLOW"):
+        pytest.skip("O_NOFOLLOW not available on this platform")
+    from core.show_pages import _read_workspace_file_safely
+
+    (tmp_path / "outside.txt").write_bytes(b"SECRET")
+    link = tmp_path / "link.txt"
+    os.symlink(tmp_path / "outside.txt", link)
+    assert _read_workspace_file_safely(link, 100) is None
+    assert _read_workspace_file_safely(link, 100, cap=True) is None
+
+
+def test_read_workspace_file_safely_refuses_non_regular_fifo(tmp_path):
+    # A FIFO (special file) swapped in must be refused by the descriptor fstat, so a
+    # read can never block the inventory. Skip where mkfifo is unavailable (Windows).
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo not available on this platform")
+    from core.show_pages import _read_workspace_file_safely
+
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    assert _read_workspace_file_safely(fifo, 100) is None
+    assert _read_workspace_file_safely(fifo, 100, cap=True) is None
 
 
 def test_fresh_workspace_scaffolds_placeholder_and_minimal_router(monkeypatch, tmp_path):

@@ -46,6 +46,22 @@ export function showPagePrivatePath(sessionId: string): string {
   return `/show/${encodeURIComponent(sessionId)}/`;
 }
 
+/** The URL for a page's own HTML icon, served by the dedicated
+ *  `GET /api/show-pages/<sid>/icon` endpoint (§7.1f). ALL href resolution + policy
+ *  lives server-side; the URL carries the session id in the PATH plus the
+ *  server-issued opaque cache token as `?v=<token>`. The server NEVER derives
+ *  resolution from the query — the token only VERSIONS the URL so it changes when
+ *  the icon file changes, busting the cache with no client update-site enumeration
+ *  (any payload refresh that changes the token changes the `src`, so the `<img>`
+ *  refetches on its own). `iconVersion` doubles as the has-icon signal: null/blank →
+ *  no icon → the caller falls back to the letter avatar (the endpoint also 404s on
+ *  any rejection, and the tile's onError falls back). Pure. */
+export function showPageIconUrl(sessionId: string, iconVersion: string | null | undefined): string | null {
+  const token = (iconVersion ?? '').trim();
+  if (!token) return null;
+  return `/api/show-pages/${encodeURIComponent(sessionId)}/icon?v=${encodeURIComponent(token)}`;
+}
+
 /** The in-app route to the owning session's Chat page (`/chat/:sessionId`). The Show
  *  Page window's chat-bubble navigates here (SPA nav, not a new tab) and minimizes the
  *  window. Pass `{ showChat: true }` to append the `?view=chat` signal that tells

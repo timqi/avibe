@@ -128,11 +128,22 @@ PUT    /api/dock/order               { order: string[] }    → { ok, dock }
 
 DockDoc = { order: string[], pins: DockPin[] }
 DockPin = { session_id: string, title_snapshot: string, pinned_at: string }
+
+GET|HEAD /api/show-pages/{session_id}/icon   → 200 image bytes | 404   # §7.1f
 ```
 
 - `POST pins` appends `show:<sid>` to the end of `order`; captures
   `title_snapshot` from the session's current title server-side.
 - Errors: 404 unknown session / no show page on pin; 400 invalid order.
+- `GET /api/show-pages/{sid}/icon?v=<token>` (§7.1f): serves the page's own HTML
+  icon, resolved server-side with document semantics (`<base href>`), confined to
+  the workspace, whitelisted image extension only. The URL carries the **sid in
+  the path + a server-issued opaque cache token as `?v=`**; the server NEVER
+  derives resolution from the query. 404 on any policy rejection / missing target
+  / malformed input — never a redirect, partial serve, or 500. Headers on 200:
+  `nosniff` + `Content-Security-Policy: sandbox` + `Cache-Control: private,
+  max-age=604800, immutable` (safe because the token versions the URL); 404s are
+  `no-store`. Never boots the Show Runtime.
 
 ## 5. Frontend Changes (map to real files)
 
@@ -344,6 +355,214 @@ shows an App Library shortcut hint (never a dead surface).
   fallback — every surface inherits.
 - Freshness: rides the existing inventory refresh cycles; no push channel.
 - Sequenced AFTER Phase 2.2 (file overlap on Dock/Library surfaces).
+
+**Implementation reality (2026-07-14, matches shipped code):**
+- The show-runtime scaffold ships **NO `<link rel="icon">`** at all (see
+  `_default_index_html` — it deliberately declares no favicon/apple-touch-icon).
+  So an un-customized page yields `icon_path: null` via the plain "no link"
+  path; there is no `vite.svg` stock link to special-case. The Vite default
+  `href="/vite.svg"` is absolute → already null; a relative `vite.svg` basename
+  is guarded defensively for raw-Vite copies.
+- `icon_path` rules (server, `core/show_pages.py._extract_icon_path`): reads
+  ONLY `<workspace>/index.html`; returns the first `<link rel="icon">` href
+  when it is a same-workspace **relative** path (leading `./` normalized off);
+  null for missing file / no link / absolute (`/…`) / any URI scheme (http:,
+  data:, //…) / parent traversal / the `vite.svg` stock basename.
+- The avatar is **not a single component chokepoint**. The icon-or-letter
+  render + onError→letter fallback lives in one shared `ShowPageAvatarContent`
+  (in `showPageAvatarTile.tsx`). It is adopted by: `ShowPageAvatarTile` (Library
+  Apps rows, Show Pages rows, ⌘K search) and the two bespoke inline tiles that
+  read the same inventory (Dock, mobile drawer). All join the page by session id.
+- **Deferred (follow-up):** the mobile full-screen **ShowPageRoute** header
+  loads the session, not the inventory, so it has no `icon_path` without an
+  extra fetch — it keeps the letter/Lucide icon for now.
+
+**Restructure (owner-adjudicated 2026-07-14, dedicated endpoint — supersedes
+the "server extracts, browser fetches a `/show/` path" shape above):** the
+browser no longer composes any file URL from `icon_path`. All href resolution
+and policy live behind ONE server chokepoint:
+
+```
+GET|HEAD /api/show-pages/{session_id}/icon   → 200 image bytes | 404
+```
+
+- **Single chokepoint.** The server resolves the page's `<link rel="icon">`
+  href with full **document semantics** — including a leading `<base href>` —
+  then serves the resolved file. The frontend URL carries ONLY the session id
+  (`showPageIconUrl` → `/api/show-pages/<sid>/icon`); `icon_path` in the
+  payload is now purely a **has-icon signal** (may later shrink to `has_icon`),
+  never composed into a path.
+- **Policy (all → 404, never a redirect / partial serve), in `core/show_pages`:**
+  resolve `href` (percent-decoded, `\`→`/`) against `<base>` then the doc URL;
+  require it stay within the workspace (`http://show.invalid/w/…`); reject the
+  runtime surfaces (`api/`, `__show/`, `__events` first segment), the `vite.svg`
+  stock basename, and parent traversal; **reject any non-relative ref up front** —
+  absolute / root-relative (`/w/…`, `/x`) / protocol-relative (`//host`) / scheme
+  hrefs and bases (a literal `/w/…` must not masquerade as workspace-relative);
+  **treat any malformed URL as "no icon", never raised** (the resolver runs while
+  building `/api/show-pages`, so one bad page falls back to the letter avatar
+  instead of 500ing the whole inventory); require a whitelisted image extension
+  `{svg,png,ico,jpg,jpeg,webp,gif}` (case-insensitive); then realpath-confirm the
+  target is a regular file inside the workspace root.
+- **Serving.** `send_file` with `Content-Type` from the extension whitelist +
+  `X-Content-Type-Options: nosniff` + `Content-Security-Policy: sandbox` +
+  `Cache-Control: private, no-cache`. The URL is stable (session id only), so
+  `no-cache` (revalidate before reuse) rather than a `max-age` fresh window keeps
+  the tile from showing a stale icon after an overwrite / a changed `<link
+  rel=icon>`; `send_file`'s ETag + Last-Modified make an unchanged icon a cheap
+  304 where conditional GETs are honored, and a changed icon always yields fresh
+  bytes. (The app-wide vault-sandbox hook then composes its `frame-src` onto the
+  CSP, so the wire value is `sandbox; frame-src 'self' https://sandbox.avibe.bot`
+  — the bare `sandbox` directive stays first and effective, rendering a
+  page-authored SVG in an opaque origin with scripts disabled.) Same authed
+  `/api` surface (inherits
+  `enforce_remote_access_cookie`); a remote request without a session is bounced.
+  Resolving/serving an icon **never boots the Show Runtime** (pure static read).
+- **Why.** Three review rounds re-litigated per-rule href policy at the URL
+  layer (traversal, encoded traversal, `api/` exemption, `<base>` semantics);
+  a chokepoint that reasons with document semantics once, and returns bytes-or-404,
+  removes the class instead of patching instances.
+- **Window title-bar** now renders the shared `ShowPageAvatarContent` chip for
+  showpage windows (`AppWindow` gets the window's `icon_path` threaded from the
+  `WindowLayer` inventory join), so it inherits the page favicon like every
+  other surface.
+
+**Hardening (review round 2, 2026-07-14):**
+- **Bytes-or-404, never 500.** The endpoint wraps its body in `except
+  (ShowPageError, ValueError, OSError)` → 404, so a malformed session id
+  (`/api/show-pages/!/icon`, which `validate_session_id` rejects in
+  `store.get`) or a page-authored href that resolves to a filesystem-invalid
+  path (embedded NUL, overlong filename → `Path.resolve()`/`stat` raises) both
+  degrade to the letter avatar. `resolve_show_page_icon` also catches
+  `(ValueError, OSError)` at its own layer so the helper honors its "None for
+  bad input" contract.
+- **Offline pages serve icons.** The visibility gate is dropped (serve for any
+  of the user's own pages — private/public/**offline**): the payload advertises
+  `icon_path` for offline pages and the inventory lists them, so gating would
+  strand offline rows / pinned offline apps on the letter avatar.
+- **404s are `no-store`.** The not-found response carries `Cache-Control:
+  no-store` so a heuristically-cached negative can't keep the letter fallback on
+  the stable URL after the page later adds the icon.
+- **Already-loaded icons revalidate.** `ShowPageAvatarContent` remounts its
+  `<img>` (a refresh nonce as `key`) on each inventory refresh, forcing an
+  already-loaded, stable-URL icon to re-request; the backend `no-cache` then
+  makes it a 304 (unchanged) or fresh bytes (changed), so an overwritten favicon
+  / repointed `<link rel=icon>` reflects without a full reload.
+
+**Versioned URL (owner-approved 2026-07-14 — SUPERSEDES the sid-only + `no-cache`
++ notifier/remount freshness design above).** The icon-freshness theme recurred
+across three review rounds (backend cache header → frontend remount-on-load →
+remount-on-mutation): the "notify→remount at every inventory-update site"
+mechanism is leaky by design (each round found another un-enumerated update
+site). Replaced with a **content-versioned URL**, correct-by-construction:
+
+- **Token.** The payload's has-icon signal becomes `icon_version` (was
+  `icon_path`): a server-issued opaque token — `show_page_icon_version` digests
+  the resolved icon file's **CONTENT** (a same-size/same-mtime regeneration via
+  `cp -p`/deterministic builds still busts it; identical bytes keep the token
+  stable so an unchanged icon stays a cache hit). Non-null iff a servable icon
+  exists. `icon_path` is removed from the payload (the frontend never needed the
+  path).
+- **URL.** `showPageIconUrl(sid, iconVersion)` →
+  `/api/show-pages/<sid>/icon?v=<token>`. Any payload refresh that changed the
+  icon changed the token → a new `src` the `<img>` refetches on its own. No
+  notifier, no remount, no update-site enumeration; freshness rides the normal
+  React re-render. Unchanged icon → same URL → cache hit (flicker-free).
+- **The query never selects the file; it is a read-time CONTENT ASSERTION
+  (owner-adjudicated 2026-07-14, supersedes "the server never reads `?v=`").**
+  Resolution is still sid + workspace only — a `v` value can neither traverse nor
+  change which file is resolved. But `read_show_page_icon` now recomputes the
+  content token of the bytes it is about to serve and returns 404/`no-store` if it
+  does not match the requested `?v=`. This makes `immutable` semantically honest (a
+  URL maps to exactly one byte-content — no cache poisoning across a content
+  revert) and closes the resolve→read TOCTOU in the same code region: the resolved
+  candidate is opened `O_NOFOLLOW` (a symlink swapped in after resolve fails), the
+  size cap is re-checked on the DESCRIPTOR via `fstat` (a huge file swapped in is
+  rejected), then bounded-read. Wording: **"sid in the path selects the file; the
+  `?v=` token never selects it, it is validated as a content assertion after
+  sid-only resolution."** Tests: correct token → 200 immutable; wrong/missing/
+  path-shaped token → 404 (never the file a `v` names); symlink-swap and
+  over-cap-swap rejected on the descriptor path.
+  - _Threat-model note (ledger):_ this endpoint is the OWNER's authed `/api`
+    surface (NOT the public `/p/` share); the racing party is the user's own agent,
+    which already has local FS access — so the read-time hardening is
+    defense-in-depth, not a privilege boundary.
+- **Caching restored.** 200s are `Cache-Control: private, max-age=604800,
+  immutable` — honest now that `?v=` is enforced against the served bytes; 404s
+  stay `no-store`.
+- **Deleted.** `showPageIconRefresh` (notifier) and the `<img>` remount nonce are
+  removed entirely — this round is a net simplification (no dead code).
+- **Freshness invariant (test).** Overwriting the icon, or repointing
+  `<link rel=icon>`, changes `icon_version` in the next payload — asserted
+  directly, so no update-site enumeration exists anywhere.
+- **Serving is materialized bytes-or-404 (test).** The endpoint reads the icon
+  bytes INSIDE its `try` and returns a plain `Response`, not a lazy
+  `FileResponse`: a live-edit race (favicon rebuilt/removed after `resolve()`
+  accepted it) surfaces as an `OSError` → 404 instead of failing while a response
+  streams, and a `Range` header can never produce a 206/416 (a plain Response
+  ignores Range). Icons are small, so buffering is cheap.
+- **Size cap (test).** Because both the token hash (per inventory row) and the
+  materialized serve read the file in full, `resolve_show_page_icon` drops any icon
+  over `_ICON_MAX_BYTES` (2 MiB) to `None` (letter avatar) — a page can't point
+  `<link rel=icon>` at a screenshot/large asset and make `/api/show-pages` allocate
+  hundreds of MB. An icon renders ~40px, so the cap is generous.
+- **One workspace read chokepoint (owner-adjudicated 2026-07-14, tests).** All
+  three reads of agent-authored workspace files — `index.html` head (@64 KiB),
+  the icon token hash (@2 MiB), and the icon serve (@2 MiB) — go through a single
+  portable helper `_read_workspace_file_safely(path, limit, *, cap)`. It opens with
+  getattr-guarded `O_NOFOLLOW` (a swapped-in symlink is not followed; degrades to a
+  plain open on Windows, where the earlier unguarded `os.O_NOFOLLOW` would have
+  `AttributeError`ed → 500) **and** `O_NONBLOCK` (opening a swapped-in FIFO/device
+  returns immediately instead of BLOCKING on a writer — otherwise a hung
+  `/api/show-pages` request is user-visible), then `fstat`s the DESCRIPTOR to refuse
+  a non-regular target (and, with `cap`, an oversized one) before a bounded read.
+  Net simpler (dedupes three fd sites); no raw `read_bytes`/`open` on workspace
+  paths remains in the module. Helper tests: regular OK · symlink refused ·
+  oversize refused · FIFO refused (symlink/FIFO cases skip where the platform lacks
+  the flag/`mkfifo`, so windows-smoke stays green).
+  - _Threat-model note (ledger):_ owner-authed `/api` surface, racing party is the
+    user's own agent with local FS access → the swap/TOCTOU parts are
+    defense-in-depth; the Windows crash and the FIFO-hang-on-inventory were the
+    substantive bits (a hung inventory request is user-visible, not ledger material).
+- **Bounded load-retry (frontend; owner-accepted as-is 2026-07-14 — ledger).**
+  `ShowPageAvatarContent` retries a failed `<img>` up to `MAX_ICON_LOAD_ATTEMPTS`
+  (3) — `onError` remounts it via a per-URL attempt-count `key`, latching to the
+  letter only after the budget. In the versioned-URL model a permanently-absent
+  icon is a null `iconUrl` (letter, no `<img>`, no onError), so onError only ever
+  signals a transient/race failure — exactly the case worth retrying; the budget
+  resets when the URL changes. A longer persistent transient (or an exact
+  content-revert whose token is unchanged) falls back to the letter until a natural
+  remount / payload refresh — accepted for a DECORATIVE surface rather than
+  resurrecting the deleted notifier or adding timers.
+
+### 7.1g Window-close ergonomics (owner approved 2026-07-14 16:03)
+
+Browsers reserve ⌘W (tab close) — not interceptable in a normal tab. Two
+mitigations ship together (the fullscreen Keyboard-Lock capture was offered
+and NOT taken):
+
+- **⌥W closes the focused in-app window** (desktop): same target resolution
+  and guard flow as the existing window chords in WindowLayer
+  (activeElement→data-window-id, close-guard/confirmClose respected,
+  input/terminal exemptions consistent with existing chord handling; use
+  event.code KeyW).
+- **beforeunload guard**: while at least one NON-minimized app window is
+  open (PM default — minimized-only windows do not arm it; flag if wrong),
+  closing/leaving the tab triggers the browser's native confirm. No custom
+  copy (browsers ignore it). Must not interfere with the terminal's
+  existing pagehide cleanup path — verify.
+
+_Implementation note (matches shipped code): ⌥W reuses the existing
+`inTextEntrySurface` exemption (like the Alt+1-9 chord), so inputs, the Monaco
+editor, and the terminal keep Option+W for character entry — macOS emits a
+special char there; ⌥W closes when focus is elsewhere in a window. The
+beforeunload guard arms via the pure `shouldGuardUnload(windows)` predicate and
+is independent of the terminal's `pagehide` keepalive-DELETE, which still runs
+on a confirmed leave. Inside a Show Page **iframe** the bridge (`ShowPageApp`)
+listens on the iframe's `contentWindow` in the CAPTURE phase — the earliest point
+in the event path (window → document → element) — so a page's own
+`stopPropagation()` (even a capture-phase one) cannot swallow ⌥W; only the
+`inTextEntrySurface` exemption suppresses it._
 
 ### 7.2 Becoming an app: the ladder (owner Q&A 2026-07-13)
 

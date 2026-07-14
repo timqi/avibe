@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { MonitorX, PinOff } from 'lucide-react';
 
+import { inTextEntrySurface } from '../components/apps/windowChords';
 import { useApi } from '../context/ApiContext';
 import { useDock } from '../context/DockContext';
 import { useWindowManager } from '../context/WindowManagerContext';
@@ -23,8 +24,9 @@ export const ShowPageApp: React.FC<{ windowId: string; params?: Record<string, u
   // than the whole context value: the value object changes identity on every
   // window focus/minimize/drag tick, and depending on it here would re-run this
   // "read once" effect and re-hit /api/sessions on every such change (Codex).
-  const { setTitle, close } = useWindowManager();
+  const { setTitle, close, confirmClose } = useWindowManager();
   const { unpin } = useDock();
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
   const sessionId = typeof params?.sessionId === 'string' ? params.sessionId : '';
   // 'loading' optimistically frames the page (the common case: it exists);
@@ -58,6 +60,51 @@ export const ShowPageApp: React.FC<{ windowId: string; params?: Record<string, u
       cancelled = true;
     };
   }, [sessionId, api, setTitle, windowId]);
+
+  // Bridge ⌥W (close window) into the same-origin Show Page iframe: a keydown
+  // inside the iframe dispatches to ITS document and never bubbles to the parent
+  // WindowLayer listener, so without this ⌥W could not close the window while the
+  // user is interacting with the page content (Codex §7.1f review). Re-attach on
+  // each (re)load; text-entry surfaces inside the page keep Option+W for char entry.
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== 'KeyW' || !e.altKey || e.metaKey || e.ctrlKey || e.shiftKey) return;
+      let active: Element | null = null;
+      try {
+        active = iframe.contentDocument?.activeElement ?? null;
+      } catch {
+        active = null;
+      }
+      if (inTextEntrySurface(active)) return;
+      e.preventDefault();
+      if (confirmClose(windowId)) close(windowId);
+    };
+    const attach = () => {
+      try {
+        // Capture phase (`true`) on the iframe's WINDOW — the EARLIEST target in the
+        // event path (window → document → element). A page that installs its own
+        // capture-phase keydown listener and calls stopPropagation() would run before
+        // a document-level capture listener and still swallow ⌥W; the window capture
+        // runs before that, so only the explicit text-entry exemption above can
+        // suppress the close shortcut (Codex §7.1g review).
+        iframe.contentWindow?.addEventListener('keydown', onKeyDown, true);
+      } catch {
+        // Cross-origin (should not happen for the same-origin /show/ surface).
+      }
+    };
+    attach();
+    iframe.addEventListener('load', attach);
+    return () => {
+      iframe.removeEventListener('load', attach);
+      try {
+        iframe.contentWindow?.removeEventListener('keydown', onKeyDown, true);
+      } catch {
+        // Document already torn down.
+      }
+    };
+  }, [close, confirmClose, windowId]);
 
   if (!sessionId || state === 'missing') {
     return (
@@ -94,6 +141,7 @@ export const ShowPageApp: React.FC<{ windowId: string; params?: Record<string, u
   // per the standing product decision we do NOT harden it here.
   return (
     <iframe
+      ref={iframeRef}
       title={t('chat.showPage.title')}
       src={showPagePrivatePath(sessionId)}
       sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads"

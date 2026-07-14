@@ -14,6 +14,10 @@ export interface ShowPage {
   platform: string | null;
   agent: string | null;
   path: string;
+  /** Opaque cache token for the page's own HTML icon (§7.1f): non-null iff a
+   *  servable icon exists, and it changes when the icon file changes. Doubles as
+   *  the has-icon signal and is appended to the icon URL as `?v=<token>`. */
+  icon_version: string | null;
   active_url: string | null;
   private_url: string | null;
   public_url: string | null;

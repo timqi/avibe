@@ -339,6 +339,273 @@ def test_private_show_page_uses_runtime_when_available(monkeypatch, tmp_path):
     assert "x-vibe-csrf-token" not in manager.calls[0][2]
 
 
+def _icon_token(session_id: str) -> str:
+    # The correct ?v= token the frontend would send (same source as the payload).
+    from core.show_pages import show_page_icon_version
+
+    return show_page_icon_version(session_id) or ""
+
+
+def test_show_page_icon_endpoint_serves_static_with_hardened_headers(monkeypatch, tmp_path):
+    # §7.1f: the dedicated icon endpoint resolves the page's own <link rel=icon>
+    # against document semantics and streams the file — statically, never booting
+    # the Show Runtime (listing apps would otherwise start a runtime per icon).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+    page_dir = ensure_show_page_dir("ses123")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    (page_dir / "favicon.svg").write_text("<svg/>", encoding="utf-8")
+    manager = _FakeShowRuntimeManager(body=b"<h1>Runtime Page</h1>")
+    set_show_runtime_manager_for_tests(manager)
+    try:
+        response = app.test_client().get(
+            f"/api/show-pages/ses123/icon?v={_icon_token('ses123')}", base_url="http://127.0.0.1:5123"
+        )
+    finally:
+        set_show_runtime_manager_for_tests(None)
+
+    assert response.status_code == 200
+    assert response.content == b"<svg/>"
+    assert response.headers["content-type"] == "image/svg+xml"
+    # Hardened static-asset headers: no sniffing, sandboxed, privately cacheable.
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    # The route sets `sandbox`; the app-wide vault-sandbox hook then composes its
+    # frame-src onto it. The bare `sandbox` directive stays present + effective
+    # (a page-authored SVG is rendered in an opaque origin with scripts disabled).
+    csp_directives = [d.strip() for d in response.headers["Content-Security-Policy"].split(";")]
+    assert "sandbox" in csp_directives
+    # `immutable` is honest because ?v= is enforced against the served bytes.
+    assert response.headers["Cache-Control"] == "private, max-age=604800, immutable"
+    # Serving the icon never contacted the Show Runtime.
+    assert manager.calls == []
+
+
+def test_show_page_icon_endpoint_enforces_token_without_selecting_the_file(monkeypatch, tmp_path):
+    # §7.1f (token-enforcement): resolution derives ONLY from the sid + workspace —
+    # `?v=` NEVER selects the file. The CORRECT token serves the favicon; a
+    # wrong/missing/path-shaped token is a 404, and NEVER the file a `v` value names
+    # (no traversal, no wrong-file serve). This is the honest-`immutable` guarantee:
+    # a URL maps to exactly one byte-content.
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+    page_dir = ensure_show_page_dir("ses123")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    (page_dir / "favicon.svg").write_text("<svg/>", encoding="utf-8")
+    # Files a hostile query would try to reach if the endpoint ever RESOLVED via ?v=.
+    (page_dir / "secret.svg").write_text("<svg>secret</svg>", encoding="utf-8")
+    (tmp_path / "outside.svg").write_text("<svg>outside</svg>", encoding="utf-8")
+    client = app.test_client()
+
+    ok = client.get(f"/api/show-pages/ses123/icon?v={_icon_token('ses123')}", base_url="http://127.0.0.1:5123")
+    assert ok.status_code == 200
+    assert ok.content == b"<svg/>"
+
+    for query in (
+        "",  # missing v
+        "?v=abc123",  # a wrong token
+        "?v=../../secret.svg",  # traversal-shaped
+        "?v=../../../outside.svg",
+        "?v=%2e%2e%2fsecret.svg",  # encoded traversal-shaped
+        "?v=secret.svg",  # names a real in-workspace file
+        "?v=" + "z" * 5000,  # junk
+    ):
+        response = client.get(f"/api/show-pages/ses123/icon{query}", base_url="http://127.0.0.1:5123")
+        assert response.status_code == 404, query  # never resolves a different file
+        assert b"secret" not in response.content, query
+        assert b"outside" not in response.content, query
+
+
+def test_show_page_icon_endpoint_ignores_range_header(monkeypatch, tmp_path):
+    # The icon is a bytes-or-404 chokepoint: a `Range` header must NOT turn it into
+    # a 206/416 partial (the materialized plain Response never honors Range) — it
+    # always serves the full 200 (Codex).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+    page_dir = ensure_show_page_dir("ses123")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    (page_dir / "favicon.svg").write_text("<svg>abcdefghij</svg>", encoding="utf-8")
+
+    response = app.test_client().get(
+        f"/api/show-pages/ses123/icon?v={_icon_token('ses123')}",
+        base_url="http://127.0.0.1:5123",
+        headers={"Range": "bytes=0-3"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"<svg>abcdefghij</svg>"
+    assert "Content-Range" not in response.headers
+
+
+def test_show_page_icon_endpoint_404s_when_file_vanishes_after_resolve(monkeypatch, tmp_path):
+    # Live-edit race: resolve_show_page_icon accepts the icon, then the file is
+    # rebuilt/removed before the bytes are read. Because the endpoint materializes
+    # the bytes INSIDE its try, the OSError degrades to the 404 letter fallback —
+    # not a 500 raised while a lazy FileResponse streams (Codex).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+    vanished = ensure_show_page_dir("ses123") / "vanished.svg"  # never created on disk
+    monkeypatch.setattr(
+        "core.show_pages.resolve_show_page_icon",
+        lambda session_id: (vanished, "image/svg+xml"),
+    )
+
+    response = app.test_client().get("/api/show-pages/ses123/icon", base_url="http://127.0.0.1:5123")
+
+    assert response.status_code == 404
+    assert response.headers.get("Cache-Control") == "no-store"
+
+
+def test_show_page_icon_endpoint_serves_offline_pages(monkeypatch, tmp_path):
+    # An offline page still advertises a token and is listed in the inventory, so its
+    # static icon must serve too — gating by visibility would strand offline rows /
+    # pinned offline apps on the letter avatar despite a real icon (Codex).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "offline")
+    page_dir = ensure_show_page_dir("ses123")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    (page_dir / "favicon.svg").write_text("<svg/>", encoding="utf-8")
+
+    response = app.test_client().get(
+        f"/api/show-pages/ses123/icon?v={_icon_token('ses123')}", base_url="http://127.0.0.1:5123"
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"<svg/>"
+
+
+def test_show_page_icon_endpoint_not_found_is_uncacheable(monkeypatch, tmp_path):
+    # The 404 for a page with no icon carries `no-store` so a heuristically-cached
+    # negative response can't strand the letter fallback once the icon is added (Codex).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")  # default scaffold: no icon link
+
+    response = app.test_client().get("/api/show-pages/ses123/icon", base_url="http://127.0.0.1:5123")
+
+    assert response.status_code == 404
+    assert response.headers.get("Cache-Control") == "no-store"
+
+
+def test_show_page_icon_endpoint_404s_malformed_session_id(monkeypatch, tmp_path):
+    # A session id that fails validate_session_id raises ShowPageError in store.get;
+    # the endpoint must catch it and 404 (letter fallback), never 500 (Codex).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+
+    response = app.test_client().get("/api/show-pages/!/icon", base_url="http://127.0.0.1:5123")
+
+    assert response.status_code == 404
+
+
+def test_show_page_icon_endpoint_404s_filesystem_invalid_icon(monkeypatch, tmp_path):
+    # A page-authored href that resolves to a filesystem-invalid path (an overlong
+    # filename) makes Path.resolve()/stat raise OSError; the endpoint must 404, never
+    # 500 (Codex). resolve_show_page_icon contains it; the boundary is belt-and-braces.
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+    page_dir = ensure_show_page_dir("ses123")
+    (page_dir / "index.html").write_text(
+        f'<link rel="icon" href="{"a" * 300}.png">', encoding="utf-8"
+    )
+
+    response = app.test_client().get("/api/show-pages/ses123/icon", base_url="http://127.0.0.1:5123")
+
+    assert response.status_code == 404
+
+
+def test_show_page_icon_endpoint_resolves_through_base_href(monkeypatch, tmp_path):
+    # The endpoint honors <base href> exactly as the browser would: the icon lives
+    # under assets/ and is served, proving the resolver runs server-side (the URL
+    # carries only the session id).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+    page_dir = ensure_show_page_dir("ses123")
+    (page_dir / "index.html").write_text(
+        '<head><base href="assets/"><link rel="icon" href="logo.png"></head>', encoding="utf-8"
+    )
+    (page_dir / "assets").mkdir()
+    (page_dir / "assets" / "logo.png").write_bytes(b"\x89PNG\r\n")
+
+    response = app.test_client().get(
+        f"/api/show-pages/ses123/icon?v={_icon_token('ses123')}", base_url="http://127.0.0.1:5123"
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"\x89PNG\r\n"
+    assert response.headers["content-type"] == "image/png"
+
+
+def test_show_page_icon_endpoint_404_when_no_icon(monkeypatch, tmp_path):
+    # The default scaffold ships no <link rel=icon>; the endpoint 404s so the tile
+    # falls back to the letter avatar.
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")  # default index has no icon link
+
+    response = app.test_client().get("/api/show-pages/ses123/icon", base_url="http://127.0.0.1:5123")
+
+    assert response.status_code == 404
+
+
+def test_show_page_icon_endpoint_404_on_policy_rejections(monkeypatch, tmp_path):
+    # Every policy rejection collapses to a 404 (never a redirect, never a partial
+    # serve): runtime api/ + __show/ paths, non-image extensions, and traversal
+    # escapes — even when the traversal target really exists on disk.
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+    page_dir = ensure_show_page_dir("ses123")
+    (tmp_path / "outside_secret.svg").write_text("<svg>secret</svg>", encoding="utf-8")
+    for href in ("api/health", "icon.txt", "../../outside_secret.svg", "__show/events.png"):
+        (page_dir / "index.html").write_text(f'<link rel="icon" href="{href}">', encoding="utf-8")
+        response = app.test_client().get("/api/show-pages/ses123/icon", base_url="http://127.0.0.1:5123")
+        assert response.status_code == 404, href
+        assert b"secret" not in response.content, href
+
+
+def test_show_page_icon_endpoint_404_when_target_missing(monkeypatch, tmp_path):
+    # A whitelisted, in-workspace href whose file does not exist is a 404 (the
+    # <link> may reference an icon the page never actually shipped).
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+    page_dir = ensure_show_page_dir("ses123")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+
+    response = app.test_client().get("/api/show-pages/ses123/icon", base_url="http://127.0.0.1:5123")
+
+    assert response.status_code == 404
+
+
+def test_show_page_icon_endpoint_requires_remote_login(monkeypatch, tmp_path):
+    # Auth parity with the rest of /api: a remote request without a session is
+    # bounced, so the icon (which can embed page-authored SVG) is never exposed
+    # anonymously. The icon exists, so a 200 here would be a real regression.
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+    page_dir = ensure_show_page_dir("ses123")
+    (page_dir / "index.html").write_text('<link rel="icon" href="favicon.svg">', encoding="utf-8")
+    (page_dir / "favicon.svg").write_text("<svg/>", encoding="utf-8")
+
+    response = app.test_client().get(
+        "/api/show-pages/ses123/icon",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        follow_redirects=False,
+    )
+
+    assert response.status_code != 200  # bounced/denied, never served anonymously
+    assert response.content != b"<svg/>"
+
+
 def test_private_show_page_materializes_workspace_before_runtime_proxy(monkeypatch, tmp_path):
     monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
     _save_config(tmp_path)

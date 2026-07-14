@@ -3,12 +3,15 @@ from __future__ import annotations
 import re
 import hashlib
 import hmac
+import os
 import secrets
+import stat as stat_module
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin, urlsplit
 
 from sqlalchemy import insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -31,6 +34,30 @@ SHOW_EVENT_WRITE_TOKEN_COOKIE = "vibe_show_event_token"
 SHOW_EVENT_WRITE_TOKEN_HEADER = "X-Vibe-Show-Token"
 SHOW_CLI_EVENT_TOKEN_HEADER = "X-Vibe-Show-Cli-Token"
 SHOW_RUNTIME_RECOVERY_LOADING_DELAY_SECONDS = 30
+# Only the head of index.html is scanned for the icon <link> (it lives in <head>,
+# at the top). Bounds the per-page read so a huge inline page can't stall
+# /api/show-pages or allocate a large string (§7.1f review).
+_ICON_INDEX_HEAD_LIMIT = 64 * 1024
+# Hard cap on a servable icon's file size. A page could point <link rel="icon"> at a
+# large in-workspace asset (a screenshot, a generated image with a whitelisted
+# extension); resolving/serving it would read the whole file into memory, and the
+# token hash runs for EVERY row of /api/show-pages. Above the cap the icon is treated
+# as "no icon" (letter avatar) so the inventory can't be made to allocate hundreds of
+# MB. An icon is displayed ~40px — 2 MiB is already very generous (§7.1f review).
+_ICON_MAX_BYTES = 2 * 1024 * 1024
+# Whitelisted image extensions -> Content-Type served by the icon endpoint. A page
+# icon MUST be one of these (§7.1f): anything else is treated as "no icon" so a page
+# can't smuggle an executable/HTML asset through the thumbnail. Shared by the
+# resolver (has-icon policy) and the serving endpoint (content-type) — one source.
+SHOW_PAGE_ICON_CONTENT_TYPES: dict[str, str] = {
+    "svg": "image/svg+xml",
+    "png": "image/png",
+    "ico": "image/x-icon",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "gif": "image/gif",
+}
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 # A custom public share suffix lands directly in the ``/p/<share_id>/`` URL, so
 # keep it to URL-safe slug characters: start and end alphanumeric, with dash and
@@ -495,6 +522,297 @@ def _page_from_row(row: Any) -> ShowPage:
     )
 
 
+class _IconLinkFinder(HTMLParser):
+    """Capture the first ``<link rel="icon">`` href — and the ``<base href>`` in
+    effect before it — from an HTML document.
+
+    Tolerant, stdlib-only (html.parser, no new deps): a ``<link>`` whose ``rel``
+    token set includes ``icon`` matches (so ``icon`` and ``shortcut icon`` do,
+    ``apple-touch-icon`` does not). ``base_href`` holds the first ``<base href>``
+    seen BEFORE the icon link (a base applies only to later URLs); recording stops
+    once the icon link is found. Pure string extraction — never fetches/resolves.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.icon_href: str | None = None
+        self.base_href: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.icon_href is not None:
+            return
+        name = tag.lower()
+        values = {attr.lower(): (value or "") for attr, value in attrs}
+        if name == "base":
+            if self.base_href is None:
+                href = values.get("href", "").strip()
+                if href:
+                    self.base_href = href
+        elif name == "link" and "icon" in values.get("rel", "").lower().split():
+            href = values.get("href", "").strip()
+            if href:
+                self.icon_href = href
+
+
+def _resolve_show_page_icon_href(href: str, base_href: str | None) -> str | None:
+    """Resolve a page's icon href to a same-workspace relative path, or None.
+
+    Resolves with DOCUMENT semantics — the browser percent-decodes the href and any
+    ``<base href>``, treats backslashes as slashes, then joins them the way it
+    resolves ``<img src>`` — so ``<base href="assets/">`` + ``favicon.svg`` becomes
+    ``assets/favicon.svg`` and ``%2e%2e/x`` / ``..\\x`` are caught. Returns None
+    unless the result lands inside the page's own workspace AND names a static,
+    whitelisted image: absolute / root-relative (``/w/…``, ``/icon.svg``) / external /
+    other-scheme / malformed hrefs, parent traversal, runtime API/event paths
+    (``api/`` / ``__show/`` / ``__events``), the generic ``vite.svg`` scaffold mascot,
+    and non-whitelisted extensions all yield None (the letter avatar is preferred).
+    Pure — no I/O.
+    """
+
+    def _normalize(value: str) -> str:
+        return unquote(value).replace("\\", "/")
+
+    def _escapes_workspace(value: str) -> bool:
+        # A ref resolves INSIDE /show/<sid>/ only if it is purely RELATIVE. The
+        # browser roots a leading-"/" ref (``/w/icon.svg``, ``/icon.svg``) or a
+        # ``//host`` ref at the ORIGIN — not the workspace — and a ``..`` segment
+        # climbs out. These must reject up front: otherwise a literal ``/w/…`` would
+        # collide with the synthetic prefix below and be mis-served as if relative.
+        normalized = _normalize(value)
+        if not normalized or normalized.startswith("/"):
+            return True
+        if urlsplit(normalized).scheme:  # http:, data:, javascript:, …
+            return True
+        return ".." in normalized.split("/")
+
+    # Resolve href (and any <base>) with document semantics against a synthetic
+    # same-origin workspace root, rejecting non-relative refs first. ANY malformed
+    # URL is treated as "no icon", never raised: _extract_icon_path runs while
+    # building /api/show-pages, so one bad page must fall back to the letter avatar
+    # rather than break the whole Show Pages / Dock inventory request.
+    try:
+        if _escapes_workspace(href):
+            return None
+        if base_href is not None and _escapes_workspace(base_href):
+            return None
+        doc_base = "http://show.invalid/w/"
+        base_url = urljoin(doc_base, _normalize(base_href)) if base_href else doc_base
+        resolved = urlsplit(urljoin(base_url, _normalize(href)))
+    except ValueError:
+        return None  # malformed href/base → no icon (never break the inventory)
+    if resolved.scheme != "http" or resolved.netloc != "show.invalid":
+        return None  # external / protocol-relative / other scheme (defense in depth)
+    prefix = "/w/"
+    if not resolved.path.startswith(prefix):
+        return None  # absolute or ../ traversal escaped the workspace
+    relative = resolved.path[len(prefix) :]
+    if not relative:
+        return None
+    segments = [segment for segment in relative.split("/") if segment]
+    if segments[0].lower() in {"api", "__show", "__events"}:
+        return None  # runtime API/event paths are not static icons
+    if any(segment.startswith(".") for segment in segments):
+        # Hidden / dot segments (.git/x.png, .env.svg, assets/.secret.png) are
+        # denied for icons exactly as the Show Page static server denies them
+        # (_is_show_page_dot_path); the icon endpoint must not become a bypass for
+        # that policy. (Sensitive non-image files are already blocked by the image
+        # extension whitelist below; this closes image-extension dot-files.)
+        return None
+    filename = segments[-1]
+    if filename.lower() == "vite.svg":
+        return None  # generic scaffold mascot → letter avatar
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in SHOW_PAGE_ICON_CONTENT_TYPES:
+        return None
+    return relative
+
+
+def _read_fd_fully(fd: int, size: int) -> bytes:
+    """Read exactly ``size`` bytes from ``fd`` (handling short reads)."""
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_workspace_file_safely(path: Path, limit: int, *, cap: bool = False) -> bytes | None:
+    """Race/DoS-safe read of a REGULAR workspace file, or None — the ONE chokepoint
+    for reading agent-authored workspace files (index.html, icons).
+
+    Opens ``path`` with getattr-guarded ``O_NOFOLLOW`` (a symlink swapped in after an
+    earlier check is NOT followed) and ``O_NONBLOCK`` (opening a FIFO/device returns
+    immediately instead of BLOCKING on a writer — the fstat below then refuses it,
+    so a swapped-in special file can never hang an ``/api/show-pages`` request; both
+    flags degrade to a plain open where absent, e.g. native Windows). It re-checks on
+    the DESCRIPTOR via ``fstat`` that the target is a REGULAR file, then bounded-reads.
+
+    ``cap=False`` (default): read up to ``limit`` bytes — a HEAD scan of a
+    possibly-large file (index.html, whose ``<head>`` is at the top). ``cap=True``:
+    a file LARGER than ``limit`` is refused (None) — for a file that must be read in
+    FULL within a cap (an icon: hash + serve). Returns None for missing / symlink /
+    non-regular / (capped) oversized / unreadable; never raises, never blocks.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat_module.S_ISREG(info.st_mode):
+            return None  # symlink target that isn't regular, FIFO/device swapped in
+        if cap and info.st_size > limit:
+            return None  # oversized (e.g. a screenshot advertised as an icon)
+        return _read_fd_fully(fd, info.st_size if cap else min(info.st_size, limit))
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _extract_icon_path(page_dir: Path) -> str | None:
+    """The page's own favicon as a same-workspace relative path, or None.
+
+    Reads ONLY the head (bounded) of a REGULAR ``<page_dir>/index.html`` — never a
+    symlink/special file, never any other file, never the icon itself — extracts the
+    first ``<link rel="icon">`` href (with any ``<base href>``), and resolves +
+    validates it via :func:`_resolve_show_page_icon_href`. The returned path is served
+    ONLY through ``GET /api/show-pages/<sid>/icon``; callers use its presence as the
+    has-icon signal, never to compose a URL.
+    """
+    # Head scan of a REGULAR index.html through the safe-read chokepoint: an oversized
+    # inline page — or a symlink / special file an agent dropped in (or swapped in
+    # mid-check) — must not stall /api/show-pages or allocate a huge string.
+    raw = _read_workspace_file_safely(page_dir / "index.html", _ICON_INDEX_HEAD_LIMIT)
+    if raw is None:
+        return None
+    html = raw.decode("utf-8", errors="replace")
+    finder = _IconLinkFinder()
+    try:
+        finder.feed(html)
+    except Exception:
+        # Malformed markup: prefer the letter avatar over guessing.
+        return None
+    href = (finder.icon_href or "").strip()
+    if not href:
+        return None
+    return _resolve_show_page_icon_href(href, finder.base_href)
+
+
+def resolve_show_page_icon(session_id: str) -> tuple[Path, str] | None:
+    """The absolute path + Content-Type of a Show Page's own icon, or None.
+
+    The single serving chokepoint for ``GET /api/show-pages/<sid>/icon``: combines
+    :func:`_extract_icon_path` (document-semantics resolution + policy) with the
+    same-workspace realpath guard, regular-file check, and extension whitelist, so
+    the serving layer just streams the file. Returns None for any missing workspace
+    / no icon / policy rejection — the caller answers 404 and the frontend falls
+    back to the letter avatar.
+    """
+    page_dir = show_page_dir(session_id)
+    relative = _extract_icon_path(page_dir)
+    if relative is None:
+        return None
+    try:
+        candidate = (page_dir / relative).resolve()
+        root = page_dir.resolve()
+        # Realpath must stay inside the workspace (defends against an in-workspace
+        # symlink pointing out) and be a regular file of a whitelisted image type.
+        if candidate != root and root not in candidate.parents:
+            return None
+        if not candidate.is_file():
+            return None
+        if candidate.stat().st_size > _ICON_MAX_BYTES:
+            # An oversized "icon" (e.g. a screenshot) → letter avatar; never hashed
+            # or served in full, bounding /api/show-pages + endpoint memory.
+            return None
+    except (ValueError, OSError):
+        # A page-authored href can resolve to a filesystem-invalid path (embedded
+        # NUL, an overlong filename): that is "no icon" (letter avatar), never an
+        # error to surface — this helper must return None rather than raise.
+        return None
+    content_type = SHOW_PAGE_ICON_CONTENT_TYPES.get(candidate.suffix.lower().lstrip("."))
+    if content_type is None:
+        return None
+    return candidate, content_type
+
+
+def show_page_icon_version(session_id: str) -> str | None:
+    """An opaque cache token for a page's servable icon, or None when it has none.
+
+    The token is a short digest of the resolved icon file's CONTENT, so any byte
+    change — overwriting the favicon, repointing ``<link rel="icon">``, or a
+    same-size/same-mtime regeneration — changes the token, and therefore the ``?v=``
+    on the icon URL, with NO update-site enumeration anywhere in the client (the
+    freshness rides the normal payload refresh). Identical bytes yield an identical
+    token, so an unchanged icon stays a cache hit. Carried in the payload as the
+    has-icon signal; the frontend appends it verbatim as ``?v=<token>``. The icon
+    endpoint's ``?v=`` NEVER selects the file — resolution is derived only from the
+    session id + workspace — it is validated as a content assertion at read time
+    (see :func:`read_show_page_icon`).
+    """
+    resolved = resolve_show_page_icon(session_id)
+    if resolved is None:
+        return None
+    candidate, _content_type = resolved
+    # Read through the safe-read chokepoint (cap=True): bounded to the icon cap and
+    # race-safe (a swap to a symlink / huge file / FIFO after resolve is refused, not
+    # followed / buffered / blocked on) — the token path must be as hardened as the
+    # serving path since it runs for EVERY /api/show-pages + `vibe show list` row.
+    data = _read_workspace_file_safely(candidate, _ICON_MAX_BYTES, cap=True)
+    if data is None:
+        return None
+    # Hash the icon's CONTENT so the token changes for ANY byte change — including a
+    # regeneration that preserves path, size, AND mtime (`cp -p`/`rsync`-style copies,
+    # deterministic build artifacts), which an mtime+size identity would miss under
+    # `immutable` caching. Content-addressed: identical bytes → identical token (the
+    # icon is unchanged, so the ?v= URL correctly stays a cache hit); different bytes
+    # → different token → new URL → refetch. Icons are small, so hashing is cheap.
+    return _icon_content_token(data)
+
+
+def _icon_content_token(data: bytes) -> str:
+    """The opaque icon cache token for a byte string — the one algorithm shared by
+    the payload (:func:`show_page_icon_version`) and the read-time enforcement
+    (:func:`read_show_page_icon`), so they can never drift apart."""
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def read_show_page_icon(session_id: str, expected_version: str) -> tuple[bytes, str] | None:
+    """Icon bytes + Content-Type for serving, or None — a race-safe, token-enforced
+    read for ``GET /api/show-pages/<sid>/icon?v=<token>``.
+
+    Resolution is still sid-only (:func:`resolve_show_page_icon`); ``?v=`` NEVER
+    selects the file, it is validated as a CONTENT ASSERTION here so the stable URL's
+    ``immutable`` cache is honest (a given URL maps to exactly one byte-content). The
+    read closes the resolve→read TOCTOU: the resolved candidate is opened
+    ``O_NOFOLLOW`` (a symlink swapped in after resolve fails), re-checked on the
+    DESCRIPTOR via ``fstat`` (regular file, still within the size cap — a huge file
+    swapped in is rejected), and bounded-read. Returns None (→ 404 no-store) for a
+    missing/oversized/non-regular target, a swap, or a token mismatch (the content
+    changed since the payload advertised it, or no token was supplied). No exception
+    escapes.
+    """
+    resolved = resolve_show_page_icon(session_id)
+    if resolved is None:
+        return None
+    candidate, content_type = resolved
+    # Race-safe read through the shared chokepoint (cap=True): O_NOFOLLOW open +
+    # fstat regular-file/size-cap re-check on the descriptor + bounded read, so a
+    # symlink / huge file / FIFO swapped in after resolve is refused, not served.
+    data = _read_workspace_file_safely(candidate, _ICON_MAX_BYTES, cap=True)
+    if data is None:
+        return None
+    if not expected_version or _icon_content_token(data) != expected_version:
+        return None  # ?v= is a content assertion: mismatch/absent → 404 (no poison)
+    return data, content_type
+
+
 def show_page_payload(page: ShowPage, *, config: V2Config | None = None) -> dict[str, Any]:
     path = show_page_dir(page.session_id)
     private = private_url(page.session_id, config=config)
@@ -509,6 +827,10 @@ def show_page_payload(page: ShowPage, *, config: V2Config | None = None) -> dict
         "session_id": page.session_id,
         "visibility": page.visibility,
         "path": str(path),
+        # Opaque cache token (not a path): non-null iff a servable icon exists, and
+        # it changes when the icon file changes so the frontend's ?v=<token> busts
+        # the cache with no update-site enumeration (§7.1f versioned-URL).
+        "icon_version": show_page_icon_version(page.session_id),
         "active_url": active_url,
         "private_url": private,
         "public_url": public,
