@@ -351,7 +351,10 @@ class ShowPageStore:
             )
         return _page_from_row(row), created
 
-    def _is_archived(self, session_id: str) -> bool:
+    def is_archived(self, session_id: str) -> bool:
+        """Whether the session is archived (terminal). Archived sessions reject Show Page
+        mutations with ``session_archived`` — see ``ensure_active`` / ``update_visibility``
+        / ``set_share_id`` here and the icon-upload guard in ``vibe.api``."""
         with self.engine.connect() as conn:
             status = conn.execute(
                 select(agent_sessions.c.status).where(agent_sessions.c.id == session_id)
@@ -366,7 +369,7 @@ class ShowPageStore:
         # default (private) page row for an archived session — that would leave
         # ``/show/<id>/`` enabled for a terminal session. The in-txn check below
         # is the atomic authority for the concurrent-archive race.
-        if visibility != VISIBILITY_OFFLINE and self._is_archived(session_id):
+        if visibility != VISIBILITY_OFFLINE and self.is_archived(session_id):
             raise ShowPageError(
                 "Cannot republish the Show Page of an archived session.",
                 code="session_archived",
@@ -404,7 +407,7 @@ class ShowPageStore:
         # Same guard as update_visibility, before ``ensure`` materializes a page:
         # an archived session is terminal, so its share link can't be rotated /
         # re-enabled (and a stale/direct call must not create a default page).
-        if self._is_archived(session_id):
+        if self.is_archived(session_id):
             raise ShowPageError(
                 "Cannot rotate the share link of an archived session.",
                 code="session_archived",
@@ -443,7 +446,7 @@ class ShowPageStore:
         # default page for an archived (terminal) session. The in-txn re-reads
         # below are the atomic authority for the concurrent-archive / concurrent
         # visibility-flip race.
-        if self._is_archived(session_id):
+        if self.is_archived(session_id):
             raise ShowPageError(
                 "Cannot change the share link of an archived session.",
                 code="session_archived",
@@ -706,14 +709,13 @@ def _extract_icon_path(page_dir: Path) -> str | None:
 
 # Workspace-conventional favicon locations, tried IN ORDER when the page declares no
 # usable <link rel="icon"> (§7.1h): most agent-built pages ship no link tag at all, so
-# these give them an icon from the common spots — root first, then Vite's public/.
-_CONVENTIONAL_ICON_RELATIVES: tuple[str, ...] = (
-    "favicon.svg",
-    "favicon.ico",
-    "favicon.png",
-    "public/favicon.svg",
-    "public/favicon.ico",
-    "public/favicon.png",
+# these give them an icon from the common spots — root first, then Vite's public/. The
+# extension order (svg vector first, down to raster) covers EVERY uploadable/servable
+# favicon type so an icon uploaded via POST .../icon (§7.1j, which writes favicon.<ext>)
+# is resolved here regardless of its type.
+_CONVENTIONAL_ICON_EXTS: tuple[str, ...] = ("svg", "ico", "png", "webp", "jpg", "jpeg")
+_CONVENTIONAL_ICON_RELATIVES: tuple[str, ...] = tuple(
+    f"{prefix}favicon.{ext}" for prefix in ("", "public/") for ext in _CONVENTIONAL_ICON_EXTS
 )
 
 
@@ -842,6 +844,141 @@ def read_show_page_icon(session_id: str, expected_version: str) -> tuple[bytes, 
     return data, content_type
 
 
+# --- Icon self-serve upload (§7.1j) -------------------------------------------------
+# A user can upload an image from the App Library as a page's icon. The upload writes
+# the workspace-root CONVENTIONAL favicon (favicon.<ext>) that resolve_show_page_icon
+# already picks up (§7.1h) — so the SERVER chooses the on-disk name and the client
+# never supplies a path. It is the inverse of the read side and shares the same cap +
+# whitelist; index.html is never edited, so an explicit usable <link rel=icon> still
+# WINS (§7.1f resolution order) — the editor just covers the common no-link case.
+#
+# Public so the ui_server upload route can size the multipart parser / Content-Length
+# guard from the same number write_show_page_icon re-checks the actual bytes against.
+SHOW_PAGE_ICON_MAX_UPLOAD_BYTES = _ICON_MAX_BYTES  # 2 MiB
+# Accepted upload content-types -> the single canonical on-disk extension. The owner's
+# whitelist (§7.1j) is svg/png/ico/jpg/jpeg/webp — a subset of the servable set (no gif).
+_ICON_UPLOAD_CONTENT_TYPE_EXT = {
+    "image/svg+xml": "svg",
+    "image/png": "png",
+    "image/x-icon": "ico",
+    "image/vnd.microsoft.icon": "ico",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+}
+# Accepted filename extensions -> canonical on-disk extension (jpeg folds to jpg).
+_ICON_UPLOAD_NAME_EXT = {
+    "svg": "svg",
+    "png": "png",
+    "ico": "ico",
+    "jpg": "jpg",
+    "jpeg": "jpg",
+    "webp": "webp",
+}
+
+
+def _canonical_upload_icon_ext(filename: str | None, content_type: str | None) -> str | None:
+    """The one on-disk extension for an uploaded icon, or None if it isn't whitelisted.
+
+    Derived from the content-type first, then the filename suffix (jpeg→jpg). A
+    recognizable, whitelisted signal that DISAGREES with the other is refused (a PNG
+    announced as ``image/svg+xml`` is suspicious), so the server writes exactly the type
+    it validated. Falling back to the filename is limited to a BLANK or generic
+    (``application/octet-stream``) content-type: an EXPLICIT, non-generic type that isn't
+    a whitelisted image is a rejection signal (a ``text/html`` body named ``logo.svg`` is
+    not an icon), not something to accept on the extension alone. None → the route answers
+    415 rather than guessing an extension."""
+    raw_type = (content_type or "").split(";", 1)[0].strip().lower()
+    type_ext = _ICON_UPLOAD_CONTENT_TYPE_EXT.get(raw_type)
+    if type_ext is None and raw_type and raw_type != "application/octet-stream":
+        return None  # an explicit, non-image content-type → reject, don't trust the name
+    name_ext = _ICON_UPLOAD_NAME_EXT.get(Path(filename or "").suffix.lower().lstrip("."))
+    if type_ext and name_ext and type_ext != name_ext:
+        return None
+    return type_ext or name_ext
+
+
+def _unlink_quietly(path: Path) -> None:
+    """Remove a directory ENTRY (a symlink is unlinked itself, never followed), ignoring
+    a missing / again-racing target. Used to clear old favicon.* before an atomic write."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _write_root_favicon_atomically(page_dir: Path, ext: str, data: bytes) -> None:
+    """Write ``<page_dir>/favicon.<ext>`` as the SOLE conventional root icon, safely, and
+    WITHOUT destroying the existing icon unless the replacement actually lands.
+
+    The new bytes go to a fresh ``O_EXCL | O_NOFOLLOW`` temp and are atomically
+    ``os.replace``d onto ``favicon.<ext>`` FIRST — so a failure while opening/writing the
+    temp or replacing (e.g. disk full mid-upload) raises with every existing favicon still
+    in place (no data loss — §7.1j review P2). ONLY AFTER the new file lands are the
+    OTHER-extension root ``favicon.*`` removed, leaving exactly one conventional source
+    (e.g. a prior ``favicon.svg`` after uploading ``favicon.png``, which would otherwise
+    shadow it in the resolver's svg>ico>png>… order). ``os.replace`` swaps the final NAME
+    without following a symlink raced back in, and no reader sees a half-written icon.
+    Threat model: the racing party is the user's own agent with local FS access, so the
+    swap guards are defense-in-depth, not a boundary — but a symlinked/partial favicon
+    must never become servable."""
+    target = page_dir / f"favicon.{ext}"
+    tmp = page_dir / f".favicon.{ext}.{secrets.token_hex(8)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        # Atomic: overwrites any existing favicon.<ext> in place (a symlink at the name is
+        # replaced, not followed). Old favicons of every extension are still intact here.
+        os.replace(tmp, target)
+    except BaseException:
+        _unlink_quietly(tmp)
+        raise
+    # The replacement has landed — now drop the OTHER-extension root favicons so exactly
+    # one conventional source remains. Done last so a failed write above never orphans the
+    # page icon-less. EXCEPT a root favicon the page explicitly links from index.html:
+    # deleting it would 404 the page's own <link rel=icon> (which still WINS in the
+    # resolver — we never edit index.html), so preserve that one (§7.1j review P2).
+    linked = _extract_icon_path(page_dir)
+    for servable_ext in SHOW_PAGE_ICON_CONTENT_TYPES:
+        if servable_ext == ext:
+            continue
+        sibling_rel = f"favicon.{servable_ext}"
+        if sibling_rel == linked:
+            continue
+        _unlink_quietly(page_dir / sibling_rel)
+
+
+def write_show_page_icon(
+    session_id: str, data: bytes, *, filename: str | None, content_type: str | None
+) -> str | None:
+    """Write an uploaded image as the page's workspace-root conventional favicon, and
+    return the FRESH ``icon_version`` (§7.1j icon self-serve).
+
+    The SERVER derives the on-disk name (``favicon.<ext>``) from the whitelisted
+    content-type/extension — the client NEVER supplies a path — enforces the 2 MiB cap,
+    and writes atomically without following a symlink (see
+    :func:`_write_root_favicon_atomically`). ``index.html`` is not touched, so a usable
+    explicit ``<link rel=icon>`` still WINS in :func:`resolve_show_page_icon` and the
+    returned version reflects whatever now resolves. Raises :class:`ShowPageError`
+    (mapped to a 4xx by the route) for a malformed id / non-whitelisted type / empty or
+    oversized payload; never a 500."""
+    validate_session_id(session_id)
+    ext = _canonical_upload_icon_ext(filename, content_type)
+    if ext is None:
+        raise ShowPageError(
+            "The icon must be an SVG, PNG, ICO, JPEG, or WebP image.", code="invalid_icon_type"
+        )
+    if not data:
+        raise ShowPageError("The icon file is empty.", code="icon_required")
+    if len(data) > SHOW_PAGE_ICON_MAX_UPLOAD_BYTES:
+        raise ShowPageError("The icon file is too large (max 2 MiB).", code="icon_too_large")
+    page_dir = show_page_dir(session_id)
+    page_dir.mkdir(parents=True, exist_ok=True)
+    _write_root_favicon_atomically(page_dir, ext, data)
+    return show_page_icon_version(session_id)
+
+
 def show_page_payload(page: ShowPage, *, config: V2Config | None = None) -> dict[str, Any]:
     path = show_page_dir(page.session_id)
     private = private_url(page.session_id, config=config)
@@ -917,6 +1054,15 @@ def _default_index_html(session_id: str) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Show Page {escaped}</title>
+    <!-- App icon (Avibe Dock / App Library): to give this app an icon, place a
+         favicon FILE in this workspace — either `favicon.svg` (or .png/.ico) at the
+         workspace root, or a `<link rel="icon" href="./your-icon.svg">` in this
+         <head> pointing at a RELATIVE file here. Avibe reads that static FILE to
+         render the app tile. Do NOT inject the icon from JavaScript at runtime
+         (e.g. appending a <link> in a script): the icon is resolved from the file
+         on disk, so a script-created one is never picked up. You can also upload one
+         from the App Library (the AI page's expanded panel), which writes the
+         workspace-root favicon for you. -->
     <!-- PWA: let a user "Add to Home Screen" this Show Page as a standalone app.
          We declare it standalone-capable but DELIBERATELY ship no apple-touch-icon
          or apple-mobile-web-app-title here. A page customizes its installed icon

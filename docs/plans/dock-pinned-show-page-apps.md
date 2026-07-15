@@ -130,6 +130,7 @@ DockDoc = { order: string[], pins: DockPin[] }
 DockPin = { session_id: string, title_snapshot: string, pinned_at: string }
 
 GET|HEAD /api/show-pages/{session_id}/icon   → 200 image bytes | 404   # §7.1f
+POST     /api/show-pages/{session_id}/icon   (multipart file) → { ok, ...page }  # §7.1j
 ```
 
 - `POST pins` appends `show:<sid>` to the end of `order`; captures
@@ -144,6 +145,16 @@ GET|HEAD /api/show-pages/{session_id}/icon   → 200 image bytes | 404   # §7.1
   `nosniff` + `Content-Security-Policy: sandbox` + `Cache-Control: private,
   max-age=604800, immutable` (safe because the token versions the URL); 404s are
   `no-store`. Never boots the Show Runtime.
+- `POST /api/show-pages/{sid}/icon` (§7.1j, **multipart**): uploads an image as the
+  page's workspace-root conventional favicon. The **server** chooses the on-disk name
+  — `favicon.<ext>`, `ext` derived from a whitelisted content-type/extension
+  (`svg,png,ico,jpg,jpeg,webp`) — so the client NEVER supplies a path; 2 MiB cap;
+  write-safe (removes sibling root `favicon.*` so one source remains, no symlink
+  follow, atomic replace); index.html is never edited. Returns the refreshed page
+  payload (incl. the new `icon_version`). Errors are structured 4xx (`invalid_icon_type`
+  415, `icon_too_large` 413, `icon_required` 400, `show_page_not_found` 404) — never a
+  500. An explicit usable `<link rel=icon>` in index.html still WINS over the uploaded
+  conventional file (§7.1f resolution order); the editor covers the common no-link case.
 
 ## 5. Frontend Changes (map to real files)
 
@@ -640,6 +651,49 @@ alongside §7.1h item 3), in `AppWindow.tsx` + `WindowManagerContext.tsx`:
    is a pure predicate (skips minimized windows); both it and the shield have
    vitest DOM-structure coverage. The real gesture FEEL is verified by the owner
    via CDP on the regression env post-merge (residual manual check).
+
+### 7.1j Phase 2.5 — icon self-serve (owner 2026-07-15 23:04)
+
+1. **Scaffold head comment** (English, in the default Show Page template's
+   `<head>`): to give the app an icon, place a favicon FILE (e.g.
+   `favicon.svg` at the workspace root or a `<link rel="icon">` to a relative
+   file) — do NOT inject icons dynamically via JS; the file becomes the app
+   icon in the Dock / App Library. Rationale: the rule lives in the artifact
+   agents actually edit (no prompt verbosity); closes the JS-injection blind
+   spot at the source.
+2. **Icon editor beside the page rename** (AI view expanded panel): shorten
+   the name input; add current-icon preview + upload/replace control. Upload
+   writes the workspace-root conventional favicon file (server-chosen fixed
+   name `favicon.<ext>`; replaces siblings to keep one source). New authed
+   endpoint `POST /api/show-pages/<sid>/icon` (multipart): extension+type
+   whitelist, 2MiB cap, write-safe (no symlink follow, fixed name — client
+   never names paths), returns fresh `icon_version`. Ledger: an explicit
+   usable `<link rel=icon>` still wins over the uploaded conventional file
+   (we do not edit user HTML).
+3. **Copy**: the Library 移出 button text → 「移出 App」 (en aligned, e.g.
+   "Remove App").
+
+**Hardening (review round 1, 2026-07-16 — #916):** four Codex findings, all fixed:
+- **Preserve the old icon until the new write lands (P2):** the write reorders to
+  temp → atomic `os.replace` → *then* remove the other-extension root `favicon.*`, so a
+  failed/partial write (e.g. disk full) never deletes the user's existing icon first.
+- **Cross-surface freshness (P2):** a successful upload broadcasts a `session.activity`
+  `show_event`, so every already-mounted inventory (Dock, WindowLayer, mobile drawer,
+  ⌘K search) reloads and picks up the new `icon_version` — not just the Library instance
+  that ran the upload (its optimistic `mergePage` is local).
+- **Preserve the too-large path (P3):** the Content-Length guard's `too_large` keeps its
+  `icon_too_large`/413 mapping instead of collapsing to a generic `invalid_icon`/400.
+- **Reject explicit non-image content types (P3):** an explicit, non-generic MIME that is
+  not a whitelisted image is refused even when the filename extension is whitelisted;
+  filename fallback is limited to blank / `application/octet-stream` types.
+
+**Hardening (review round 2, 2026-07-16 — #916):** two more P2 findings, fixed:
+- **Preserve an explicitly-linked root favicon (P2):** the sibling cleanup skips a root
+  `favicon.*` that `index.html` links via `<link rel=icon>` — deleting it would 404 the
+  page's own favicon while the explicit link keeps winning in the resolver.
+- **Reject icon uploads for archived sessions (P2):** `upload_show_page_icon` rejects an
+  archived session with `session_archived` (the store's `is_archived` check is promoted to
+  public), matching every other Show Page mutator's archived guard.
 
 ### 7.2 Becoming an app: the ladder (owner Q&A 2026-07-13)
 
