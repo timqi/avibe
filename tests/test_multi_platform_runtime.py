@@ -145,6 +145,24 @@ class _CrashingClient(_StubClient):
         raise self.exc
 
 
+class _RestartOnceClient(_StubClient):
+    def __init__(self, name: str, *, crash_first: bool):
+        super().__init__(name, run_until_stopped=True)
+        self.crash_first = crash_first
+        self.run_calls = 0
+        self.restarted = threading.Event()
+
+    def run(self):
+        self.run_calls += 1
+        self.started.set()
+        if self.run_calls == 1:
+            if self.crash_first:
+                raise RuntimeError(f"{self.name} failed")
+            return
+        self.restarted.set()
+        self._stop_event.wait()
+
+
 def test_multi_settings_manager_routes_scoped_keys(tmp_path):
     manager = MultiSettingsManager(
         ["slack", "wechat"], settings_file=str(tmp_path / "settings.json"), primary_platform="slack"
@@ -247,7 +265,7 @@ def test_multi_im_client_remove_last_client_restores_workbench_formatter():
     assert "Warning" in client.formatter.format_warning("heads up")
 
 
-def test_multi_im_client_remove_pending_platform_completes_ready():
+def test_multi_im_client_connected_transport_does_not_emit_runtime_ready():
     slack = _StubClient("slack")
     discord = _StubClient("discord")
     client = MultiIMClient({"slack": slack, "discord": discord}, primary_platform="slack")
@@ -261,14 +279,38 @@ def test_multi_im_client_remove_pending_platform_completes_ready():
     assert slack.on_ready_callback is not None
     asyncio.run(slack.on_ready_callback())
     assert ready_calls == []
+    assert client._ready_platforms == {"slack"}
+    assert client.is_transport_ready("slack") is True
+    assert client.is_transport_ready("discord") is False
 
     removed = client.remove_client("discord")
 
     assert removed is discord
-    assert ready_calls == [True]
+    assert ready_calls == []
 
 
-def test_multi_im_client_remove_last_pending_platform_completes_empty_ready():
+def test_multi_im_client_clears_transport_readiness_on_disconnect():
+    discord = _StubClient("discord")
+    client = MultiIMClient({"discord": discord}, primary_platform="discord")
+    unavailable_calls: list[str] = []
+
+    async def on_transport_unready(*, platform: str):
+        unavailable_calls.append(platform)
+
+    client.register_callbacks(on_transport_unready=on_transport_unready)
+
+    asyncio.run(discord.on_ready_callback())
+    assert client.is_transport_ready("discord") is True
+
+    asyncio.run(discord.on_transport_unready_callback())
+    assert client.is_transport_ready("discord") is False
+    assert unavailable_calls == ["discord"]
+
+    asyncio.run(discord.on_transport_unready_callback())
+    assert unavailable_calls == ["discord"]
+
+
+def test_multi_im_client_remove_before_runtime_start_does_not_emit_ready():
     slack = _StubClient("slack")
     client = MultiIMClient({"slack": slack}, primary_platform="slack")
     ready_calls: list[bool] = []
@@ -281,10 +323,34 @@ def test_multi_im_client_remove_last_pending_platform_completes_empty_ready():
     removed = client.remove_client("slack")
 
     assert removed is slack
+    assert ready_calls == []
+
+
+def test_multi_im_client_run_emits_ready_while_transports_are_unavailable():
+    slack = _StubClient("slack", run_until_stopped=True)
+    discord = _StubClient("discord", run_until_stopped=True)
+    client = MultiIMClient({"slack": slack, "discord": discord}, primary_platform="slack")
+    ready = threading.Event()
+    ready_calls: list[bool] = []
+
+    async def on_ready():
+        ready_calls.append(True)
+        ready.set()
+
+    client.register_callbacks(on_ready=on_ready)
+    thread = threading.Thread(target=client.run, daemon=True)
+    thread.start()
+
+    assert ready.wait(timeout=2)
+    assert client._ready_platforms == set()
     assert ready_calls == [True]
 
+    client.stop()
+    thread.join(timeout=2)
+    assert thread.is_alive() is False
 
-def test_multi_im_client_run_returns_when_all_enabled_threads_exit():
+
+def test_multi_im_client_run_stays_alive_when_all_enabled_threads_exit():
     client = MultiIMClient({"slack": _StubClient("slack")}, primary_platform="slack")
     returned: list[bool] = []
 
@@ -295,37 +361,90 @@ def test_multi_im_client_run_returns_when_all_enabled_threads_exit():
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
 
+    assert client._run_started.wait(timeout=2)
+    time.sleep(0.6)
+    assert thread.is_alive() is True
+    assert returned == []
+
+    client.stop()
     thread.join(timeout=2)
 
     assert thread.is_alive() is False
     assert returned == [True]
 
 
-def test_multi_im_client_run_raises_single_platform_runtime_crash():
+def test_multi_im_client_isolates_single_platform_runtime_crash():
     boom = RuntimeError("slack failed")
-    client = MultiIMClient({"slack": _CrashingClient("slack", boom)}, primary_platform="slack")
+    crashing = _CrashingClient("slack", boom)
+    client = MultiIMClient({"slack": crashing}, primary_platform="slack")
+    returned: list[bool] = []
 
-    try:
+    def _run() -> None:
         client.run()
-    except RuntimeError as exc:
-        assert exc is boom
-    else:
-        raise AssertionError("MultiIMClient.run should raise the platform runtime crash")
+        returned.append(True)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    assert crashing.started.wait(timeout=2)
+    time.sleep(0.6)
+    assert thread.is_alive() is True
+    assert returned == []
+
+    client.stop()
+    thread.join(timeout=2)
+
+    assert thread.is_alive() is False
+    assert returned == [True]
 
 
-def test_multi_im_client_run_raises_multi_platform_runtime_crash_when_all_exit():
+def test_multi_im_client_restarts_exited_and_crashed_platform_runtimes(monkeypatch):
+    monkeypatch.setattr("modules.im.multi._RUNTIME_RETRY_INITIAL_SECONDS", 0.01)
+    for crash_first in (False, True):
+        restarting = _RestartOnceClient("slack", crash_first=crash_first)
+        client = MultiIMClient({"slack": restarting}, primary_platform="slack")
+        thread = threading.Thread(target=client.run, daemon=True)
+        thread.start()
+
+        assert restarting.started.wait(timeout=2)
+        assert restarting.restarted.wait(timeout=2)
+        assert restarting.run_calls == 2
+        assert client._threads["slack"].is_alive() is True
+
+        client.stop()
+        thread.join(timeout=2)
+
+        assert thread.is_alive() is False
+
+
+def test_multi_im_client_isolates_crash_when_all_platform_threads_exit():
     boom = RuntimeError("discord failed")
+    slack = _StubClient("slack")
+    discord = _CrashingClient("discord", boom)
     client = MultiIMClient(
-        {"slack": _StubClient("slack"), "discord": _CrashingClient("discord", boom)},
+        {"slack": slack, "discord": discord},
         primary_platform="slack",
     )
+    returned: list[bool] = []
 
-    try:
+    def _run() -> None:
         client.run()
-    except RuntimeError as exc:
-        assert exc is boom
-    else:
-        raise AssertionError("MultiIMClient.run should raise the captured platform runtime crash")
+        returned.append(True)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    assert slack.started.wait(timeout=2)
+    assert discord.started.wait(timeout=2)
+    time.sleep(0.6)
+    assert thread.is_alive() is True
+    assert returned == []
+
+    client.stop()
+    thread.join(timeout=2)
+
+    assert thread.is_alive() is False
+    assert returned == [True]
 
 
 def test_multi_im_client_remove_client_keeps_maps_when_thread_will_not_stop():
@@ -1887,31 +2006,41 @@ def test_multi_im_client_routes_dismiss_form_message_by_context_platform():
     assert lark.dismissed == [("lark", "om_456")]
 
 
-def test_multi_im_client_on_ready_fires_only_after_all_platforms():
-    """on_ready callback must wait for all platform clients to be ready."""
+def test_multi_im_client_transport_ready_callbacks_do_not_repeat_runtime_ready():
     slack = _StubClient("slack")
     wechat = _StubClient("wechat")
     client = MultiIMClient({"slack": slack, "wechat": wechat}, primary_platform="slack")
 
     ready_calls: list[bool] = []
+    transport_ready_calls: list[str] = []
 
     async def _on_ready():
         ready_calls.append(True)
 
-    client.register_callbacks(on_message=None, on_ready=_on_ready)
+    async def _on_transport_ready(*, platform: str):
+        transport_ready_calls.append(platform)
 
-    # Simulate only Slack becoming ready — on_ready should NOT fire yet
+    client.register_callbacks(
+        on_message=None,
+        on_ready=_on_ready,
+        on_transport_ready=_on_transport_ready,
+    )
+
     slack_on_ready = slack.on_ready_callback
     assert slack_on_ready is not None
     asyncio.run(slack_on_ready())
-    assert ready_calls == [], "on_ready fired before all platforms were ready"
+    assert ready_calls == []
+    assert transport_ready_calls == ["slack"]
 
-    # Now simulate WeChat becoming ready — on_ready should fire exactly once
     wechat_on_ready = wechat.on_ready_callback
     assert wechat_on_ready is not None
     asyncio.run(wechat_on_ready())
-    assert ready_calls == [True], "on_ready should fire exactly once after all platforms are ready"
+    assert ready_calls == []
+    assert transport_ready_calls == ["slack", "wechat"]
+    assert client._ready_platforms == {"slack", "wechat"}
 
-    # Calling again should not fire a second time
     asyncio.run(wechat_on_ready())
-    assert len(ready_calls) == 1, "on_ready should not fire more than once"
+    assert transport_ready_calls == ["slack", "wechat"]
+
+    client._emit_runtime_ready_once()
+    assert ready_calls == [True]

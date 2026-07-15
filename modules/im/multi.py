@@ -14,6 +14,9 @@ from .base import BaseIMClient, InlineKeyboard, MessageContext
 
 logger = logging.getLogger(__name__)
 
+_RUNTIME_RETRY_INITIAL_SECONDS = 1.0
+_RUNTIME_RETRY_MAX_SECONDS = 30.0
+
 
 class IMClientRemovalError(RuntimeError):
     """Raised when a hot-remove cannot stop a platform runtime cleanly."""
@@ -34,7 +37,6 @@ class MultiIMClient(BaseIMClient):
         self._auxiliary_clients = auxiliary_clients or {}
         self.primary_platform = primary_platform
         self._threads: Dict[str, threading.Thread] = {}
-        self._run_exceptions: Dict[str, BaseException] = {}
         self._run_started = threading.Event()
         # Guards mutations of ``clients`` / ``_threads`` so the run() monitor
         # loop (IM worker thread) and runtime add/remove_client calls (the
@@ -75,6 +77,12 @@ class MultiIMClient(BaseIMClient):
         """Register a delivery-only client that is not part of the run loop."""
         with self._clients_lock:
             self._auxiliary_clients[platform] = client
+
+    def is_transport_ready(self, platform: str) -> bool:
+        if platform == "avibe":
+            return self._run_started.is_set() and not self._stop_requested.is_set()
+        with self._ready_lock:
+            return platform in self._ready_platforms
 
     def _primary_client(self) -> BaseIMClient:
         with self._clients_lock:
@@ -182,8 +190,13 @@ class MultiIMClient(BaseIMClient):
         if self._registered_callbacks is None:
             return
         on_message, on_command, on_callback_query, kwargs = self._registered_callbacks
-        wrapped_kwargs = {key: self._wrap_additional_callback(platform, value) for key, value in kwargs.items()}
-        wrapped_kwargs["on_ready"] = self._wrap_on_ready(platform, kwargs.get("on_ready"))
+        wrapped_kwargs = {
+            key: self._wrap_additional_callback(platform, value)
+            for key, value in kwargs.items()
+            if key not in {"on_ready", "on_transport_ready", "on_transport_unready"}
+        }
+        wrapped_kwargs["on_ready"] = self._wrap_on_ready(platform, kwargs.get("on_transport_ready"))
+        wrapped_kwargs["on_transport_unready"] = self._wrap_on_unready(platform, kwargs.get("on_transport_unready"))
         wrapped_commands: Optional[Dict[str, Callable]] = None
         if on_command is not None:
             wrapped_commands = {}
@@ -237,38 +250,34 @@ class MultiIMClient(BaseIMClient):
 
         return _wrapped
 
-    def _wrap_on_ready(self, platform: str, callback: Optional[Callable]) -> Optional[Callable]:
-        if callback is None:
-            return None
-
+    def _wrap_on_ready(self, platform: str, callback: Optional[Callable]) -> Callable:
         async def _wrapped(*args: Any, **kwargs: Any):
             with self._ready_lock:
+                should_emit = platform not in self._ready_platforms
                 self._ready_platforms.add(platform)
-            if self._mark_ready_if_complete():
-                await callback(*args, **kwargs)
+            logger.info("IM transport ready: %s", platform)
+            if should_emit and callback is not None:
+                await callback(platform=platform)
 
         return _wrapped
 
-    def _mark_ready_if_complete(self) -> bool:
-        """Return True once when all currently registered clients are ready."""
+    def _mark_transport_unready(self, platform: str) -> bool:
         with self._ready_lock:
-            client_count = len(self._client_snapshot())
-            logger.info(
-                "IM runtime ready progress (%d/%d)",
-                len(self._ready_platforms),
-                client_count,
-            )
-            if client_count > 0 and not self._ready_emitted and len(self._ready_platforms) >= client_count:
-                self._ready_emitted = True
-                return True
-        return False
+            was_ready = platform in self._ready_platforms
+            self._ready_platforms.discard(platform)
+        if was_ready:
+            logger.info("IM transport unavailable: %s", platform)
+        return was_ready
 
-    def _aggregate_ready_callback(self) -> Optional[Callable]:
-        if self._registered_callbacks is None:
-            return None
-        return self._registered_callbacks[3].get("on_ready")
+    def _wrap_on_unready(self, platform: str, callback: Optional[Callable]) -> Callable:
+        async def _wrapped(*args: Any, **kwargs: Any):
+            was_ready = self._mark_transport_unready(platform)
+            if was_ready and callback is not None:
+                await callback(platform=platform)
 
-    def _fire_aggregate_ready_from_thread(self, callback: Callable) -> None:
+        return _wrapped
+
+    def _fire_runtime_ready_from_thread(self, callback: Callable) -> None:
         async def _call_ready() -> None:
             result = callback()
             if inspect.isawaitable(result):
@@ -277,26 +286,17 @@ class MultiIMClient(BaseIMClient):
         try:
             asyncio.run(_call_ready())
         except Exception:
-            logger.exception("MultiIMClient aggregate on_ready callback failed")
+            logger.exception("MultiIMClient runtime on_ready callback failed")
 
-    def _emit_empty_ready_once(self) -> None:
+    def _emit_runtime_ready_once(self) -> None:
         callback = getattr(self, "on_ready_callback", None)
         if callback is None:
             return
         with self._ready_lock:
-            if self._ready_emitted or self.clients:
+            if self._ready_emitted:
                 return
             self._ready_emitted = True
-
-        async def _call_ready() -> None:
-            result = callback()
-            if inspect.isawaitable(result):
-                await result
-
-        try:
-            asyncio.run(_call_ready())
-        except Exception:
-            logger.exception("MultiIMClient empty-runtime on_ready callback failed")
+        self._fire_runtime_ready_from_thread(callback)
 
     @staticmethod
     def _annotate_context(platform: str, context: MessageContext) -> None:
@@ -443,64 +443,69 @@ class MultiIMClient(BaseIMClient):
         self._stop_requested.clear()
         with self._clients_lock:
             self._threads = {}
-            self._run_exceptions = {}
             for platform, client in self.clients.items():
                 thread = threading.Thread(target=self._run_client, args=(platform, client), daemon=True)
                 thread.start()
                 self._threads[platform] = thread
-            if not self.clients:
-                self._emit_empty_ready_once()
+        # Core services belong to the aggregate Avibe runtime, not to the
+        # connectivity state of every external transport. Individual clients
+        # may still be connecting or retrying after this callback fires.
+        self._emit_runtime_ready_once()
 
         try:
-            # Idle-loop until an explicit stop. The runtime stays alive even when
-            # no platform threads remain — that is a valid state now: hot
-            # reconcile can disable every IM platform (workbench-only) or be
-            # mid-rebuild, and the runtime must keep running so a platform can be
-            # added back without restarting the service. (Previously this broke
-            # out when ``_threads`` emptied, which — via Controller._run_im_runtime
-            # calling loop.stop() — would tear the whole service down.)
-            while not self._stop_requested.is_set():
-                should_exit = False
-                crash_exception: BaseException | None = None
+            # Platform runtimes are failure-isolated from the service lifecycle.
+            # Keep the aggregate runtime alive until an explicit stop so the
+            # workbench remains available and hot reconcile can replace a failed
+            # or disabled platform without restarting Avibe.
+            while not self._stop_requested.wait(0.5):
                 with self._clients_lock:
                     for platform, thread in list(self._threads.items()):
                         if thread.is_alive():
                             continue
                         if platform in self._removing_platforms:
                             continue
-                        logger.warning("IM runtime for %s exited", platform)
+                        logger.warning("IM runtime for %s exited; Avibe remains available", platform)
                         self._threads.pop(platform, None)
-                    active_platforms = [platform for platform in self.clients if platform not in self._removing_platforms]
-                    live_active_threads = [
-                        platform
-                        for platform in active_platforms
-                        if (thread := self._threads.get(platform)) is not None and thread.is_alive()
-                    ]
-                    if active_platforms and not live_active_threads:
-                        logger.error("All enabled IM runtime threads exited")
-                        crash_exception = next(
-                            (self._run_exceptions[platform] for platform in active_platforms if platform in self._run_exceptions),
-                            None,
-                        )
-                        should_exit = True
-                if crash_exception is not None:
-                    raise crash_exception
-                if should_exit:
-                    break
-                time.sleep(0.5)
         finally:
             self.stop()
             for thread in list(self._threads.values()):
                 thread.join(timeout=1.0)
             self._run_started.clear()
 
+    def _client_should_run(self, platform: str, client: BaseIMClient) -> bool:
+        if self._stop_requested.is_set():
+            return False
+        with self._clients_lock:
+            return self.clients.get(platform) is client and platform not in self._removing_platforms
+
+    def _wait_for_client_retry(self, platform: str, client: BaseIMClient, delay: float) -> bool:
+        deadline = time.monotonic() + delay
+        while self._client_should_run(platform, client):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            if self._stop_requested.wait(min(remaining, 0.1)):
+                return False
+        return False
+
     def _run_client(self, platform: str, client: BaseIMClient) -> None:
-        try:
-            client.run()
-        except Exception as exc:
-            with self._clients_lock:
-                self._run_exceptions[platform] = exc
-            logger.exception("IM runtime for %s crashed", platform)
+        retry_delay = _RUNTIME_RETRY_INITIAL_SECONDS
+        while self._client_should_run(platform, client):
+            try:
+                client.run()
+            except Exception:
+                logger.exception("IM runtime for %s crashed; retrying in %.1f seconds", platform, retry_delay)
+            else:
+                if self._client_should_run(platform, client):
+                    logger.warning("IM runtime for %s exited unexpectedly; retrying in %.1f seconds", platform, retry_delay)
+            finally:
+                self._mark_transport_unready(platform)
+
+            if not self._client_should_run(platform, client):
+                return
+            if not self._wait_for_client_retry(platform, client, retry_delay):
+                return
+            retry_delay = min(retry_delay * 2, _RUNTIME_RETRY_MAX_SECONDS)
 
     def add_client(self, platform: str, client: BaseIMClient) -> None:
         """Start one platform's client (+ its runtime thread) at runtime.
@@ -514,7 +519,6 @@ class MultiIMClient(BaseIMClient):
                 logger.warning("add_client: platform %s already present; skipping", platform)
                 return
             self._removing_platforms.discard(platform)
-            self._run_exceptions.pop(platform, None)
             self._register_client_callbacks(platform, client)
             self.clients[platform] = client
             if self.primary_platform not in self.clients:
@@ -563,12 +567,9 @@ class MultiIMClient(BaseIMClient):
                 logger.error("%s; hot-remove failed", message)
                 raise IMClientRemovalError(message)
 
-            ready_callback = None
-            emit_empty_ready = False
             with self._clients_lock:
                 self.clients.pop(platform, None)
                 self._threads.pop(platform, None)
-                self._run_exceptions.pop(platform, None)
                 self._removing_platforms.discard(platform)
                 if self.clients:
                     if self.primary_platform not in self.clients:
@@ -578,19 +579,12 @@ class MultiIMClient(BaseIMClient):
                         self.formatter = next_client.formatter
                 else:
                     self._use_workbench_fallback_runtime()
-                    emit_empty_ready = True
         except Exception:
             with self._clients_lock:
                 self._removing_platforms.discard(platform)
             raise
         with self._ready_lock:
             self._ready_platforms.discard(platform)
-        if emit_empty_ready:
-            self._emit_empty_ready_once()
-        elif self._mark_ready_if_complete():
-            ready_callback = self._aggregate_ready_callback()
-        if ready_callback is not None:
-            self._fire_aggregate_ready_from_thread(ready_callback)
         logger.info("Hot-removed IM platform %s", platform)
         return client
 

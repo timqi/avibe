@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import threading
 import time
 from typing import Dict, Any, Optional, Callable, List
 
@@ -37,6 +38,9 @@ from vibe.claude_model_catalog import DEFAULT_CLAUDE_MODEL_ALIASES
 
 logger = logging.getLogger(__name__)
 
+_RUNTIME_RETRY_INITIAL_SECONDS = 1.0
+_RUNTIME_RETRY_MAX_SECONDS = 30.0
+
 
 def _prioritize_claude_model_choices(models: List[str], current_model: Optional[str]) -> List[str]:
     """Order Claude model ids so the active selection and the canonical bare
@@ -70,7 +74,8 @@ class DiscordBot(BaseIMClient):
         intents.dm_messages = True
         intents.reactions = True
 
-        self.client = discord.Client(intents=intents)
+        self._intents = intents
+        self.client = self._new_client()
         self.formatter = DiscordFormatter()
 
         self.settings_manager = None
@@ -81,9 +86,13 @@ class DiscordBot(BaseIMClient):
         self._recent_interaction_ids: Dict[str, float] = {}
         self._recent_callback_keys: Dict[str, float] = {}
         self._callback_dedupe_ttl_seconds = 3.0
+        self._stop_event = threading.Event()
 
-        self.client.on_ready = self._on_ready_event
-        self.client.on_message = self._on_message_event
+    def _new_client(self) -> discord.Client:
+        client = discord.Client(intents=self._intents)
+        client.on_ready = self._on_ready_event
+        client.on_message = self._on_message_event
+        return client
 
     def set_settings_manager(self, settings_manager):
         self.settings_manager = settings_manager
@@ -326,38 +335,79 @@ class DiscordBot(BaseIMClient):
 
         async def _run():
             self._loop = asyncio.get_running_loop()
-            # Inject proxy connector inside the event loop (required by
-            # aiohttp). Must happen before login() creates the session.
-            from vibe.proxy import redact_proxy_url, resolve_proxy
+            try:
+                if self._stop_event.is_set():
+                    return
 
-            proxy_url = resolve_proxy(self.config.proxy_url)
-            if proxy_url:
-                try:
-                    from aiohttp_socks import ProxyConnector
+                # Inject proxy connector inside the event loop (required by
+                # aiohttp). Must happen before login() creates the session.
+                from vibe.proxy import redact_proxy_url, resolve_proxy
 
-                    self.client.http.connector = ProxyConnector.from_url(proxy_url, rdns=True)
-                    logger.info("Discord using proxy: %s", redact_proxy_url(proxy_url))
-                except ImportError:
-                    logger.warning("Proxy configured but aiohttp_socks not installed")
+                proxy_url = resolve_proxy(self.config.proxy_url)
+                if proxy_url:
+                    try:
+                        from aiohttp_socks import ProxyConnector
 
-            async with self.client:
-                await self.client.start(self.config.bot_token)
+                        self.client.http.connector = ProxyConnector.from_url(proxy_url, rdns=True)
+                        logger.info("Discord using proxy: %s", redact_proxy_url(proxy_url))
+                    except ImportError:
+                        logger.warning("Proxy configured but aiohttp_socks not installed")
 
-        try:
-            asyncio.run(_run())
-        except KeyboardInterrupt:
-            return
+                async with self.client:
+                    # stop() may race with startup before _loop is installed.
+                    if self._stop_event.is_set():
+                        return
+                    await self.client.start(self.config.bot_token)
+            finally:
+                callback = getattr(self, "on_transport_unready_callback", None)
+                if callback is not None:
+                    try:
+                        await callback()
+                    except Exception:
+                        logger.exception("Discord transport-unready callback failed")
+                self._loop = None
+
+        retry_delay = _RUNTIME_RETRY_INITIAL_SECONDS
+        while not self._stop_event.is_set():
+            try:
+                asyncio.run(_run())
+            except KeyboardInterrupt:
+                return
+            except Exception:
+                if self._stop_event.is_set():
+                    return
+                logger.exception(
+                    "Discord runtime failed; retrying in %.1f seconds",
+                    retry_delay,
+                )
+            else:
+                if self._stop_event.is_set():
+                    return
+                logger.warning(
+                    "Discord runtime exited unexpectedly; retrying in %.1f seconds",
+                    retry_delay,
+                )
+
+            if self._stop_event.wait(retry_delay):
+                return
+            if self._stop_event.is_set():
+                return
+            self.client = self._new_client()
+            retry_delay = min(retry_delay * 2, _RUNTIME_RETRY_MAX_SECONDS)
 
     def stop(self) -> None:
+        self._stop_event.set()
         loop = getattr(self, "_loop", None)
         if loop is None or loop.is_closed():
             return
+        client = self.client
         try:
-            loop.call_soon_threadsafe(lambda: loop.create_task(self.client.close()))
+            loop.call_soon_threadsafe(lambda: loop.create_task(client.close()))
         except Exception:
             logger.exception("Failed to stop Discord client")
 
     async def shutdown(self) -> None:
+        self._stop_event.set()
         loop = getattr(self, "_loop", None)
         current_loop = asyncio.get_running_loop()
         if loop is None or loop is current_loop:

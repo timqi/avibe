@@ -24,7 +24,7 @@ from modules.agents.base import AgentRequest, BaseAgent
 from .caller_context import bind_session as bind_caller_context_session
 from .client_manager import OpenCodeClientManager
 from .message_processor import OpenCodeMessageProcessorMixin
-from .poll_loop import OpenCodePollLoop, restored_session_key_from_poll_info
+from .poll_loop import OpenCodePollLoop, restored_platform_from_poll_info, restored_session_key_from_poll_info
 from .server import OpenCodeServerManager
 from .session import OpenCodeResumeUnavailableError, OpenCodeSessionManager
 from .utils import resolve_opencode_model_id, resolve_opencode_reasoning_effort
@@ -591,12 +591,12 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
         not carry ``agent_session_id``, so we recover it from ``base_session_id``
         for avibe polls only — IM polls return ``None`` and get no status dot.
         """
-        if (poll_info.platform or "") != "avibe":
+        if restored_platform_from_poll_info(poll_info) != "avibe":
             return None
         base_session_id = poll_info.base_session_id or ""
         return base_session_id or None
 
-    async def restore_active_polls(self) -> int:
+    async def restore_active_polls(self, platforms: set[str] | None = None) -> int:
         """Restore active poll loops that were interrupted by vibe-remote restart."""
 
         active_polls = self.sessions.get_all_active_polls()
@@ -608,6 +608,12 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
         stale_poll_ids = []
 
         for session_id, poll_info in active_polls.items():
+            poll_platform = restored_platform_from_poll_info(poll_info)
+            if platforms is not None and poll_platform not in platforms:
+                continue
+            existing_task = self._active_requests.get(poll_info.base_session_id)
+            if existing_task is not None and not existing_task.done():
+                continue
             try:
                 server = await self._get_server()
                 messages = await server.list_messages(
