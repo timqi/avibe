@@ -67,6 +67,14 @@ const ShowPageRoute = lazy(() =>
   import('./components/apps/ShowPageRoute').then((m) => ({ default: m.ShowPageRoute })),
 );
 import { hasConfiguredPlatformCredentials } from './lib/platforms';
+import { isIosDevice, isStandalonePwa } from './lib/platform';
+import {
+  readLastPwaPath,
+  resolvePwaLaunchPath,
+  shouldRestorePwaLaunch,
+  writeLastPwaPath,
+} from './lib/pwaRouteMemory';
+import { takePendingWebPushLaunchPath } from './lib/webPushLaunch';
 import { applyAppTitle } from './lib/documentTitle';
 import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './components/ui/card';
@@ -376,11 +384,62 @@ const DocumentTitle = () => {
   return null;
 };
 
+// Installed iOS PWAs launch at the manifest's `/` start URL after iOS has
+// evicted the process. Restore the last canonical app route only for that cold
+// launch; later in-app navigation to `/` must still reach the workbench canvas.
+const PwaRouteMemory = () => {
+  const location = useLocation();
+  const [launch] = useState(() => {
+    const iosStandalone = isIosDevice() && isStandalonePwa();
+    return {
+      iosStandalone,
+      locationKey: location.key,
+      location,
+      pendingNotificationPath: iosStandalone
+        ? takePendingWebPushLaunchPath()
+        : Promise.resolve<string | null>(null),
+    };
+  });
+  const [launchRestorePath, setLaunchRestorePath] = useState<string | null | undefined>(
+    launch.iosStandalone ? undefined : null,
+  );
+  const restoringLaunch =
+    launchRestorePath !== undefined &&
+    shouldRestorePwaLaunch(launchRestorePath, launch.locationKey, location);
+  const restorePath = restoringLaunch ? launchRestorePath : null;
+
+  useEffect(() => {
+    if (!launch.iosStandalone) return;
+    let active = true;
+    launch.pendingNotificationPath.then((pendingPath) => {
+      if (!active) return;
+      setLaunchRestorePath(
+        resolvePwaLaunchPath(true, launch.location, pendingPath ?? readLastPwaPath()),
+      );
+    });
+    return () => {
+      active = false;
+    };
+  }, [launch]);
+
+  useEffect(() => {
+    if (!launch.iosStandalone || launchRestorePath === undefined) return;
+    // Do not overwrite the remembered destination while <Navigate> is still
+    // replacing the manifest start URL (including StrictMode's second effect).
+    if (restoringLaunch) return;
+
+    writeLastPwaPath(location.pathname);
+  }, [launch.iosStandalone, launchRestorePath, location.pathname, restoringLaunch]);
+
+  return restorePath ? <Navigate to={restorePath} replace /> : null;
+};
+
 function RouterRoot() {
   return (
     <UnsavedChangesProvider>
       <DocumentTitle />
       <WebPushNotificationNavigator />
+      <PwaRouteMemory />
       <Outlet />
     </UnsavedChangesProvider>
   );
