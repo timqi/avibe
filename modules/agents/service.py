@@ -2,7 +2,7 @@ import logging
 import asyncio
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from core.session_activities import SessionActivityRegistry
 from core.message_output import terminal_output_for, terminal_turn_output
@@ -22,6 +22,13 @@ STALE_STOP_REASONS = {"not_active", "runtime_unavailable"}
 
 class AgentService:
     """Registry and dispatcher for agent implementations."""
+
+    # These clocks never decide that a turn is old. They only pace a positive
+    # backend-liveness probe and confirm one definitive False result across the
+    # small process-exit/terminal-delivery race window.
+    _liveness_probe_interval_seconds = 1.0
+    _liveness_failure_grace_seconds = 0.5
+    _backend_exit_terminal_error = "backend_runtime_exited_before_terminal"
 
     def __init__(
         self,
@@ -208,6 +215,7 @@ class AgentService:
         gate.runtime_started = False
         gate.task = asyncio.current_task()
         gate.context = request.context
+        gate.request = request
         gate.cancel_tidy_task = None
         self._stamp_runtime_turn(request, runtime_key, gate.token)
         try:
@@ -383,6 +391,153 @@ class AgentService:
         if gate is None or gate.token != runtime_token:
             return
         gate.runtime_started = True
+        gate.liveness_probe = self._capture_backend_liveness(gate, context)
+        self._start_runtime_liveness_monitor(runtime_key, gate, runtime_token)
+
+    def _capture_backend_liveness(
+        self,
+        gate: "_RuntimeTurnGate",
+        context: Any,
+    ) -> Callable[[], Optional[bool]]:
+        capture = getattr(gate.agent, "capture_backend_liveness", None)
+        if callable(capture):
+            try:
+                probe = capture(context)
+                if callable(probe):
+                    return probe
+            except Exception:
+                logger.debug(
+                    "Failed to capture backend liveness for %s",
+                    gate.backend,
+                    exc_info=True,
+                )
+        return lambda: self.backend_alive(context, use_captured=False)
+
+    @staticmethod
+    def _probe_backend_liveness(
+        probe: Callable[[], Optional[bool]] | None,
+    ) -> Optional[bool]:
+        if probe is None:
+            return None
+        try:
+            return probe()
+        except Exception:
+            logger.debug("Captured backend liveness probe raised", exc_info=True)
+            return None
+
+    def _start_runtime_liveness_monitor(
+        self,
+        runtime_key: str,
+        gate: "_RuntimeTurnGate",
+        runtime_token: str,
+    ) -> None:
+        existing = gate.liveness_task
+        if existing is not None and not existing.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(
+                self._monitor_runtime_liveness(runtime_key, runtime_token),
+                name=f"agent-runtime-liveness:{gate.backend}:{runtime_key}",
+            )
+        except RuntimeError:
+            # mark_runtime_turn_started is normally called on the controller loop.
+            # A synchronous unit/stub caller has no runtime to supervise.
+            return
+        gate.liveness_task = task
+        self._background_tasks.add(task)
+
+        def _finished(finished: asyncio.Task) -> None:
+            self._background_tasks.discard(finished)
+            current = self._turn_gates.get(runtime_key)
+            if current is not None and current.token == runtime_token and current.liveness_task is finished:
+                current.liveness_task = None
+            if finished.cancelled():
+                return
+            try:
+                error = finished.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                logger.error(
+                    "Runtime liveness monitor crashed for backend=%s runtime=%s: %r",
+                    gate.backend,
+                    runtime_key,
+                    error,
+                    exc_info=error,
+                )
+
+        task.add_done_callback(_finished)
+
+    async def _monitor_runtime_liveness(self, runtime_key: str, runtime_token: str) -> None:
+        """Turn a definitive owned-backend death into the normal terminal path.
+
+        Age is deliberately absent. A live or unknown backend may run forever.
+        Recovery requires the same runtime-key/token owner and two definitive
+        ``False`` probes around a short grace period; a terminal event or newer
+        turn changes the token and makes this monitor a no-op.
+        """
+
+        while True:
+            await asyncio.sleep(self._liveness_probe_interval_seconds)
+            gate = self._turn_gates.get(runtime_key)
+            if gate is None or gate.token != runtime_token or not gate.runtime_started:
+                return
+            if gate.context is None or self._probe_backend_liveness(gate.liveness_probe) is not False:
+                continue
+
+            await asyncio.sleep(self._liveness_failure_grace_seconds)
+            gate = self._turn_gates.get(runtime_key)
+            if gate is None or gate.token != runtime_token or not gate.runtime_started:
+                return
+            context = gate.context
+            if context is None or self._probe_backend_liveness(gate.liveness_probe) is not False:
+                continue
+
+            logger.error(
+                "Accepted Agent turn lost its owned backend before terminal delivery "
+                "(backend=%s runtime=%s)",
+                gate.backend,
+                runtime_key,
+            )
+            emit = getattr(self.controller, "emit_agent_message", None)
+            if not callable(emit):
+                logger.error(
+                    "Cannot recover dead backend turn because the terminal emitter is unavailable "
+                    "(backend=%s runtime=%s)",
+                    gate.backend,
+                    runtime_key,
+                )
+                continue
+            try:
+                output = (
+                    terminal_output_for(gate.request)
+                    if gate.request is not None
+                    else terminal_turn_output()
+                )
+                await emit(
+                    context,
+                    "result",
+                    "",
+                    is_error=True,
+                    level="silent",
+                    output=output,
+                    terminal_error=self._backend_exit_terminal_error,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Do not release only half of the ownership graph. Retrying the
+                # idempotent terminal chokepoint is safer than freeing the runtime
+                # gate while the Session sink or Run row may still be active.
+                logger.exception(
+                    "Failed to converge dead backend turn through terminal delivery "
+                    "(backend=%s runtime=%s)",
+                    gate.backend,
+                    runtime_key,
+                )
+                continue
+            return
 
     def runtime_turn_started(self, context: Any) -> bool:
         payload = getattr(context, "platform_specific", None) or {}
@@ -458,6 +613,9 @@ class AgentService:
         await gate.lock.acquire()
         gate.token = uuid.uuid4().hex
         gate.backend = agent_name
+        gate.agent = self.agents.get(agent_name)
+        gate.context = context
+        gate.request = None
         # The backend already produced output, so the turn is unambiguously
         # running — there is no queued-startup window to distinguish (unlike a
         # user turn waiting on the gate), so mark it started immediately.
@@ -466,6 +624,8 @@ class AgentService:
             context.platform_specific = {}
         context.platform_specific[AGENT_RUNTIME_TURN_KEY] = runtime_key
         context.platform_specific[AGENT_RUNTIME_TURN_TOKEN] = gate.token
+        gate.liveness_probe = self._capture_backend_liveness(gate, context)
+        self._start_runtime_liveness_monitor(runtime_key, gate, gate.token)
         # Fresh streaming token too: the previous turn's SSE sink is already gone,
         # and a leftover ``turn_token`` would only confuse ``mark_turn_complete``
         # (which no-ops anyway with no live sink for this session).
@@ -509,12 +669,23 @@ class AgentService:
             return
         if runtime_token is not None and gate.token != runtime_token:
             return
+        liveness_task = gate.liveness_task
+        gate.liveness_task = None
         gate.token = ""
         gate.backend = ""
         gate.runtime_started = False
         gate.agent = None
         gate.task = None
         gate.context = None
+        gate.request = None
+        gate.liveness_probe = None
+        if liveness_task is not None and not liveness_task.done():
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            if liveness_task is not current:
+                liveness_task.cancel()
         if gate.lock.locked():
             gate.lock.release()
 
@@ -569,13 +740,29 @@ class AgentService:
         gate = self._turn_gates.get(runtime_key)
         return gate is not None and gate.token == runtime_token
 
-    def backend_alive(self, context: Any) -> Optional[bool]:
+    def backend_alive(
+        self,
+        context: Any,
+        *,
+        use_captured: bool = True,
+    ) -> Optional[bool]:
         """Resolve the backend for this turn (via its runtime gate) and ask it
         whether it is still alive. Returns ``None`` when the backend is unknown
         or has no probe — callers treat ``None`` as alive (no false alarm)."""
         payload = getattr(context, "platform_specific", None) or {}
         runtime_key = str(payload.get(AGENT_RUNTIME_TURN_KEY) or "").strip()
         gate = self._turn_gates.get(runtime_key) if runtime_key else None
+        runtime_token = str(payload.get(AGENT_RUNTIME_TURN_TOKEN) or "").strip()
+        if (
+            use_captured
+            and gate is not None
+            and runtime_token
+            and gate.token == runtime_token
+            and getattr(gate, "runtime_started", False)
+        ):
+            return self._probe_backend_liveness(
+                getattr(gate, "liveness_probe", None)
+            )
         backend = gate.backend if gate else None
         agent = getattr(gate, "agent", None) if gate is not None else None
         if agent is None and backend:
@@ -691,4 +878,7 @@ class _RuntimeTurnGate:
     agent: BaseAgent | None = None
     task: asyncio.Task | None = None
     context: Any = None
+    request: AgentRequest | None = None
+    liveness_probe: Callable[[], Optional[bool]] | None = None
     cancel_tidy_task: asyncio.Task | None = None
+    liveness_task: asyncio.Task | None = None
