@@ -575,8 +575,19 @@ PENDING_TYPE = "pending"
 # Hidden row used only to keep native-message-id dedupe coverage after multiple
 # queued harness callbacks are coalesced into one dispatched turn.
 HARNESS_DEDUPE_TYPE = "harness_dedupe"
-# Ephemeral types that must never count as inbox activity / conversation.
-NON_CONVERSATION_TYPES = (QUEUED_TYPE, DRAFT_TYPE, PENDING_TYPE, HARNESS_DEDUPE_TYPE)
+# An INVISIBLE, agent-authored terminal marker persisted when a turn completes
+# NORMALLY but produces no user-visible message — a ``<silent>``-stripped or empty
+# final reply, or a reply-less bookkeeping turn (common for watch/scheduled
+# orchestration). It exists ONLY so the activity grouping can close such a turn as
+# DONE instead of misreading "activity rows + no terminal" as ``interrupted``. It is
+# kept out of every user-facing surface by the allowlist reads (TRANSCRIPT_TYPES,
+# inbox preview, unread, web-push, live publish) and, being author='agent', is listed
+# in NON_CONVERSATION_TYPES below so it never bumps the inbox activity clock / last
+# author. Never delivered to IM (avibe-persistence only).
+SILENT_TYPE = "silent"
+# Types that must never count as inbox conversation activity: the ephemeral user rows
+# above plus the invisible agent silent-completion marker.
+NON_CONVERSATION_TYPES = (QUEUED_TYPE, DRAFT_TYPE, PENDING_TYPE, HARNESS_DEDUPE_TYPE, SILENT_TYPE)
 
 # The transcript-visible types — the SINGLE source of truth shared by the
 # history fetch (``list_session_messages``) AND the live ``message.new`` publish
@@ -925,6 +936,13 @@ def list_inbox_sessions(
     last_author = _latest_message_value("author", conversation_only=True)
     preview_id = _latest_message_value("id", types=("result", "notify", "error"))
     preview_at = _latest_message_value("created_at", types=("result", "notify", "error"))
+    # The awaiting/replied calc must count the INVISIBLE ``silent`` completion marker
+    # as a reply too (a reply-less turn is still answered) — otherwise a silently
+    # completed turn keeps the sidebar showing "awaiting the agent". The PREVIEW text
+    # stays the last VISIBLE reply, so ``silent`` is included here but NOT in preview_*.
+    _terminal_types = ("result", "notify", "error", SILENT_TYPE)
+    last_terminal_id = _latest_message_value("id", types=_terminal_types)
+    last_terminal_at = _latest_message_value("created_at", types=_terminal_types)
     last_input_at = _latest_message_value(
         "created_at", conversation_only=True, input_turn_only=True
     )
@@ -957,6 +975,8 @@ def list_inbox_sessions(
             unread_count_col,
             preview_id.label("preview_id"),
             preview_at.label("preview_at"),
+            last_terminal_id.label("last_terminal_id"),
+            last_terminal_at.label("last_terminal_at"),
             last_input_at.label("last_input_at"),
             last_input_id.label("last_input_id"),
         )
@@ -1023,14 +1043,17 @@ def list_inbox_sessions(
         # reply.
         last_input_at = row["last_input_at"]
         last_input_id = row["last_input_id"]
-        preview_at = row["preview_at"]
-        preview_id = row["preview_id"]
+        # Compare against the last TERMINAL (incl. the invisible ``silent`` marker),
+        # not the preview: a silently-completed turn HAS replied even though its text
+        # is not the visible preview.
+        terminal_at = row["last_terminal_at"]
+        terminal_id = row["last_terminal_id"]
         awaiting_reply = bool(
             last_input_at is not None
-            and preview_at is not None
+            and terminal_at is not None
             and (
-                last_input_at > preview_at
-                or (last_input_at == preview_at and (last_input_id or "") > (preview_id or ""))
+                last_input_at > terminal_at
+                or (last_input_at == terminal_at and (last_input_id or "") > (terminal_id or ""))
             )
         )
         sessions.append(
