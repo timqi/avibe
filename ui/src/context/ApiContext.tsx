@@ -1,9 +1,13 @@
-import React, { createContext, useContext, useMemo, useRef } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useToast } from './ToastContext';
 import { apiFetch } from '../lib/apiFetch';
 import type { TurnActivityGroupWire } from '../lib/agentActivity';
 import type { VaultSessionPolicy } from '../lib/vaultSandboxPolicy';
+import {
+  WorkbenchEventReconnectLoop,
+  type WorkbenchEventConnectionState,
+} from '../lib/workbenchEventConnection';
 import type { DockDoc } from './DockContext';
 
 // The workbench Dock API response shape ({ ok, dock }); the Dock document type
@@ -602,11 +606,11 @@ export type ApiContextType = {
   listSessionQueue: (sessionId: string, options?: { cache?: boolean }) => Promise<{ queued: WorkbenchMessage[] }>;
   removeQueuedMessage: (sessionId: string, messageId: string) => Promise<{ removed: boolean }>;
   sendQueuedNow: (sessionId: string, messageId: string) => Promise<{ ok: boolean; status?: string; code?: string; detail?: string }>;
-  getTurnState: (sessionId: string) => Promise<SessionRuntimeState>;
+  getTurnState: (sessionId: string, options?: { handleError?: boolean }) => Promise<SessionRuntimeState>;
   getSessionDraft: (sessionId: string) => Promise<{ text: string }>;
   setSessionDraft: (sessionId: string, text: string) => Promise<{ ok: boolean }>;
-  listInbox: (params?: { platform?: string; unreadOnly?: boolean; limit?: number; before?: string; cache?: boolean }) => Promise<InboxFeedResult>;
-  connectWorkbenchEvents: (handlers: WorkbenchEventHandlers, options?: { reconnect?: boolean }) => () => void;
+  listInbox: (params?: { platform?: string; unreadOnly?: boolean; limit?: number; before?: string; cache?: boolean; handleError?: boolean }) => Promise<InboxFeedResult>;
+  connectWorkbenchEvents: (handlers: WorkbenchEventHandlers) => () => void;
   listVibeAgents: (params?: { backend?: string; includeDisabled?: boolean }) => Promise<{ ok: boolean; agents: VibeAgentBrief[]; default_agent_name: string | null }>;
   getVibeAgent: (name: string) => Promise<{ ok: boolean; agent: VibeAgentFull; default_agent_name: string | null }>;
   createVibeAgent: (payload: VibeAgentCreatePayload) => Promise<{ ok: boolean; agent: VibeAgentFull }>;
@@ -914,6 +918,7 @@ export type WorkbenchEventEnvelope<T = unknown> = {
 
 export type WorkbenchEventHandlers = {
   onConnected?: (data: { sub_id: number; source?: 'browser' | 'controller' }) => void;
+  onConnectionState?: (state: WorkbenchEventConnectionState) => void;
   onEventBridgeStatus?: (data: { connected: boolean }) => void;
   onMessageNew?: (data: WorkbenchMessage) => void;
   onSessionActivity?: (data: { session_id: string; scope_id: string | null; event: string; title?: string | null }) => void;
@@ -1769,6 +1774,10 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const eventHandlersRef = useRef(new Set<WorkbenchEventHandlers>());
   const eventConnectionRef = useRef<{ sub_id: number; source?: 'browser' | 'controller' } | null>(null);
   const eventBridgeConnectedRef = useRef(false);
+  const eventConnectionStateRef = useRef<WorkbenchEventConnectionState>('reconnecting');
+  const eventReconnectLoopRef = useRef<WorkbenchEventReconnectLoop | null>(null);
+  const wakeWorkbenchEventsRef = useRef<() => void>(() => {});
+  const stopWorkbenchEventsRef = useRef<() => void>(() => {});
 
   const handleApiError = async (res: Response, path: string) => {
     let errorMessage = `Request failed: ${path} (${res.status})`;
@@ -1868,6 +1877,12 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
+  const setWorkbenchEventConnectionState = (state: WorkbenchEventConnectionState) => {
+    if (eventConnectionStateRef.current === state) return;
+    eventConnectionStateRef.current = state;
+    dispatchToWorkbenchHandlers((handlers) => handlers.onConnectionState?.(state));
+  };
+
   const parseWorkbenchEnvelope = <T,>(raw: string): WorkbenchEventEnvelope<T> | null => {
     try {
       return JSON.parse(raw) as WorkbenchEventEnvelope<T>;
@@ -1877,22 +1892,53 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const closeWorkbenchEventSource = () => {
-    eventSourceRef.current?.close();
+  const closeActiveWorkbenchEventSource = () => {
+    const source = eventSourceRef.current;
     eventSourceRef.current = null;
+    source?.close();
     eventConnectionRef.current = null;
     eventBridgeConnectedRef.current = false;
   };
 
-  const ensureWorkbenchEventSource = (options?: { reconnect?: boolean }) => {
-    if (options?.reconnect) {
-      closeWorkbenchEventSource();
-    }
-    if (eventSourceRef.current) return;
+  function reconnectWorkbenchEventSource(): void {
+    if (eventHandlersRef.current.size === 0) return;
+    closeActiveWorkbenchEventSource();
+    openWorkbenchEventSource();
+  }
 
-    const source = new EventSource('/api/events');
+  function getWorkbenchEventReconnectLoop(): WorkbenchEventReconnectLoop {
+    if (!eventReconnectLoopRef.current) {
+      eventReconnectLoopRef.current = new WorkbenchEventReconnectLoop({
+        reconnect: reconnectWorkbenchEventSource,
+        isVisible: () => document.visibilityState === 'visible',
+      });
+    }
+    return eventReconnectLoopRef.current;
+  }
+
+  function openWorkbenchEventSource(): void {
+    if (
+      eventSourceRef.current ||
+      eventHandlersRef.current.size === 0 ||
+      document.visibilityState !== 'visible'
+    ) return;
+
+    let source: EventSource;
+    try {
+      source = new EventSource('/api/events');
+    } catch (err) {
+      setWorkbenchEventConnectionState('reconnecting');
+      getWorkbenchEventReconnectLoop().failed();
+      const event = err instanceof Event ? err : new Event('error');
+      dispatchToWorkbenchHandlers((handlers) => handlers.onError?.(event));
+      return;
+    }
+
     eventSourceRef.current = source;
+    setWorkbenchEventConnectionState('reconnecting');
+    getWorkbenchEventReconnectLoop().attemptStarted();
     source.addEventListener('connected', (e: MessageEvent) => {
+      if (eventSourceRef.current !== source) return;
       try {
         const parsed = JSON.parse(e.data) as { sub_id?: number; type?: string; data?: unknown };
         const sourceKind = typeof parsed.sub_id === 'number' ? 'browser' : 'controller';
@@ -1902,6 +1948,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
         if (sourceKind === 'controller') {
           eventBridgeConnectedRef.current = true;
+          setWorkbenchEventConnectionState('connected');
           dispatchToWorkbenchHandlers((handlers) => handlers.onEventBridgeStatus?.({ connected: true }));
         }
       } catch (err) {
@@ -1909,6 +1956,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         eventConnectionRef.current = null;
       }
       if (eventConnectionRef.current) {
+        getWorkbenchEventReconnectLoop().streamOpened();
         const connected = eventConnectionRef.current;
         dispatchToWorkbenchHandlers((handlers) => handlers.onConnected?.(connected));
       }
@@ -2038,21 +2086,61 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
     });
     source.addEventListener('workbench.events.bridge.status', (e: MessageEvent) => {
+      if (eventSourceRef.current !== source) return;
       const envelope = parseWorkbenchEnvelope<{ connected: boolean }>(e.data);
       if (!envelope) return;
+      getWorkbenchEventReconnectLoop().streamOpened();
       eventBridgeConnectedRef.current = envelope.data.connected;
+      setWorkbenchEventConnectionState(envelope.data.connected ? 'connected' : 'reconnecting');
       dispatchToWorkbenchHandlers((handlers) => {
         handlers.onAny?.(envelope);
         handlers.onEventBridgeStatus?.(envelope.data);
       });
     });
     source.onerror = (err) => {
-      eventConnectionRef.current = null;
-      eventBridgeConnectedRef.current = false;
+      if (eventSourceRef.current !== source) return;
+      closeActiveWorkbenchEventSource();
+      setWorkbenchEventConnectionState('reconnecting');
       dispatchToWorkbenchHandlers((handlers) => handlers.onEventBridgeStatus?.({ connected: false }));
       dispatchToWorkbenchHandlers((handlers) => handlers.onError?.(err));
+      getWorkbenchEventReconnectLoop().failed();
     };
+  }
+
+  const ensureWorkbenchEventSource = () => {
+    getWorkbenchEventReconnectLoop();
+    openWorkbenchEventSource();
   };
+
+  const stopWorkbenchEventSource = () => {
+    closeActiveWorkbenchEventSource();
+    eventReconnectLoopRef.current?.stop();
+    eventReconnectLoopRef.current = null;
+    setWorkbenchEventConnectionState('reconnecting');
+  };
+  stopWorkbenchEventsRef.current = stopWorkbenchEventSource;
+
+  const wakeWorkbenchEvents = () => {
+    if (eventHandlersRef.current.size === 0 || document.visibilityState !== 'visible') return;
+    setWorkbenchEventConnectionState('reconnecting');
+    getWorkbenchEventReconnectLoop().wake();
+  };
+  wakeWorkbenchEventsRef.current = wakeWorkbenchEvents;
+
+  useEffect(() => {
+    const wakeIfVisible = () => {
+      if (document.visibilityState === 'visible') wakeWorkbenchEventsRef.current();
+    };
+    document.addEventListener('visibilitychange', wakeIfVisible);
+    window.addEventListener('online', wakeIfVisible);
+    window.addEventListener('focus', wakeIfVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', wakeIfVisible);
+      window.removeEventListener('online', wakeIfVisible);
+      window.removeEventListener('focus', wakeIfVisible);
+      stopWorkbenchEventsRef.current();
+    };
+  }, []);
 
   const requestJson = async (
     path: string,
@@ -2499,7 +2587,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
       return { ok: res.ok, ...payloadJson };
     },
-    getTurnState: async (sessionId) => {
+    getTurnState: async (sessionId, options) => {
       const path = `/api/sessions/${encodeURIComponent(sessionId)}/turn-state`;
       const res = await apiFetch(path);
       if (res.status === 504) {
@@ -2515,6 +2603,9 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
       }
       if (!res.ok) {
+        if (options?.handleError === false) {
+          throw new ApiError(`Request failed: ${path} (${res.status})`, res.status, null);
+        }
         await handleApiError(res, path);
       }
       return res.json();
@@ -2536,7 +2627,8 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (params?.before) search.set('before', params.before);
       const qs = search.toString();
       const path = qs ? `/api/inbox?${qs}` : '/api/inbox';
-      return params?.cache === false ? getJson(path) : getCachedJson(path);
+      const options = { handleError: params?.handleError };
+      return params?.cache === false ? getJson(path, options) : getCachedJson(path, 1500, options);
     },
     listVibeAgents: (params) => {
       const search = new URLSearchParams();
@@ -2713,9 +2805,14 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return getCachedJson(qs ? `/api/harness/runs?${qs}` : '/api/harness/runs');
     },
     getHarnessRun: (runId) => getCachedJson(`/api/harness/runs/${encodeURIComponent(runId)}`),
-    connectWorkbenchEvents: (handlers, options) => {
+    connectWorkbenchEvents: (handlers) => {
       eventHandlersRef.current.add(handlers);
-      ensureWorkbenchEventSource(options);
+      ensureWorkbenchEventSource();
+      queueMicrotask(() => {
+        if (eventHandlersRef.current.has(handlers)) {
+          handlers.onConnectionState?.(eventConnectionStateRef.current);
+        }
+      });
       if (
         eventConnectionRef.current &&
         (eventConnectionRef.current.source !== 'controller' || eventBridgeConnectedRef.current)
@@ -2740,7 +2837,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return () => {
         eventHandlersRef.current.delete(handlers);
         if (eventHandlersRef.current.size === 0) {
-          closeWorkbenchEventSource();
+          stopWorkbenchEventSource();
         }
       };
     },

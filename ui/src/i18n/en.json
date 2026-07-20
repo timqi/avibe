@@ -2361,10 +2361,6 @@
         "taskOneShot": "One-time",
         "taskRecurring": "Recurring",
         "agentRun": "Agent run"
-      },
-      "connection": {
-        "reconnecting": "Reconnecting",
-        "disconnected": "Disconnected"
       }
     },
     "agentActivity": {
