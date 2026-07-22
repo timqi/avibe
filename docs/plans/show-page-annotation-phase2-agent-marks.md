@@ -16,7 +16,7 @@ Two complementary mark kinds:
 | Kind | Authored via | Nature | Lifecycle owner |
 | --- | --- | --- | --- |
 | **Reply mark** (回应型) | `vibe show reply` (CLI, event-backed) | Answers a specific user annotation | Read-to-retire pairing |
-| **Note mark** (说明型) | `vibe show mark` (CLI) or `mark-note` attribute (declarative, in page source) | Agent's own callout on an element | CLI: replace-on-same-target + read-to-fade; attribute: lives/dies with the source |
+| **Note mark** (说明型) | `vibe show mark` (CLI) or `agent-note` attribute (declarative, in page source) | Agent's own callout on an element | CLI: replace-on-same-target + read-to-fade; attribute: lives/dies with the source |
 
 ## Agent-facing API (owner review section)
 
@@ -49,17 +49,26 @@ vibe show mark <target> --message "本区块已切换到新数据源，历史口
 - Same target marked again → **replaces** the previous note (no stacking).
 - Session id injected; `--scope` stays optional (default `default`).
 
-### 3. `mark-note` attribute — declarative note in page source
+### 3. `agent-note` attribute — declarative note in page source
 
 ```jsx
-<section mark-default="q3.summary" mark-note="这里我改用了新数据源">
+<section mark-default="q3.summary" agent-note="这里我改用了新数据源">
 ```
 
-- Any element authored by the agent can carry `mark-note="<text>"`; the
-  overlay renders the standard violet mark for it. Pairs naturally with the
-  existing `mark-default` anchor attribute (same naming family).
+- Any element authored by the agent can carry `agent-note="<text>"`; the
+  overlay renders the standard violet mark for it. Complements the `mark-*`
+  anchor attributes: `mark-*` = anchors (WHERE), `agent-note` = the agent's
+  words (WHAT).
 - Lifecycle = source lifecycle: edit/remove the attribute and the mark
   follows on next render. No events involved.
+- Naming revision (2026-07-23, review finding #269): originally specced as
+  `mark-note`, which collides with the anchor attribute family — `mark-<scope>`
+  is emitted by `markAttributes(id, scope)` for ANY scope name, so a page
+  using scope "note" would have its anchor ids rendered as bogus notes, and
+  no `mark-*` content attribute can ever be collision-free against
+  free-form scopes. The content attribute therefore lives OUTSIDE the
+  `mark-*` prefix. `markAttributes` behavior is unchanged; no public API
+  break.
 
 ### 4. `vibe show marks` — inspect / tidy
 
@@ -119,7 +128,7 @@ so `vibe show reply` remains available.
   — POST path already exists, ensure resolved-by-user authoring is allowed
   and author-stamped.
 - **Lane R (vibe-show-runtime)**: mark rendering upgrade (unread violet →
-  expand bubble → emit resolved → gray fade); `mark-note` attribute pickup
+  expand bubble → emit resolved → gray fade); `agent-note` attribute pickup
   (registry scan alongside `mark-*` anchors); cap-and-aggregate badge +
   list; missing-anchor list entries; replace semantics on render
   (same target/pair → newest wins).
@@ -137,5 +146,5 @@ so `vibe show reply` remains available.
    all; reading retires each.
 4. Agent rewrites the page section → orphaned mark moves to the badge list
    as "原位置已更新" (never mis-pinned).
-5. `mark-note` attribute renders a mark; removing the attribute removes it;
+5. `agent-note` attribute renders a mark; removing the attribute removes it;
    read state survives reload via localStorage.
