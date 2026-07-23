@@ -15,8 +15,16 @@ class RuntimeServiceLockTests(unittest.TestCase):
     def setUp(self):
         self._extra_service_pids = patch("vibe.runtime.extra_service_process_pids", return_value=[])
         self._extra_service_pids.start()
+        # These tests target the generic (non-scoped) start_service contract via
+        # wait_for_service_pid. On a Linux dev host with a user systemd manager,
+        # maybe_systemd_scope_prefix() is truthy and would route start_service
+        # through the scoped poll-and-adopt path (and real host lock state), so
+        # pin it off here. The scoped path has its own dedicated tests.
+        self._no_scope = patch("vibe.runtime.maybe_systemd_scope_prefix", return_value=[])
+        self._no_scope.start()
 
     def tearDown(self):
+        self._no_scope.stop()
         self._extra_service_pids.stop()
 
     def test_start_service_reuses_existing_live_pid(self):

@@ -1274,13 +1274,13 @@ def maybe_systemd_scope_prefix() -> list[str]:
 
 
 def _adopt_scoped_service_owner(prev_pid: int) -> int | None:
-    """Reconcile the tracked service pid after a ``systemd-run --user --scope`` launch.
+    """Adopt the authoritative ``service.lock`` holder if it differs from ``prev_pid``.
 
-    ``--scope`` exec()s into the target, so ``process.pid`` is normally already the
-    real service pid and this fallback is never reached (the first
-    ``wait_for_service_pid`` succeeds). It exists purely to be robust on any host
-    where the shim survives as a distinct parent: the flock in ``service.lock`` is
-    the authoritative owner signal (see ``resolve_service_owner_pid``), so if a
+    Called on every tick of ``_wait_for_scoped_service_pid``. ``--scope`` exec()s
+    into the target, so ``prev_pid`` is normally already the real service pid and
+    the owner matches it (no-op). This exists to stay correct on any host where a
+    shim survives as a distinct parent: the flock in ``service.lock`` is the
+    authoritative owner signal (see ``resolve_service_owner_pid``), so if a
     *different* live process now holds it, adopt that pid instead of the shim's.
     Returns the adopted pid, or ``None`` to leave ``prev_pid`` in place.
     """
@@ -1300,6 +1300,80 @@ def _adopt_scoped_service_owner(prev_pid: int) -> int | None:
         )
         return owner
     return None
+
+
+def _wait_for_scoped_service_pid(spawn_pid: int, timeout: float) -> int | None:
+    """Poll a ``systemd-run --user --scope`` launch until it is lock-verified.
+
+    ``--scope`` exec()s into the target, so ``spawn_pid`` is normally already the
+    service pid. To stay correct even if a shim ever survives as a distinct
+    parent, the ``service.lock`` flock holder is authoritative: on every tick we
+    adopt a differing live lock holder, so we never settle on an unverified
+    (possibly wrapper) pid. Returns the ready pid, or ``None`` if it neither
+    became ready nor left a live owner within ``timeout``.
+    """
+    pid = spawn_pid
+    deadline = time.monotonic() + timeout
+    while True:
+        if service_pid_recorded(pid):
+            _SERVICE_START_PROCESSES.pop(pid, None)
+            return pid
+        adopted = _adopt_scoped_service_owner(pid)
+        if adopted is not None:
+            pid = adopted
+            continue
+        # The spawn process is gone and nobody holds the lock -> startup failed.
+        if _service_start_exit_code(spawn_pid) is not None:
+            if resolve_service_owner_pid(include_starting=False) is None:
+                return None
+        elif not pid_alive(pid) and resolve_service_owner_pid(include_starting=False) is None:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def _start_scoped_service_result(
+    spawn_pid: int,
+    *,
+    initial_ready_timeout: float,
+    wait_for_ready: bool,
+) -> int:
+    """Resolve the final service pid for a scoped launch, polling+adopting the
+    authoritative lock holder rather than trusting the spawn pid."""
+    # A scoped launch must resolve to a lock-verified pid, so give the first
+    # phase a floor even when the caller passed initial_ready_timeout=0 (e.g.
+    # restart_supervisor): the spawn pid alone is not a trustworthy owner signal
+    # under a scope wrapper. In the common exec() case this returns as soon as
+    # the service acquires the lock, so the floor rarely costs anything.
+    first_timeout = max(initial_ready_timeout, SERVICE_LOCK_READY_TIMEOUT_SECONDS)
+    ready = _wait_for_scoped_service_pid(spawn_pid, first_timeout)
+    if ready is not None:
+        return ready
+    exit_code = _service_start_exit_code(spawn_pid)
+    if exit_code is not None and resolve_service_owner_pid(include_starting=False) is None:
+        raise RuntimeError(
+            f"Vibe service process pid={spawn_pid} exited with code {exit_code} before acquiring the service lock"
+        )
+    if not wait_for_ready:
+        candidate = resolve_service_owner_pid() or spawn_pid
+        if pid_alive(candidate):
+            logger.warning(
+                "Scoped Vibe service pid=%s has not acquired the service lock yet; "
+                "continuing while it finishes startup",
+                candidate,
+            )
+            return candidate
+    ready = _wait_for_scoped_service_pid(spawn_pid, SERVICE_SLOW_START_TIMEOUT_SECONDS)
+    if ready is not None:
+        return ready
+    exit_code = _service_start_exit_code(spawn_pid)
+    if exit_code is not None:
+        raise RuntimeError(
+            f"Vibe service process pid={spawn_pid} exited with code {exit_code} before acquiring the service lock"
+        )
+    _raise_service_start_not_ready(spawn_pid, timeout=SERVICE_SLOW_START_TIMEOUT_SECONDS)
+    return spawn_pid
 
 
 def start_service(
@@ -1377,16 +1451,16 @@ def start_service(
         pid = process.pid
         _SERVICE_START_PROCESSES[pid] = process
         _record_service_pid_reservation(pid)
+        if scope_prefix:
+            # Scoped launches resolve their pid via the authoritative lock holder
+            # (poll-and-adopt), never by trusting the spawn pid alone.
+            return _start_scoped_service_result(
+                pid,
+                initial_ready_timeout=initial_ready_timeout,
+                wait_for_ready=wait_for_ready,
+            )
         if initial_ready_timeout > 0 and wait_for_service_pid(pid, timeout=initial_ready_timeout):
             return pid
-        if scope_prefix:
-            adopted_pid = _adopt_scoped_service_owner(pid)
-            if adopted_pid is not None:
-                pid = adopted_pid
-                if wait_for_service_pid(
-                    pid, timeout=initial_ready_timeout or SERVICE_LOCK_READY_TIMEOUT_SECONDS
-                ):
-                    return pid
         exit_code = _service_start_exit_code(pid)
         if exit_code is not None:
             raise RuntimeError(
