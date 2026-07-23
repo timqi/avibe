@@ -3019,6 +3019,270 @@ def config_get():
     return jsonify(api.config_to_payload(config))
 
 
+_MODEL_HUB_ENGINE_ADAPTER = None
+_MODEL_HUB_NATIVE_OAUTH_ADAPTER = None
+_MODEL_HUB_SERVICE = None
+
+
+def _model_hub_service():
+    from core.handlers.model_hub import create_default_service
+
+    global _MODEL_HUB_SERVICE
+    if _MODEL_HUB_SERVICE is None:
+        _MODEL_HUB_SERVICE = create_default_service(
+            adapter=_MODEL_HUB_ENGINE_ADAPTER,
+            native_oauth_adapter=_MODEL_HUB_NATIVE_OAUTH_ADAPTER,
+        )
+    return _MODEL_HUB_SERVICE
+
+
+def _model_hub_success(**payload):
+    return jsonify({"ok": True, "contract_version": 1, **payload})
+
+
+def _model_hub_error(exc):
+    body = {"ok": False, "contract_version": 1, "error": exc.code}
+    if exc.detail:
+        body["detail"] = exc.detail
+    return jsonify(body), exc.status
+
+
+def _model_hub_json_object(error: str = "discovery_failed", *, status: int = 400):
+    from core.handlers.model_hub import ModelHubError
+
+    payload = request.json
+    if not isinstance(payload, dict):
+        raise ModelHubError(error, status=status)
+    return payload
+
+
+@app.route("/api/models/sources", methods=["GET"])
+def model_hub_sources_get():
+    return _model_hub_success(sources=_model_hub_service().list_sources())
+
+
+@app.route("/api/models/sources", methods=["POST"])
+async def model_hub_sources_post():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        source = await _model_hub_service().create_source(_model_hub_json_object())
+        return _model_hub_success(source=source), 201
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/sources/<source_id>", methods=["PATCH"])
+async def model_hub_sources_patch(source_id):
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        source = await _model_hub_service().patch_source(source_id, _model_hub_json_object())
+        return _model_hub_success(source=source)
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/sources/<source_id>", methods=["DELETE"])
+async def model_hub_sources_delete(source_id):
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        force = str(request.args.get("force") or "").lower() in _TRUE_BOOL_STRINGS
+        await _model_hub_service().delete_source(source_id, force=force)
+        return _model_hub_success()
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/sources/<source_id>/test", methods=["POST"])
+async def model_hub_sources_test(source_id):
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        _, discovered = await _model_hub_service().test_source(source_id)
+        return _model_hub_success(discovered=discovered)
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/priority", methods=["GET"])
+def model_hub_priority_get():
+    priority = _model_hub_service().priority()
+    return _model_hub_success(order=priority["order"])
+
+
+@app.route("/api/models/priority", methods=["PUT"])
+async def model_hub_priority_put():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        priority = await _model_hub_service().set_priority(
+            _model_hub_json_object("invalid_priority_order").get("order")
+        )
+        return _model_hub_success(order=priority["order"])
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/agents", methods=["GET"])
+def model_hub_agents_get():
+    return _model_hub_success(agents=_model_hub_service().list_agents())
+
+
+@app.route("/api/models/agents/<backend>/mode", methods=["PATCH"])
+async def model_hub_agent_mode_patch(backend):
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        agent = await _model_hub_service().set_agent_mode(
+            backend,
+            _model_hub_json_object("mode_switch_blocked").get("mode"),
+        )
+        return _model_hub_success(agent=agent)
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/agents/<backend>/mappings", methods=["PUT"])
+async def model_hub_agent_mappings_put(backend):
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        agent = await _model_hub_service().set_mappings(
+            backend,
+            _model_hub_json_object("mapping_target_unavailable").get("mappings"),
+        )
+        return _model_hub_success(agent=agent)
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/agents/opencode/menu", methods=["PUT"])
+async def model_hub_opencode_menu_put():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        agent = await _model_hub_service().set_opencode_menu(
+            _model_hub_json_object("mapping_target_unavailable").get("menu")
+        )
+        return _model_hub_success(agent=agent)
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/custom-models", methods=["POST"])
+async def model_hub_custom_models_post():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        source = await _model_hub_service().add_custom_model(
+            _model_hub_json_object("source_not_found", status=404)
+        )
+        return _model_hub_success(source=source), 201
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/custom-models", methods=["DELETE"])
+async def model_hub_custom_models_delete():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        payload = _model_hub_json_object("mapping_target_unavailable")
+        source = await _model_hub_service().delete_custom_model(payload.get("source_id"), payload.get("model_id"))
+        return _model_hub_success(source=source)
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/events", methods=["GET"])
+def model_hub_events_get():
+    try:
+        limit = int(request.args.get("limit") or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    events = _model_hub_service().list_events(limit=limit, before=request.args.get("before") or None)
+    return _model_hub_success(events=events)
+
+
+@app.route("/api/models/oauth/start", methods=["POST"])
+async def model_hub_oauth_start():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        return _model_hub_success(
+            flow=await _model_hub_service().oauth_start(_model_hub_json_object("flow_not_found"))
+        )
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/oauth/status/<flow_id>", methods=["GET"])
+async def model_hub_oauth_status(flow_id):
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        return _model_hub_success(flow=await _model_hub_service().oauth_status(flow_id))
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/oauth/submit", methods=["POST"])
+async def model_hub_oauth_submit():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        return _model_hub_success(
+            flow=await _model_hub_service().oauth_submit(
+                _model_hub_json_object("flow_not_found", status=404)
+            )
+        )
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/oauth/cancel", methods=["POST"])
+async def model_hub_oauth_cancel():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        await _model_hub_service().oauth_cancel(
+            _model_hub_json_object("flow_not_found", status=404).get("flow_id")
+        )
+        return _model_hub_success()
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/migration/scan", methods=["POST"])
+def model_hub_migration_scan():
+    return _model_hub_success(**_model_hub_service().migration_scan())
+
+
+@app.route("/api/models/migration/apply", methods=["POST"])
+def model_hub_migration_apply():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        result = _model_hub_service().migration_apply(
+            _model_hub_json_object("migration_item_conflict", status=409).get("item_ids")
+        )
+        return _model_hub_success(**result)
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
+@app.route("/api/models/runtime/status", methods=["GET"])
+async def model_hub_runtime_status():
+    from core.handlers.model_hub import ModelHubError
+
+    try:
+        return _model_hub_success(runtime=await _model_hub_service().runtime_status())
+    except ModelHubError as exc:
+        return _model_hub_error(exc)
+
+
 @app.route("/api/platforms", methods=["GET"])
 def platforms_get():
     from vibe import api
