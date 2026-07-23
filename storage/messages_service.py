@@ -21,7 +21,7 @@ from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.engine import Connection
 
 from storage.db import escape_sql_like
-from storage.models import agent_sessions, messages, scope_settings, scopes
+from storage.models import agent_runs, agent_sessions, messages, scope_settings, scopes
 from vibe.message_identity import HARNESS_TYPE, INPUT_TURN_AUTHOR_TYPES
 
 
@@ -73,6 +73,98 @@ def _row_to_payload(row: dict[str, Any]) -> dict[str, Any]:
         "delivered_at": row.get("delivered_at"),
         "read_at": row.get("read_at"),
     }
+
+
+_AGENT_RUN_NATIVE_PREFIX = "agent_run:"
+
+
+def _attach_agent_run_provenance(
+    conn: Connection, payloads: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Read-side provenance for agent-callback ("自动触发") chat messages (A9a).
+
+    A harness ``agent_run`` prompt is stored as ``native_message_id =
+    "agent_run:<execution_id>"`` with no source-session pointer (the write path
+    records none). Resolve it read-side: message → its ``agent_runs`` row
+    (``id == <execution_id>``) → the run's ``source_actor`` (the session that
+    triggered the callback) → that session's title, so the Chat chip can name the
+    source and deep-link to ``/chat/<source_session_id>``. No schema/write-path
+    change. Batched: at most two extra queries per page, only when such a message
+    is present.
+    """
+    exec_by_msg: dict[str, str] = {}
+    for payload in payloads:
+        native_id = payload.get("native_message_id")
+        if (
+            payload.get("source") == "harness"
+            and isinstance(native_id, str)
+            and native_id.startswith(_AGENT_RUN_NATIVE_PREFIX)
+        ):
+            exec_by_msg[payload["id"]] = native_id[len(_AGENT_RUN_NATIVE_PREFIX):]
+    if not exec_by_msg:
+        return payloads
+
+    # execution_id == agent_runs.id. The source SESSION differs by run kind:
+    #  - source_kind='agent'   → source_actor IS the caller session id.
+    #  - source_kind='callback'→ source_actor is the parent RUN id (or a decorated
+    #    "<run>:terminal:<status>"), NOT a session; the real source is the parent
+    #    (delegated) run's session_id.
+    runs = {
+        row["id"]: row
+        for row in conn.execute(
+            select(
+                agent_runs.c.id, agent_runs.c.source_kind,
+                agent_runs.c.source_actor, agent_runs.c.parent_run_id,
+            ).where(agent_runs.c.id.in_(set(exec_by_msg.values())))
+        ).mappings()
+    }
+    callback_parents = {
+        run["parent_run_id"] for run in runs.values()
+        if run["source_kind"] == "callback" and run["parent_run_id"]
+    }
+    parent_session: dict[str, str] = {}
+    if callback_parents:
+        for row in conn.execute(
+            select(agent_runs.c.id, agent_runs.c.session_id).where(
+                agent_runs.c.id.in_(callback_parents)
+            )
+        ).mappings():
+            sess = (row["session_id"] or "").strip()
+            if sess:
+                parent_session[row["id"]] = sess
+
+    source_by_exec: dict[str, str] = {}
+    for exec_id, run in runs.items():
+        if run["source_kind"] == "callback":
+            source_id = parent_session.get(run["parent_run_id"])
+        else:
+            source_id = (run["source_actor"] or "").strip() or None
+        # A session id never contains ':' (decorated run/terminal forms do); guard
+        # so an unexpected source_actor shape can't become a bogus /chat target.
+        if source_id and ":" not in source_id:
+            source_by_exec[exec_id] = source_id
+    if not source_by_exec:
+        return payloads
+
+    meta_by_session: dict[str, dict[str, Optional[str]]] = {}
+    for row in conn.execute(
+        select(agent_sessions.c.id, agent_sessions.c.title, agent_sessions.c.agent_name).where(
+            agent_sessions.c.id.in_(set(source_by_exec.values()))
+        )
+    ).mappings():
+        meta_by_session[row["id"]] = {"title": row["title"], "agent_name": row["agent_name"]}
+
+    for payload in payloads:
+        source_id = source_by_exec.get(exec_by_msg.get(payload["id"], ""))
+        # Only attach when the source session still exists (is in meta_by_session);
+        # a stale/imported/deleted source would otherwise write source_session_id
+        # and produce a dead /chat/<missing id> link with only the fallback label.
+        if source_id in meta_by_session:
+            meta = meta_by_session[source_id]
+            payload["source_session_id"] = source_id
+            payload["source_session_title"] = meta.get("title")
+            payload["source_session_agent_name"] = meta.get("agent_name")
+    return payloads
 
 
 _WS_RE = re.compile(r"\s+")
@@ -188,6 +280,7 @@ def search_messages(
         .where(messages.c.content_text.ilike(f"%{like}%", escape="\\"))
         # Archived sessions are soft-deleted — never surface their messages.
         .where(agent_sessions.c.status != "archived")
+        .where(agent_sessions.c.visibility == "foreground")
         # Archived PROJECTS are modelled as scope_settings.enabled = 0 (the
         # sessions stay active), so exclude a disabled scope's messages too. A
         # missing scope_settings row (legacy / folder-less project) is enabled.
@@ -234,7 +327,7 @@ def search_messages(
 def append(
     conn: Connection,
     *,
-    scope_id: str,
+    scope_id: Optional[str],
     session_id: Optional[str],
     platform: str,
     author: str,
@@ -471,7 +564,7 @@ def list_session_messages(
         has_newer = len(newer) > effective_limit
         newer = newer[:effective_limit]
 
-        merged = older + anchor_rows + newer
+        merged = _attach_agent_run_provenance(conn, older + anchor_rows + newer)
         return {
             "messages": merged,
             "next_after_id": newer[-1]["id"] if has_newer and newer else None,
@@ -480,7 +573,9 @@ def list_session_messages(
     if tail:
         # Newest ``limit`` rows, then flip back to chronological for the caller.
         query = query.order_by(messages.c.created_at.desc(), messages.c.id.desc()).limit(effective_limit + 1)
-        rows = [_row_to_payload(dict(row)) for row in conn.execute(query).mappings().all()]
+        rows = _attach_agent_run_provenance(
+            conn, [_row_to_payload(dict(row)) for row in conn.execute(query).mappings().all()]
+        )
         has_older = len(rows) > effective_limit
         rows = rows[:effective_limit]
         rows.reverse()
@@ -501,7 +596,9 @@ def list_session_messages(
                 )
             )
         query = query.order_by(messages.c.created_at.desc(), messages.c.id.desc()).limit(effective_limit + 1)
-        rows = [_row_to_payload(dict(row)) for row in conn.execute(query).mappings().all()]
+        rows = _attach_agent_run_provenance(
+            conn, [_row_to_payload(dict(row)) for row in conn.execute(query).mappings().all()]
+        )
         has_older = len(rows) > effective_limit
         rows = rows[:effective_limit]
         rows.reverse()
@@ -522,7 +619,9 @@ def list_session_messages(
                 )
             )
     query = query.order_by(messages.c.created_at.asc(), messages.c.id.asc()).limit(effective_limit + 1)
-    rows = [_row_to_payload(dict(row)) for row in conn.execute(query).mappings().all()]
+    rows = _attach_agent_run_provenance(
+        conn, [_row_to_payload(dict(row)) for row in conn.execute(query).mappings().all()]
+    )
     # Probe one extra row against the clamped page size: a full page alone does
     # not prove there is another page, but the extra row does.
     has_newer = len(rows) > effective_limit
@@ -762,7 +861,13 @@ def get_draft(conn: Connection, session_id: str) -> Optional[dict[str, Any]]:
     return _row_to_payload(dict(row)) if row else None
 
 
-def set_draft(conn: Connection, *, scope_id: str, session_id: str, text: Optional[str]) -> Optional[dict[str, Any]]:
+def set_draft(
+    conn: Connection,
+    *,
+    scope_id: Optional[str],
+    session_id: str,
+    text: Optional[str],
+) -> Optional[dict[str, Any]]:
     """Upsert the session's draft (one row per session). Blank text clears it."""
     conn.execute(
         delete(messages).where(messages.c.session_id == session_id).where(messages.c.type == DRAFT_TYPE)
@@ -816,7 +921,12 @@ def unread_counts(
             or_(
                 messages.c.session_id.is_(None),
                 messages.c.session_id.not_in(
-                    select(agent_sessions.c.id).where(agent_sessions.c.status == "archived")
+                    select(agent_sessions.c.id).where(
+                        or_(
+                            agent_sessions.c.status == "archived",
+                            agent_sessions.c.visibility != "foreground",
+                        )
+                    )
                 ),
             )
         )
@@ -850,7 +960,16 @@ def unread_counts_by_session(
         .where(messages.c.session_id.is_not(None))
         # Archived sessions are inert — their unread results must not light the
         # sidebar / global badge.
-        .where(messages.c.session_id.not_in(select(agent_sessions.c.id).where(agent_sessions.c.status == "archived")))
+        .where(
+            messages.c.session_id.not_in(
+                select(agent_sessions.c.id).where(
+                    or_(
+                        agent_sessions.c.status == "archived",
+                        agent_sessions.c.visibility != "foreground",
+                    )
+                )
+            )
+        )
         .group_by(messages.c.session_id)
     )
     if platform is not None:
@@ -987,7 +1106,10 @@ def list_inbox_sessions(
         )
     )
     # Archived sessions are hidden everywhere — keep them out of the inbox feed too.
-    session_rows = session_rows.where(agent_sessions.c.status != "archived")
+    session_rows = session_rows.where(
+        agent_sessions.c.status != "archived",
+        agent_sessions.c.visibility == "foreground",
+    )
     if only_session:
         session_rows = session_rows.where(agent_sessions.c.id == only_session)
 

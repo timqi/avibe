@@ -1,7 +1,7 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Activity, ArrowLeft, ArrowRight, Bell, Bot, ChevronDown, ChevronRight, Clock, Eye, GitFork, Info, Loader2, MessageSquare, Pencil, Presentation, Terminal, Undo2, UploadCloud, X } from 'lucide-react';
+import { Activity, ArrowLeft, ArrowRight, ArrowUpRight, Bell, Bot, ChevronDown, ChevronRight, Clock, Eye, GitFork, Info, Loader2, MessageSquare, Pencil, Presentation, Terminal, Undo2, UploadCloud, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -24,6 +24,7 @@ import {
   resolveActivityLabel,
   sortBackgroundActivities,
 } from '../../lib/backgroundActivity';
+import { chatTriggerLink, isUnresolvedAgentCallback } from '../../lib/chatTrigger';
 import { useFileDrop } from '../../lib/useFileDrop';
 import { quoteText } from '../../lib/quoteText';
 import { mergeById, insertMessageOrdered } from '../../lib/transcriptOrder';
@@ -1003,6 +1004,10 @@ export const ChatPage: React.FC = () => {
           return;
         }
         appendMessage(msg);
+        // A9a: a live agent-callback prompt is published before its source
+        // session is resolved, so pull the enriched REST row (mergeById fills
+        // source_session_* in place) — the chip appears without a reload/refocus.
+        if (isUnresolvedAgentCallback(msg)) void reconcile();
         // Agent Activity: a terminal reply settles the turn → mark the generation
         // settled and rebuild groups from storage (chip, rows, status, duration all
         // come from the endpoint, never the lossy live buffer).
@@ -3074,6 +3079,7 @@ type MessageRowProps = {
 // useCallback), so the default shallow compare is correct here.
 const MessageRow = memo(function MessageRow({ message, session, messageFontSize, onQuickReply, highlighted }: MessageRowProps) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   // Harness rows are collapsed by default; this tracks the per-row expand state.
   const [expanded, setExpanded] = useState(false);
 
@@ -3092,6 +3098,9 @@ const MessageRow = memo(function MessageRow({ message, session, messageFontSize,
   // watch / webhook); collapsed by default so it doesn't dominate.
   const isHarness = !isNotify && !isAgent && !isSystem && message.source === 'harness';
   const isUser = !isNotify && !isAgent && !isSystem && !isHarness;
+  // Trigger-message provenance click-through (contract A9a/A9b): agent-callback
+  // rows link to the source session's chat; task/watch rows to the Harness view.
+  const triggerLink = isHarness ? chatTriggerLink(message, t('chat.source.agentFallback')) : null;
   const messageFontStyle = { fontSize: `${normalizeChatMessageFontSize(messageFontSize)}px` };
 
   // User-uploaded attachments ride in ``content.attachments`` (agent-reply media
@@ -3220,7 +3229,33 @@ const MessageRow = memo(function MessageRow({ message, session, messageFontSize,
         <div className="group/message flex max-w-[min(92%,860px)] flex-col items-start gap-1">
           <div className="flex items-center gap-2 px-0.5">
             <RoleAvatar tone="cyan"><Clock /></RoleAvatar>
-            <span className="text-[11px] font-medium text-cyan">{harnessLabel(message.author_name, t)}</span>
+            {triggerLink?.kind === 'harness' ? (
+              // A9b: task/watch label deep-links to the Harness filtered view.
+              <button
+                type="button"
+                onClick={() => navigate(triggerLink.to)}
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-cyan hover:underline"
+              >
+                {harnessLabel(message.author_name, t)}
+                <ArrowUpRight className="size-3 shrink-0" />
+              </button>
+            ) : (
+              <span className="text-[11px] font-medium text-cyan">{harnessLabel(message.author_name, t)}</span>
+            )}
+            {triggerLink?.kind === 'source' && (
+              // A9a: agent-callback shows the SOURCE session + links to its chat.
+              <>
+                <span className="text-[11px] text-muted">·</span>
+                <button
+                  type="button"
+                  onClick={() => navigate(triggerLink.to)}
+                  className="inline-flex min-w-0 items-center gap-1 text-[11px] font-medium text-cyan hover:underline"
+                >
+                  <span className="min-w-0 truncate">{triggerLink.label}</span>
+                  <ArrowUpRight className="size-3 shrink-0" />
+                </button>
+              </>
+            )}
           </div>
           <Button
             type="button"

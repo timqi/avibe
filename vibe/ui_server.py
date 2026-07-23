@@ -3112,6 +3112,55 @@ async def running_agents_end():
     return jsonify(body), (result.get("status_code") or 200)
 
 
+# Contract A7: the run-graph endpoint lives OUTSIDE the ``/api/agents/<name>``
+# namespace (``/api/agents-graph``). ``<name>`` is a user-creatable agent slug,
+# so a ``/api/agents/graph`` path would be shadowed by — or shadow — an agent
+# literally named ``graph``; a distinct top-level path avoids the collision.
+@app.route("/api/agents-graph", methods=["GET"])
+async def agents_graph_get():
+    """Read-only run-graph payload for the Agents → 运行 tab.
+
+    Assembles ``agent_sessions`` + ``agent_runs`` + ``scopes`` into the frozen
+    contract §3 shape (``docs/plans/agents-run-graph-contract.md``). Liveness is
+    controller-owned, so it is fetched from the internal running-agents snapshot
+    and merged in; when the controller is unreachable the graph still renders
+    from the DB (all nodes non-live) with a ``live_unreachable`` hint so the tab
+    can show a "runtime unreachable — history only" state instead of a
+    misleading empty graph."""
+    from core.services import agent_graph
+    from vibe import internal_client
+
+    def _flag(value, default: bool) -> bool:
+        if value is None:
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    window = request.args.get("window") or agent_graph.DEFAULT_WINDOW
+    project = request.args.get("project") or "all"
+    include_ended = _flag(request.args.get("include_ended"), True)
+    include_background = _flag(request.args.get("include_background"), True)
+
+    live_agents: list = []
+    live_unreachable = False
+    try:
+        result = await internal_client.list_running_agents()
+        live_agents = (result.get("body") or {}).get("agents") or []
+    except (internal_client.InternalServerUnavailable, internal_client.InternalServerTimeout):
+        # Controller down: fall back to a DB-only graph (history stays visible).
+        live_unreachable = True
+
+    payload = await asyncio.to_thread(
+        agent_graph.build_graph,
+        live_agents=live_agents,
+        window=window,
+        project=project,
+        include_ended=include_ended,
+        include_background=include_background,
+        live_unreachable=live_unreachable,
+    )
+    return jsonify(payload)
+
+
 @app.route("/api/agents/<name>", methods=["GET"])
 def vibe_agent_get(name):
     from vibe import api
@@ -6015,6 +6064,64 @@ def _backend_locked_response(err):
     )
 
 
+def _publish_session_update_activity(
+    broker,
+    *,
+    session_id: str,
+    session: dict,
+    previous_session: dict | None = None,
+) -> None:
+    """Publish one canonical title/placement reconciliation sequence."""
+    broker.publish(
+        "session.activity",
+        {
+            "session_id": session_id,
+            "scope_id": session.get("scope_id"),
+            "event": "updated",
+            "title": session.get("title"),
+            "visibility": session.get("visibility"),
+        },
+    )
+    if previous_session is None:
+        return
+
+    previous_scope_id = previous_session.get("scope_id")
+    current_scope_id = session.get("scope_id")
+    placement_changed = (
+        previous_scope_id != current_scope_id
+        or previous_session.get("visibility") != session.get("visibility")
+    )
+    if not placement_changed:
+        return
+
+    # The current sidebar listener patches title-only `updated` events, then
+    # reconciles project windows for ordering activity. Reconcile the old scope
+    # to remove the row, and treat a foreground row in its new scope as newly
+    # visible so an empty loaded project also fetches it.
+    if previous_scope_id and (
+        previous_scope_id != current_scope_id or session.get("visibility") == "background"
+    ):
+        broker.publish(
+            "session.activity",
+            {
+                "session_id": session_id,
+                "scope_id": previous_scope_id,
+                "event": "user_message",
+                "reason": "session_placement_changed",
+            },
+        )
+    if current_scope_id and session.get("visibility") == "foreground":
+        broker.publish(
+            "session.activity",
+            {
+                "session_id": session_id,
+                "scope_id": current_scope_id,
+                "event": "created",
+                "reason": "session_placement_changed",
+            },
+        )
+
+
 @app.route("/api/sessions/<session_id>", methods=["PATCH"])
 async def sessions_update(session_id: str):
     from core.services import sessions as workbench_sessions_service
@@ -6032,6 +6139,8 @@ async def sessions_update(session_id: str):
             "agent_variant",
             "model",
             "reasoning_effort",
+            "visibility",
+            "scope_id",
         )
         if key in payload
     }
@@ -6081,25 +6190,29 @@ async def sessions_update(session_id: str):
 
     try:
         with engine.begin() as conn:
+            previous_session = (
+                workbench_sessions_service.get_session(conn, session_id)
+                if {"visibility", "scope_id"}.intersection(updatable)
+                else None
+            )
             session = workbench_sessions_service.update_session(conn, session_id, **updatable)
     except LookupError as err:
         return jsonify({"error": str(err)}), 404
+    except (ValueError, PermissionError) as err:
+        return jsonify({"error": str(err)}), 400
     except workbench_sessions_service.SessionBackendLockedError as err:
         # A session is pinned to its backend once it has a conversation (or a
         # running turn); the UI may switch the agent within the same backend,
         # but not across backends.
         return _backend_locked_response(err)
     # Broadcast so other surfaces (e.g. the sidebar session list) reflect the
-    # edit live — renaming a session in the chat header should rename its
-    # sidebar row without a manual refresh.
-    broker.publish(
-        "session.activity",
-        {
-            "session_id": session_id,
-            "scope_id": session.get("scope_id"),
-            "event": "updated",
-            "title": session.get("title"),
-        },
+    # edit live. The local CLI route below uses this same sequence after its
+    # out-of-process DB write.
+    _publish_session_update_activity(
+        broker,
+        session_id=session_id,
+        session=session,
+        previous_session=previous_session,
     )
     return jsonify(session)
 
@@ -6117,20 +6230,25 @@ def sessions_cli_activity(session_id: str):
     from core.services import sessions as workbench_sessions_service
     from vibe.sse_broker import broker
 
+    payload = request.json or {}
+    previous_session = None
+    if "previous_scope_id" in payload and "previous_visibility" in payload:
+        previous_session = {
+            "scope_id": payload.get("previous_scope_id"),
+            "visibility": payload.get("previous_visibility"),
+        }
+
     engine = _projects_engine()
     try:
         with engine.connect() as conn:
             session = workbench_sessions_service.get_session(conn, session_id)
     except LookupError:
         return jsonify({"error": "not found"}), 404
-    broker.publish(
-        "session.activity",
-        {
-            "session_id": session_id,
-            "scope_id": session.get("scope_id"),
-            "event": "updated",
-            "title": session.get("title"),
-        },
+    _publish_session_update_activity(
+        broker,
+        session_id=session_id,
+        session=session,
+        previous_session=previous_session,
     )
     return jsonify({"ok": True})
 
@@ -6866,6 +6984,15 @@ def media_get(token: str):
     ``inline`` (so images render in ``<img>`` and PDFs preview); ``?download=1``
     forces an attachment download.
     """
+    return _registered_media_response(token)
+
+
+def _registered_media_response(
+    token: str,
+    *,
+    expected_session_id: str | None = None,
+    expected_source: str | None = None,
+):
     from urllib.parse import quote
 
     from storage import media_service
@@ -6874,6 +7001,10 @@ def media_get(token: str):
     with engine.connect() as conn:
         row = media_service.get_by_token(conn, token)
     if not row or row.get("revoked_at"):
+        return jsonify({"error": "not_found"}), 404
+    if expected_session_id is not None and row.get("session_id") != expected_session_id:
+        return jsonify({"error": "not_found"}), 404
+    if expected_source is not None and row.get("source") != expected_source:
         return jsonify({"error": "not_found"}), 404
     stored = row["local_path"]
     try:
@@ -7540,6 +7671,10 @@ def inbox_list():
     except (TypeError, ValueError):
         limit = 30
     before = request.args.get("before") or None
+    # Targeted single-session fetch: lets a client (e.g. the Inbox visibility
+    # reconcile) guarantee one specific session's row is (re)loaded even when its
+    # activity sorts past the paged window.
+    only_session = request.args.get("session") or None
 
     engine = _projects_engine()
     with engine.connect() as conn:
@@ -7549,6 +7684,7 @@ def inbox_list():
             unread_only=unread_only,
             limit=limit,
             before=before,
+            only_session=only_session,
         )
         # Pagination-independent unread map for the sidebar badges (a session
         # with unread may sit past the first inbox page) + header totals.
@@ -8493,6 +8629,7 @@ def _show_event_response_from_payload(
     *,
     author: dict[str, str] | None = None,
     public: bool = False,
+    public_share_id: str | None = None,
     allow_dispatch: bool = True,
 ):
     if show_event_payload_session_mismatch(session_id, payload):
@@ -8517,7 +8654,19 @@ def _show_event_response_from_payload(
     _publish_show_session_event(event_payload)
     if allow_dispatch:
         _dispatch_show_event_if_requested(event_payload)
-    return jsonify({"ok": True, "event": _show_event_response_payload(event_payload, public=public)}), 201
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "event": _show_event_response_payload(
+                    event_payload,
+                    public=public,
+                    public_share_id=public_share_id,
+                ),
+            }
+        ),
+        201,
+    )
 
 
 def record_local_show_event(session_id: str, payload: dict[str, Any], *, dispatch_sync: bool = False) -> dict[str, Any]:
@@ -8622,12 +8771,16 @@ def _show_event_dispatch_text(event_payload: dict[str, Any]) -> str:
         return transcript_text
     lines = [transcript_text, "", f"Show event id: {event_id}"]
     payload = event_payload.get("payload")
-    if isinstance(payload, dict) and payload.get("intent") == "question":
+    intent = "comment"
+    if isinstance(payload, dict):
+        intent = str(payload.get("intent") or "").strip() or "comment"
+    if intent in {"question", "comment"}:
         lines.extend(
             [
                 "",
-                "用户在页面上提出了疑问。请优先把回答放回页面上用户指的位置（chat 里保留一句简短结论即可）：",
+                "如需在页面上原位回应，可执行：",
                 f"  vibe show reply {event_id} --message '<你的回答>'",
+                "（也可以直接修改页面内容来响应，按场景选择。）",
             ]
         )
     return "\n".join(lines)
@@ -8648,7 +8801,12 @@ def _publish_show_dispatch_event(event_payload: dict[str, Any], event_name: str,
     )
 
 
-def _show_event_response_payload(event_payload: dict[str, Any], *, public: bool = False) -> dict[str, Any]:
+def _show_event_response_payload(
+    event_payload: dict[str, Any],
+    *,
+    public: bool = False,
+    public_share_id: str | None = None,
+) -> dict[str, Any]:
     if not public:
         return event_payload
     public_event = {
@@ -8662,6 +8820,26 @@ def _show_event_response_payload(event_payload: dict[str, Any], *, public: bool 
         author = public_payload.get("author")
         if isinstance(author, dict) and "email" in author:
             public_payload["author"] = {key: value for key, value in author.items() if key != "email"}
+        screenshot = public_payload.get("screenshot")
+        if isinstance(screenshot, dict):
+            local_path = screenshot.get("path")
+            public_screenshot = {key: value for key, value in screenshot.items() if key != "path"}
+            attachment_id = public_screenshot.get("attachmentId")
+            if (
+                public_share_id
+                and isinstance(local_path, str)
+                and local_path
+                and isinstance(attachment_id, str)
+                and attachment_id
+            ):
+                public_screenshot["url"] = (
+                    f"/p/{quote(public_share_id, safe='')}/__show/media/{quote(attachment_id, safe='')}"
+                )
+            public_payload["screenshot"] = public_screenshot
+            transcript_text = public_event.get("transcript_text")
+            if isinstance(local_path, str) and local_path and isinstance(transcript_text, str):
+                public_ref = str(public_screenshot.get("attachmentId") or "screenshot attachment")
+                public_event["transcript_text"] = transcript_text.replace(local_path, public_ref)
         public_event["payload"] = public_payload
     return public_event
 
@@ -8688,20 +8866,35 @@ def _redact_public_dispatch_value(value: Any) -> Any:
     return value
 
 
-def _show_events_list_payload(payload: dict[str, Any], *, public: bool = False) -> dict[str, Any]:
+def _show_events_list_payload(
+    payload: dict[str, Any],
+    *,
+    public: bool = False,
+    public_share_id: str | None = None,
+) -> dict[str, Any]:
     if not public:
         return payload
     return {
         **payload,
         "events": [
-            _show_event_response_payload(event_payload, public=True)
+            _show_event_response_payload(
+                event_payload,
+                public=True,
+                public_share_id=public_share_id,
+            )
             for event_payload in payload.get("events", [])
             if isinstance(event_payload, dict)
         ],
     }
 
 
-async def _show_events_stream(session_id: str, *, after_id: str | None = None, public: bool = False):
+async def _show_events_stream(
+    session_id: str,
+    *,
+    after_id: str | None = None,
+    public: bool = False,
+    public_share_id: str | None = None,
+):
     import asyncio
 
     from fastapi.responses import StreamingResponse
@@ -8727,7 +8920,14 @@ async def _show_events_stream(session_id: str, *, after_id: str | None = None, p
                     for event_payload in events:
                         if isinstance(event_payload.get("id"), str):
                             replayed_ids.add(event_payload["id"])
-                        yield _sse_frame("show.event", _show_event_response_payload(event_payload, public=public))
+                        yield _sse_frame(
+                            "show.event",
+                            _show_event_response_payload(
+                                event_payload,
+                                public=public,
+                                public_share_id=public_share_id,
+                            ),
+                        )
                     cursor = batch.get("next_after_id")
                     if not cursor:
                         break
@@ -8745,7 +8945,14 @@ async def _show_events_stream(session_id: str, *, after_id: str | None = None, p
                             continue
                         if isinstance(event_id, str):
                             replayed_ids.add(event_id)
-                        yield _sse_frame("show.event", _show_event_response_payload(event_payload, public=public))
+                        yield _sse_frame(
+                            "show.event",
+                            _show_event_response_payload(
+                                event_payload,
+                                public=public,
+                                public_share_id=public_share_id,
+                            ),
+                        )
                     elif event_type == "show.dispatch" and isinstance(event_payload, dict) and _event_visible(event_payload):
                         yield _sse_frame("show.dispatch", _show_dispatch_response_payload(event_payload, public=public))
                 except asyncio.TimeoutError:
@@ -8767,13 +8974,19 @@ async def _show_events_stream(session_id: str, *, after_id: str | None = None, p
     )
 
 
-async def _show_events_response(session_id: str, *, public: bool = False):
+async def _show_events_response(
+    session_id: str,
+    *,
+    public: bool = False,
+    public_share_id: str | None = None,
+):
     if request.method == "GET":
         if request.args.get("stream") == "1":
             return await _show_events_stream(
                 session_id,
                 after_id=request.args.get("after_id") or _last_event_id_from_request(),
                 public=public,
+                public_share_id=public_share_id,
             )
         store = _show_session_event_store()
         try:
@@ -8782,7 +8995,13 @@ async def _show_events_response(session_id: str, *, public: bool = False):
             except (TypeError, ValueError):
                 limit = 100
             payload = store.list(session_id, after_id=request.args.get("after_id") or None, limit=limit)
-            return jsonify(_show_events_list_payload(payload, public=public))
+            return jsonify(
+                _show_events_list_payload(
+                    payload,
+                    public=public,
+                    public_share_id=public_share_id,
+                )
+            )
         finally:
             store.close()
 
@@ -9595,9 +9814,24 @@ async def serve_public_show_page(share_id, asset_path):
                     show_public_event_write_token(share_id, page.session_id) if author is not None else None
                 ),
             )
+        if asset_path.strip("/").startswith("__show/media/"):
+            if request.method not in {"GET", "HEAD"}:
+                return jsonify({"ok": False, "code": "method_not_allowed"}), 405
+            token = asset_path.strip("/").removeprefix("__show/media/")
+            if not token or "/" in token:
+                return _show_page_file_not_found_response()
+            return _registered_media_response(
+                token,
+                expected_session_id=page.session_id,
+                expected_source="show_annotation",
+            )
         if asset_path.strip("/") in {"__show/events", "__events"}:
             if request.method == "GET":
-                return await _show_events_response(page.session_id, public=True)
+                return await _show_events_response(
+                    page.session_id,
+                    public=True,
+                    public_share_id=share_id,
+                )
             if request.method != "POST":
                 return jsonify({"ok": False, "code": "method_not_allowed"}), 405
             author = _show_request_author(public=True)
@@ -9625,6 +9859,7 @@ async def serve_public_show_page(share_id, asset_path):
                 payload,
                 author=author,
                 public=True,
+                public_share_id=share_id,
                 allow_dispatch=False,
             )
         if request.method in {"GET", "HEAD"}:

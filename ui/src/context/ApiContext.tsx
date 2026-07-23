@@ -3,6 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { useToast } from './ToastContext';
 import { apiFetch } from '../lib/apiFetch';
 import type { TurnActivityGroupWire } from '../lib/agentActivity';
+import type { AgentGraphParams, AgentGraphResult, AgentGraphVisibility } from '../lib/agentGraph';
+import { visibilityActivityEvents } from '../lib/sessionVisibilityEvents';
 import type { VaultSessionPolicy } from '../lib/vaultSandboxPolicy';
 import {
   WorkbenchEventReconnectLoop,
@@ -609,7 +611,7 @@ export type ApiContextType = {
   getTurnState: (sessionId: string, options?: { handleError?: boolean }) => Promise<SessionRuntimeState>;
   getSessionDraft: (sessionId: string) => Promise<{ text: string }>;
   setSessionDraft: (sessionId: string, text: string) => Promise<{ ok: boolean }>;
-  listInbox: (params?: { platform?: string; unreadOnly?: boolean; limit?: number; before?: string; cache?: boolean; handleError?: boolean }) => Promise<InboxFeedResult>;
+  listInbox: (params?: { platform?: string; unreadOnly?: boolean; limit?: number; before?: string; onlySession?: string; cache?: boolean; handleError?: boolean }) => Promise<InboxFeedResult>;
   connectWorkbenchEvents: (handlers: WorkbenchEventHandlers) => () => void;
   listVibeAgents: (params?: { backend?: string; includeDisabled?: boolean }) => Promise<{ ok: boolean; agents: VibeAgentBrief[]; default_agent_name: string | null }>;
   getVibeAgent: (name: string) => Promise<{ ok: boolean; agent: VibeAgentFull; default_agent_name: string | null }>;
@@ -676,6 +678,13 @@ export type ApiContextType = {
   listHarnessRuns: (params?: HarnessRunsParams) => Promise<HarnessRunsResult>;
   getHarnessRun: (runId: string) => Promise<{ ok: boolean; run: HarnessRun }>;
   getRunningAgents: () => Promise<RunningAgentsResult>;
+  // Agents · 运行图 graph payload (contract §3). Realtime — refetched off SSE,
+  // so it bypasses the read cache. ``live_unreachable`` is set when the
+  // controller is down and the graph fell back to DB-only (history).
+  getAgentsGraph: (params?: AgentGraphParams) => Promise<AgentGraphResult & { live_unreachable?: boolean }>;
+  // Foreground/background toggle from the graph detail panel (contract §2,
+  // M1-owned PATCH). Returns the updated session payload.
+  setSessionVisibility: (sessionId: string, visibility: AgentGraphVisibility) => Promise<WorkbenchSession>;
   endRunningAgent: (payload: {
     backend?: string | null;
     state?: string | null;
@@ -921,7 +930,19 @@ export type WorkbenchEventHandlers = {
   onConnectionState?: (state: WorkbenchEventConnectionState) => void;
   onEventBridgeStatus?: (data: { connected: boolean }) => void;
   onMessageNew?: (data: WorkbenchMessage) => void;
-  onSessionActivity?: (data: { session_id: string; scope_id: string | null; event: string; title?: string | null }) => void;
+  // ``visibility`` (contract A6): the backend carries the session's current
+  // foreground/background on visibility/scope changes so the Inbox can drop /
+  // restore the card live. Absent on pre-M1 backends ⇒ consumers no-op.
+  onSessionActivity?: (data: {
+    session_id: string;
+    scope_id: string | null;
+    event: string;
+    title?: string | null;
+    visibility?: 'foreground' | 'background';
+    // Client-synthesized marker (never on a real backend event): a foreground
+    // restore, so the projects tree grows its window to bring the row back.
+    restored?: boolean;
+  }) => void;
   onInboxUnreadChanged?: (data: {
     session_id?: string;
     scope_id?: string | null;
@@ -983,6 +1004,13 @@ export type WorkbenchMessage = {
   source: 'user' | 'agent' | 'harness' | string | null;
   author_id: string | null;
   author_name: string | null;
+  // Read-side provenance for an agent-callback ("自动触发") harness message (A9a):
+  // the session that triggered the run, resolved from the run's source_actor.
+  // Present only on agent_run harness messages; enables the source-session chip
+  // + /chat/<source_session_id> deep-link.
+  source_session_id?: string | null;
+  source_session_title?: string | null;
+  source_session_agent_name?: string | null;
   native_message_id: string | null;
   parent_native_message_id: string | null;
   text: string;
@@ -1221,6 +1249,12 @@ export type HarnessRun = {
   source_kind: string | null;
   source_actor: string | null;
   parent_run_id: string | null;
+  // Callback (report-back) lineage — serialized by the backend run row but
+  // previously unrendered; the run detail surfaces these (Part B).
+  callback_session_id: string | null;
+  callback_run_id: string | null;
+  callback_status: string | null;
+  callback_error: string | null;
   agent_name: string | null;
   agent_id: string | null;
   agent_backend: string | null;
@@ -1875,6 +1909,16 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     for (const handlers of Array.from(eventHandlersRef.current)) {
       dispatch(handlers);
     }
+  };
+
+  // Feed a locally-synthesized session.activity event through the SAME handler
+  // set + read-cache invalidation the SSE 'session.activity' listener uses, so a
+  // client-originated change (e.g. a visibility PATCH) reconciles every workbench
+  // cache via its own reducer even when the SSE stream is down. Idempotent with a
+  // later real SSE event carrying the same change.
+  const emitLocalSessionActivity = (data: Parameters<NonNullable<WorkbenchEventHandlers['onSessionActivity']>>[0]) => {
+    if (data.session_id) clearSessionReadCache(data.session_id);
+    dispatchToWorkbenchHandlers((handlers) => handlers.onSessionActivity?.(data));
   };
 
   const setWorkbenchEventConnectionState = (state: WorkbenchEventConnectionState) => {
@@ -2625,6 +2669,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (params?.unreadOnly) search.set('unread_only', '1');
       if (params?.limit) search.set('limit', String(params.limit));
       if (params?.before) search.set('before', params.before);
+      if (params?.onlySession) search.set('session', params.onlySession);
       const qs = search.toString();
       const path = qs ? `/api/inbox?${qs}` : '/api/inbox';
       const options = { handleError: params?.handleError };
@@ -2840,6 +2885,35 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           stopWorkbenchEventSource();
         }
       };
+    },
+    getAgentsGraph: (params) => {
+      const search = new URLSearchParams();
+      if (params?.window) search.set('window', params.window);
+      if (params?.project) search.set('project', params.project);
+      if (params?.includeEnded === false) search.set('include_ended', '0');
+      if (params?.includeBackground === false) search.set('include_background', '0');
+      const qs = search.toString();
+      return getJson(qs ? `/api/agents-graph?${qs}` : '/api/agents-graph');
+    },
+    setSessionVisibility: async (sessionId, visibility) => {
+      const session = (await patchJson(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+        visibility,
+      })) as WorkbenchSession;
+      // Single chokepoint: replay the committed PATCH as the same session.activity
+      // event sequence the backend emits, through the existing workbench-event
+      // pipeline, so the projects tree AND the inbox reconcile via their own
+      // reducers even when the SSE stream is down (remote/mobile). Any caller
+      // (sidebar hide, graph toggle) inherits this; a real SSE event arriving
+      // later is an idempotent no-op.
+      for (const event of visibilityActivityEvents({
+        sessionId,
+        scopeId: session.scope_id,
+        title: session.title,
+        visibility,
+      })) {
+        emitLocalSessionActivity(event);
+      }
+      return session;
     },
     getRunningAgents: async () => {
       const res = await apiFetch('/api/running-agents');
