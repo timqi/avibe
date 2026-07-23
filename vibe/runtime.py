@@ -1189,19 +1189,21 @@ def _linger_is_enabled(user: str) -> bool:
     return "Linger=yes" in (result.stdout or "")
 
 
-def _ensure_linger_enabled() -> bool:
-    """Confirm (self-enabling if needed) that the user lingers.
+def _ensure_linger_enabled(*, allow_enable: bool) -> bool:
+    """Confirm that the user lingers, enabling it only when explicitly allowed.
 
     Once the service lives under ``user@<uid>.service`` instead of a login
     session scope, logind tears that manager down on last-session-end unless
     lingering is enabled — which would kill Avibe on the first SSH logout.
-    ``loginctl enable-linger`` for one's own user is unprivileged (polkit
-    ``set-self-linger`` is ``allow_any: yes``), so this needs no root and no
-    prompt. Fail open: if we can't confirm linger, skip the scope wrap.
+    ``loginctl enable-linger`` changes persistent account state, so automatic
+    governance only observes it. Explicitly enabled governance may opt in to
+    that change. Fail open: if we can't confirm linger, skip the scope wrap.
     """
     user = _current_username()
     if _linger_is_enabled(user):
         return True
+    if not allow_enable:
+        return False
     try:
         subprocess.run(
             ["loginctl", "enable-linger", user],
@@ -1256,9 +1258,10 @@ def maybe_systemd_scope_prefix() -> list[str]:
             return []
     except Exception:
         return []
-    if _resource_governance_mode() == "disabled":
+    governance_mode = _resource_governance_mode()
+    if governance_mode == "disabled":
         return []
-    if not _ensure_linger_enabled():
+    if not _ensure_linger_enabled(allow_enable=governance_mode == "enabled"):
         logger.warning(
             "cgroup scope bootstrap: could not confirm user linger; "
             "starting service without a delegated user scope"

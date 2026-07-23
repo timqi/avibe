@@ -59,6 +59,21 @@ class MaybeSystemdScopePrefixTests(unittest.TestCase):
             with patch("vibe.runtime._resource_governance_mode", return_value="disabled"):
                 self.assertEqual(runtime.maybe_systemd_scope_prefix(), [])
 
+    def test_auto_mode_only_checks_linger(self):
+        with _passing_patches():
+            with patch("vibe.runtime._ensure_linger_enabled", return_value=True) as ensure_linger:
+                runtime.maybe_systemd_scope_prefix()
+
+        ensure_linger.assert_called_once_with(allow_enable=False)
+
+    def test_enabled_mode_may_enable_linger(self):
+        with _passing_patches():
+            with patch("vibe.runtime._resource_governance_mode", return_value="enabled"):
+                with patch("vibe.runtime._ensure_linger_enabled", return_value=True) as ensure_linger:
+                    runtime.maybe_systemd_scope_prefix()
+
+        ensure_linger.assert_called_once_with(allow_enable=True)
+
     def test_linger_unconfirmed_fails_open(self):
         with _passing_patches():
             with patch("vibe.runtime._ensure_linger_enabled", return_value=False):
@@ -74,22 +89,28 @@ class LingerHelperTests(unittest.TestCase):
     def test_already_enabled_short_circuits_without_enable(self):
         with patch("vibe.runtime._linger_is_enabled", return_value=True) as is_enabled:
             with patch("vibe.runtime.subprocess.run") as run:
-                self.assertTrue(runtime._ensure_linger_enabled())
+                self.assertTrue(runtime._ensure_linger_enabled(allow_enable=False))
                 run.assert_not_called()
         is_enabled.assert_called_once()
 
-    def test_self_enables_when_initially_off(self):
+    def test_auto_mode_does_not_enable_when_initially_off(self):
+        with patch("vibe.runtime._linger_is_enabled", return_value=False):
+            with patch("vibe.runtime.subprocess.run") as run:
+                self.assertFalse(runtime._ensure_linger_enabled(allow_enable=False))
+                run.assert_not_called()
+
+    def test_explicit_mode_self_enables_when_initially_off(self):
         # first check False -> enable-linger -> re-check True
         with patch("vibe.runtime._linger_is_enabled", side_effect=[False, True]):
             with patch("vibe.runtime.subprocess.run") as run:
-                self.assertTrue(runtime._ensure_linger_enabled())
+                self.assertTrue(runtime._ensure_linger_enabled(allow_enable=True))
                 run.assert_called_once()
                 self.assertIn("enable-linger", run.call_args.args[0])
 
     def test_fails_open_when_enable_does_not_take(self):
         with patch("vibe.runtime._linger_is_enabled", side_effect=[False, False]):
             with patch("vibe.runtime.subprocess.run"):
-                self.assertFalse(runtime._ensure_linger_enabled())
+                self.assertFalse(runtime._ensure_linger_enabled(allow_enable=True))
 
 
 class ResourceGovernanceModeTests(unittest.TestCase):
