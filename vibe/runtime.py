@@ -1,9 +1,11 @@
+import getpass
 import ipaddress
 import json
 import logging
 import os
 import signal
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -1124,6 +1126,153 @@ def _raise_service_start_not_ready(pid: int, *, timeout: float) -> None:
     raise RuntimeError(f"Vibe service process pid={pid} did not acquire the service lock")
 
 
+# --- cgroup resource-governance bootstrap -----------------------------------
+#
+# ``core/resource_governance.py`` can only move agent subprocesses into a
+# memory-capped cgroup when Avibe itself runs inside a *delegated* cgroup
+# subtree. A normal login lands the service in a root-owned, non-delegated
+# ``session-*.scope`` where ``mkdir`` returns EPERM, so governance is inert.
+#
+# The kernel's delegation-containment rule forbids a non-root process from
+# migrating itself out of that session scope into the user manager's delegated
+# tree (the common ancestor ``user-<uid>.slice`` is root-owned). The only way
+# in is to be *launched* inside the delegated tree. ``systemd-run --user
+# --scope`` does exactly that: it asks the user systemd manager to create a
+# transient scope under ``user@<uid>.service/app.slice`` (qiqi-owned, memory +
+# pids delegated) and then ``execve()``s into the target — so the launched
+# process keeps its real pid and cmdline (no supervising parent), and Avibe's
+# pid-tracking is unaffected.
+#
+# This is best-effort and fails open: on macOS, without systemd, without a live
+# user manager, when governance is disabled, or when linger can't be confirmed,
+# the prefix is empty and the service starts exactly as before.
+
+SYSTEMD_SCOPE_PREFIX = (
+    "systemd-run",
+    "--user",
+    "--scope",
+    "-q",  # suppress the "Running scope as unit ..." banner from the log sink
+    "-p",
+    "Delegate=yes",
+    "--",
+)
+
+
+def _resource_governance_mode() -> str:
+    try:
+        from config.v2_config import V2Config
+        from core.resource_governance import config_from_runtime
+
+        return str(config_from_runtime(V2Config.load()).get("mode") or "auto").strip().lower()
+    except Exception:
+        # Absent/broken config must not block startup; treat as the default.
+        return "auto"
+
+
+def _current_username() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:
+        return str(os.getuid())
+
+
+def _linger_is_enabled(user: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["loginctl", "show-user", user, "-p", "Linger"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return "Linger=yes" in (result.stdout or "")
+
+
+def _ensure_linger_enabled() -> bool:
+    """Confirm (self-enabling if needed) that the user lingers.
+
+    Once the service lives under ``user@<uid>.service`` instead of a login
+    session scope, logind tears that manager down on last-session-end unless
+    lingering is enabled — which would kill Avibe on the first SSH logout.
+    ``loginctl enable-linger`` for one's own user is unprivileged (polkit
+    ``set-self-linger`` is ``allow_any: yes``), so this needs no root and no
+    prompt. Fail open: if we can't confirm linger, skip the scope wrap.
+    """
+    user = _current_username()
+    if _linger_is_enabled(user):
+        return True
+    try:
+        subprocess.run(
+            ["loginctl", "enable-linger", user],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return _linger_is_enabled(user)
+
+
+def _systemd_run_self_test_ok(timeout: float = 5.0) -> bool:
+    """Bounded dry-run so DBus/user-manager flakiness surfaces here, not as an
+    opaque 'service did not acquire lock' timeout 30s later."""
+    try:
+        result = subprocess.run(
+            ["systemd-run", "--user", "--scope", "-q", "-p", "Delegate=yes", "--", "true"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def maybe_systemd_scope_prefix() -> list[str]:
+    """Return the ``systemd-run --user --scope`` argv prefix to launch the
+    service inside a delegated user cgroup, or ``[]`` to start unwrapped.
+
+    All predicates must hold; any failure fails open to today's behavior. There
+    is deliberately no "already inside our own scope" guard: nested
+    ``systemd-run --scope`` creates a harmless *sibling* scope (not a nested
+    child), and such a guard would misfire when a governed agent shells out to
+    ``vibe restart`` — landing the restarted service inside the old
+    memory-capped, ``oom.group`` agent cgroup.
+    """
+    if not sys.platform.startswith("linux"):
+        return []
+    if shutil.which("systemd-run") is None:
+        return []
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return []
+    if not Path(f"/run/user/{getuid()}/systemd/private").is_socket():
+        return []
+    try:
+        from core.resource_governance import detect_cgroup_root
+
+        if detect_cgroup_root() is None:
+            return []
+    except Exception:
+        return []
+    if _resource_governance_mode() == "disabled":
+        return []
+    if not _ensure_linger_enabled():
+        logger.warning(
+            "cgroup scope bootstrap: could not confirm user linger; "
+            "starting service without a delegated user scope"
+        )
+        return []
+    if not _systemd_run_self_test_ok():
+        logger.warning(
+            "cgroup scope bootstrap: systemd-run self-test failed; "
+            "starting service without a delegated user scope"
+        )
+        return []
+    return list(SYSTEMD_SCOPE_PREFIX)
+
+
 def start_service(
     *,
     wait_for_ready: bool = True,
@@ -1183,8 +1332,11 @@ def start_service(
             raise ServiceAlreadyRunningError(lock_path=get_service_lock_path(), holder_pid=extra_pids[0])
 
         main_path = get_service_main_path()
+        scope_prefix = maybe_systemd_scope_prefix()
+        if scope_prefix:
+            logger.info("cgroup scope bootstrap: launching service inside a delegated user scope")
         process = spawn_service_background_process(
-            [sys.executable, str(main_path)],
+            [*scope_prefix, sys.executable, str(main_path)],
             "service_stdout.log",
             "service_stderr.log",
             env={
