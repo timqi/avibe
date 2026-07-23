@@ -1465,8 +1465,12 @@ def start_service(
                     if _pid_reservation_is_fresh(pid_path, existing_pid):
                         if not wait_for_ready:
                             return existing_pid
-                        if wait_for_service_pid(existing_pid, timeout=SERVICE_SLOW_START_TIMEOUT_SECONDS):
-                            return existing_pid
+                        ready_pid = wait_for_service_ready(
+                            existing_pid,
+                            timeout=SERVICE_SLOW_START_TIMEOUT_SECONDS,
+                        )
+                        if ready_pid is not None:
+                            return ready_pid
                         _raise_service_start_not_ready(existing_pid, timeout=SERVICE_SLOW_START_TIMEOUT_SECONDS)
                     logger.warning(
                         "Ignoring stale service pid file pid=%s because it never acquired the service lock",
