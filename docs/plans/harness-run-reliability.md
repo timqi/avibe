@@ -1,7 +1,7 @@
 # Harness Run Reliability: Settlement, Reconcile, Delivery, and Visibility
 
-Status: investigation complete, design proposed — **implementation blocked on the
-product decisions in §7**
+Status: investigation complete, design approved — ready to implement
+
 Branch: `fix/harness-run-reconcile` (from `master` @ `5921ad39`)
 
 ## 1. Background
@@ -333,13 +333,17 @@ Ship with: en/zh key-parity test; i18n the two hardcoded strings at
    This is the must-have: `except asyncio.CancelledError` (`:2437-2439`) requeues
    the run and `_on_execution_done` releases `_inflight_sessions` → **the wedge
    is gone**. Semantics match the restart sweep exactly, so no new vocabulary.
-2. A bounded retry counter in `agent_runs.metadata_json`; past the ceiling,
-   terminalize `canceled` via `defer_run_terminal` → `settle_deferred_run`
-   instead of requeuing. **Without this, PR2 creates an eviction↔requeue storm
-   every 100s.**
+2. Per **D1**, the cancelled run is **terminalized, not requeued**:
+   `defer_run_terminal` → `settle_deferred_run` with
+   `metadata.interrupt_reason = "evicted"`. This also removes the
+   eviction↔requeue storm hazard, so no attempt counter is needed. It does mean
+   `_execute_claimed_request`'s `except asyncio.CancelledError` branch
+   (`:2437-2440`) must distinguish an eviction cancel (terminalize) from a
+   service-stop cancel (`stop()` at `:1862-1882`, which should still requeue).
 3. A DB reconcile sweep for runs the cancel didn't reach, using guarded writers
    only. Order matters: **cancel first, then reconcile** — the happy case finds
-   nothing to do. The callback comes free (§2 P3).
+   nothing to do. The callback comes free (§2 P3), which is what delivers D1's
+   user-facing notification.
 4. Promote the shared non-terminal-status constant (§3.3).
 5. i18n the interrupted copy.
 
@@ -356,7 +360,8 @@ paths (Running-tab "End", controller shutdown, Codex/OpenCode) — per CLAUDE.md
    **inside the second recheck pass** or the existing two-pass structure
    reintroduces the hole. Must **fail open** (unresolvable `session_id` does not
    pin) or a dangling P5 binding creates an immortal session. Reuses PR2's
-   resolver (§3.4).
+   resolver (§3.4). Per **D4**, the pin is **time-bounded** at
+   `stuck_active_floor_seconds` (1800s); past that, evict **and** reconcile.
 2. **Touch at claim:** `_spawn_execution` (`:2034`) →
    `touch_session_activity(composite_key)`; also after `get_session_info`
    (`message_handler.py:169`) and on a timer while blocked on `gate.lock`
@@ -388,15 +393,19 @@ also destroying the target session.
    (`workbench_sessions_service.py:922-935`) into a shared
    `reclaim_bound_definitions(conn, session_id)` and call it from
    `delete_agent_session`/`delete_agent_sessions` (`storage/sessions_service.py:475/495`).
-   For the `/new` path **pause** (`enabled=0` + `last_error`) rather than
-   soft-delete — `/new` is an everyday command, unlike terminal archive — and
-   add a one-line notice to the `/new` reply. (See Q2.)
+   Per **D2**, the `/new` path **pauses** (`enabled=0` + `last_error` naming
+   `/new` as the cause) rather than soft-deleting, and `/new`'s reply gains a
+   one-line notice with the count and how to resume.
 2. **Self-heal `create_once` only.** In `_execute_task` (`:2482`), catch the
    unresolvable-session `ValueError`; if `session_policy == "create_once"` and
    `metadata.session_scope_id`/`deliver_key` survive, re-reserve via
    `_reserve_runtime_session`, persist through `store.update_task(session_id=…)`,
    continue — **and always notify** (a silent rebind that loses continuity is a
-   worse bug than the failure). For `existing`, never rebind: pause + notify.
+   worse bug than the failure). Per **D3** the rebind **carries the previous
+   session's workdir / agent / model forward**, falling back to scope defaults
+   only for values it cannot recover — `_reserve_runtime_session` re-resolves the
+   scope agent today and would otherwise switch the backend silently. For
+   `existing`, never rebind: pause + notify.
 3. **Auto-pause backstop** for the unresolvable-target error class only.
 4. **Keyed get-or-create** `get_or_create_agent_session_row(conn, scope_id,
    session_anchor, …)` in `storage/agent_session_rows.py`: look up by the
@@ -420,7 +429,12 @@ also destroying the target session.
    "backend_failure"` is already honored by `web_push_notifications._is_notifiable_message`.
    For a dead session, build the context from `deliver_key`/`metadata.session_scope_id`
    via `_resolve_delivery_target` + `_build_context` (`:2763`) — that is the one
-   piece of new plumbing. (Q5 covers `deliver_key IS NULL`.)
+   piece of new plumbing. Delivery follows **D5**'s ladder, ending in a DM whose
+   body carries its own context (task name/id, creating channel/thread with a deep
+   link, last success, error class, current state, how to resume). Verify the
+   owner-DM fallback can always resolve; if not, widen the workbench inbox shape.
+   The same notification serves **D1** for interrupted runs, with
+   `metadata.interrupt_reason` selecting the copy.
 2. **Derived health, no migration:** add `consecutive_failures` / `recent_failures`
    to `_task_payload` (`vibe/cli.py:1505`) and the harness API
    (`vibe/ui_server.py:8083`) via one indexed query over
@@ -435,7 +449,7 @@ also destroying the target session.
    consecutive failures **only** for the unresolvable-target class — a transient
    agent error must not disable a task.
 
-### PR7 — P1: settle scheduled/watch runs at the real terminal result (gated)
+### PR7 — P1: settle scheduled/watch runs at the real terminal result
 
 The end state the docs already claim as deferred. Changes:
 
@@ -449,17 +463,19 @@ The end state the docs already claim as deferred. Changes:
 No schema change, no new status value, no UI/i18n work; historical rows keep
 their (wrong) values and only new rows get honest timing.
 
-**Blocked on two safety mitigations, because as-is it is not safe:**
+**Two safety mitigations ship in the same PR — without them PR7 is a regression:**
 
-- `recover_processing_runs` becomes a **duplicate-prompt generator** — a
-  mid-flight daily report re-sent after restart posts twice. Needs recovered
-  scheduled runs to terminalize with `error="service restarted mid-turn"`
-  instead of requeueing (mirroring the `watch_runtime` exclusion at `:1570`).
-  **This is Q1.**
-- APScheduler uses `max_instances=1` (`:1941-1948`) and `_run_task` awaits the
-  execution (`:2002-2005`), and there is **no turn-duration timeout by design**
-  (`core/services/dispatch.py:116-118`). A hung turn would then **silently
-  disable that cron job forever**. Needs a per-run lifetime watchdog. **This is Q4.**
+- **Restart must not re-dispatch (D1).** Otherwise `recover_processing_runs`
+  becomes a duplicate-prompt generator: a mid-flight daily report re-sent after
+  restart posts twice. Recovered `scheduled` rows terminalize with
+  `interrupt_reason=restarted` (mirroring the `watch_runtime` exclusion at `:1570`).
+- **The cron must not be blockable (D4).** Today `_run_task` awaits the execution
+  (`:2004-2005`) under `max_instances=1` (`:1946`); with a PR7-length turn a hung
+  run silently discards every subsequent fire. Fire becomes enqueue-only, plus a
+  per-run lifetime cap honoring `run_definitions.lifetime_timeout_seconds`
+  (currently watch-only) defaulted to `min(configured, 0.8 × cron_interval)`.
+  There is **no turn-duration timeout anywhere by design**
+  (`core/services/dispatch.py:116-118`), so this cap is the only backstop.
 
 **Rejected alternative:** adding a `dispatched` status or `dispatched_at` field.
 The enum has no DB constraint, six derived predicates key off the current five
@@ -482,8 +498,11 @@ PR2 (P3 reconcile)        — provides the session→runs resolver
        └─ PR4 (P4 drain)  — own review, own PR
 PR5 (P5 bindings)         — independent; shares the notify hook with PR6
   └─ PR6 (P6 visibility)  — same choke point as PR5's pause
-PR7 (P1 settlement)       — needs Q1 + Q4 answered; benefits from PR1 landing first
+PR7 (P1 settlement)       — needs PR1 landed and PR6's notify path available
+                            (D1 requires an actionable failure notification)
 ```
+
+All six product decisions are resolved (§7); nothing is blocked on further input.
 
 ## 6. Test plan
 
@@ -562,38 +581,89 @@ the Incus regression environment — note the running local service **predates**
 `agent_sessions.visibility` (commit `3857f832`), so anything validated against the
 live DB shape must be re-validated post-migration.
 
-## 7. Open product decisions (blocking)
+## 7. Product decisions (resolved 2026-07-25)
 
-**Q1 — On restart or eviction, should an interrupted scheduled run be re-dispatched
-or failed?** Today's sweep requeues. For a daily report that means a second post
-to the channel. Proposal: requeue for `watch` (idempotent triggers), terminalize
-for `scheduled` and interactive `agent_run` (a 2-hour turn re-run from scratch is
-worse than a clean failure). **Blocks PR7.**
+**D1 (was Q1) — An interrupted run is FAILED, never silently re-dispatched, and
+the user is told.** Applies to eviction, teardown, restart recovery, and lifetime
+timeout. Rationale: a silent re-dispatch of a daily report posts twice, and a
+re-run of a long turn from scratch is worse than a clean failure. The user
+decides what happens next, so the notification must be **actionable**: what
+failed, why, at what point, and how to re-run.
 
-**Q2 — Should `/new` pause or soft-delete bound scheduled tasks?** Archive
-soft-deletes because archive is terminal; `/new` is not. Proposal: pause + a
-one-line notice in the `/new` reply. This changes `/new`'s contract. **Blocks PR5.1.**
+Implementation consequences:
+- `recover_processing_runs` (`storage/background.py:1563-1587`) must
+  **terminalize** `scheduled`/`agent_run` rows with
+  `error="interrupted: service restarted mid-turn"` instead of resetting them to
+  `queued`. Keep the requeue path only where a trigger is genuinely idempotent
+  (`watch`), and keep the existing `watch_runtime` / deferred-terminal exclusions.
+- PR2's eviction reconcile terminalizes rather than requeues, which **removes the
+  retry-storm hazard** that the requeue design needed a ceiling for. The
+  attempt-counter requirement in PR2 is therefore dropped; a simple
+  `defer_run_terminal` → `settle_deferred_run` is enough.
+- Every terminalized-by-interruption run must carry a distinguishable error class
+  (e.g. `metadata.interrupt_reason ∈ {evicted, restarted, lifetime_timeout}`) so
+  the notification can say which, and so PR6 can suppress the auto-pause counter
+  for interruption-class failures (they are infrastructure faults, not a broken
+  task definition).
 
-**Q3 — Should a `create_once` rebind preserve the old workdir/agent/model, or
-re-resolve from current scope settings?** `_reserve_runtime_session` re-resolves
-the scope agent (`:2645`), which may silently change the backend under the user.
+**D2 (was Q2) — `/new` PAUSES bound scheduled definitions.** `enabled=0` +
+`last_error` explaining that the bound session was cleared by `/new`, plus a
+one-line notice in the `/new` reply naming how many tasks were paused and how to
+resume. Not soft-delete: archive is terminal, `/new` is an everyday command.
 
-**Q4 — Hung-turn policy.** With `max_instances=1` and no turn timeout, a hung
-turn permanently silences its cron job under PR7. Is a per-definition lifetime
-cap acceptable, and should it reuse the watch-only `lifetime_timeout_seconds`
-column or a new setting? Related: should the eviction pin (PR3) be time-bounded,
-so a permanently-stuck run doesn't create an immortal session? **Blocks PR7.**
+**D3 (was Q3) — A `create_once` rebind PRESERVES the old workdir / agent / model.**
+`_reserve_runtime_session` (`:2645`) re-resolves the scope agent today, which
+could silently switch the backend under a running task. The rebind path must
+carry the previous session's settings forward and only fall back to scope
+defaults for values it cannot recover. The rebind still always notifies (§PR5.2).
 
-**Q5 — Where does a failure notification go when the definition has no
-`deliver_key` and its session is gone** (e.g. `683be46f50af`)? Candidates:
-`metadata.session_scope_id`, the creating scope's `caller_context`, or a
-workbench inbox row not attached to any session — the last needs a new message
-shape, since `maybe_notify_inbox_message` requires `messages.session_id`
-(`core/web_push_notifications.py:71`).
+**D4 (was Q4) — A cron job must never be blocked by its own previous run.**
+Three parts:
+1. **Fire becomes enqueue-only.** Drop the `await execution` in `_run_task`
+   (`core/scheduled_tasks.py:2004-2005`) so the APScheduler job returns
+   immediately. With `max_instances=1` (`:1946`) and a PR7-length turn, an
+   awaited execution silently discards every subsequent fire
+   ("maximum number of running instances reached") with no error surfaced.
+2. **Per-run lifetime cap.** Reuse the existing `run_definitions.lifetime_timeout_seconds`
+   column — currently watch-only (`core/watches.py:618-627`; `storage/background.py:1666`
+   sets it `None` for tasks) — and honor it for scheduled runs. On expiry: cancel
+   the execution, terminalize `failed` with `interrupt_reason=lifetime_timeout`,
+   notify per D1.
+3. **Default the cap below the cron period.** Because a pinned-session task
+   serialises on `_inflight_sessions`, the next fire queues behind a hung
+   predecessor; the cap is what actually unblocks it. Default to
+   `min(configured_or_global_default, 0.8 × cron_interval)`, with the global
+   default in `config/v2_config.py`.
 
-**Q6 — Historical rows.** ~77 `succeeded` scheduled rows and 67 `watch` rows carry
-false `completed_at` and empty `result_text`. Leave them, or annotate via metadata
-so the UI can mark pre-fix rows as unverified?
+Related: **the PR3 eviction pin is time-bounded** by the same principle — cap it
+at the existing `stuck_active_floor_seconds` (1800s) so a permanently-stuck run
+cannot create an immortal session. Past the cap: evict **and** reconcile.
+
+**D5 (was Q5) — Failure notifications follow a delivery ladder, ending in DM.**
+Order: (1) the definition's `deliver_key`; (2) the bound session's scope, if the
+session is still alive; (3) the scope the definition was created from (caller
+provenance); (4) **DM to the owner**.
+
+Because a DM is context-free by construction, the notification body must carry
+its own context: task name + id, **where the task was created (channel/thread,
+with a deep link)**, when it last succeeded, the error and its class, the current
+state (paused? next fire when?), and how to re-run or resume.
+
+**Implementation check before coding:** confirm a definition can always resolve an
+owner DM target. A task created purely from the CLI may have no user id in its
+provenance, which makes rung (4) empty. If so, add a final fallback to a
+workbench inbox row — noting that `maybe_notify_inbox_message`
+(`core/web_push_notifications.py:71`) currently requires `messages.session_id`,
+so that shape needs widening.
+
+**D6 (was Q6) — Annotate historical rows; do not backfill.** ~77 `scheduled` and
+67 `watch` rows carry `status=succeeded` with a 0.6s `completed_at` and empty
+`result_text`. They are indistinguishable from honestly-settled rows once PR7
+lands. Stamp them once with `metadata.pre_settlement_migration = true` (a single
+UPDATE, no schema change, no data loss) and have the UI/CLI render a quiet
+"legacy — delivery only" marker. Rejected: leaving them (silently misleading
+history) and backfilling `result_text` from `messages` (expensive and
+incomplete).
 
 ## 8. Smaller findings worth fixing opportunistically
 
