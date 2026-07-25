@@ -34,7 +34,7 @@ and must not survive into implementation:
 |---|---|
 | P2's fork is `post_to` | It is `suppress_delivery`, derived from session visibility (`visibility == "background"`, `core/scheduled_tasks.py:319`; pre-migration: `session_metadata["no_delivery"]`). The `post_to` correlation is incidental. |
 | `agent_runs.pid` can drive reconcile | `pid` is **never populated** — 0 of 233 live rows. `update_run_status(..., pid=...)` exists but no caller passes it. Unusable. |
-| Nothing sweeps non-terminal runs on restart | `recover_processing_runs` (`storage/background.py:1563-1587`) resets `running|processing` → `queued`. It **requeues, it does not terminalize** — and that is a duplicate-prompt hazard, see Q1. |
+| Nothing sweeps non-terminal runs on restart | `recover_processing_runs` (`storage/background.py:1563-1587`) resets `running|processing` → `queued`. It **requeues, it does not terminalize** — and that is a duplicate-prompt hazard — see D1. |
 | The zombie runs were cleared by hand | The restart sweep cleared them. `7b459e5caea7` settled `succeeded` via the deferred-Activity path; `96e10711797b` settled `canceled`. Both had `cancel_requested=1` **16 minutes** before terminalizing — that gap is the real evidence. |
 | P4 was caused by idle eviction | Eviction was a symptom. The delivery failure was a **~65-minute stall of the `_watch_store` drain loop**; once it resumed, the message was delivered to a transparently re-spawned session. |
 
